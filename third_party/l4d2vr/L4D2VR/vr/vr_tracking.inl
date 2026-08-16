@@ -1,0 +1,2674 @@
+static constexpr int kServerHookFallbackDefaultDelayMs = 250;
+
+namespace
+{
+    C_BaseEntity* AdaptiveNearClipGetClientEntity(IClientEntityList* entityList, int entityIndex)
+    {
+        if (!entityList || entityIndex <= 0)
+            return nullptr;
+
+#ifdef _MSC_VER
+        __try
+        {
+            return static_cast<C_BaseEntity*>(entityList->GetClientEntity(entityIndex));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return nullptr;
+        }
+#else
+        return static_cast<C_BaseEntity*>(entityList->GetClientEntity(entityIndex));
+#endif
+    }
+
+    bool AdaptiveNearClipIsConnectedPlayer(IEngineClient* engineClient, int entityIndex)
+    {
+        if (!engineClient || entityIndex <= 0)
+            return false;
+
+        player_info_t playerInfo{};
+#ifdef _MSC_VER
+        __try
+        {
+            return engineClient->GetPlayerInfo(entityIndex, &playerInfo);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+#else
+        return engineClient->GetPlayerInfo(entityIndex, &playerInfo);
+#endif
+    }
+
+    bool AdaptiveNearClipGetPlayerTeam(C_BaseEntity* entity, int& outTeam)
+    {
+        outTeam = 0;
+        if (!entity)
+            return false;
+
+#ifdef _MSC_VER
+        __try
+        {
+            outTeam = *reinterpret_cast<const int*>(
+                reinterpret_cast<const unsigned char*>(entity) + VR::kTeamNumOffset);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            outTeam = 0;
+            return false;
+        }
+#else
+        outTeam = *reinterpret_cast<const int*>(
+            reinterpret_cast<const unsigned char*>(entity) + VR::kTeamNumOffset);
+        return true;
+#endif
+    }
+
+    bool AdaptiveNearClipGetAbsOrigin(C_BaseEntity* entity, Vector& outOrigin)
+    {
+        outOrigin = {};
+        if (!entity)
+            return false;
+
+#ifdef _MSC_VER
+        __try
+        {
+            outOrigin = entity->GetAbsOrigin();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+#else
+        outOrigin = entity->GetAbsOrigin();
+#endif
+        return
+            std::isfinite(outOrigin.x) &&
+            std::isfinite(outOrigin.y) &&
+            std::isfinite(outOrigin.z);
+    }
+
+    float AdaptiveNearClipDistanceToCharacterCapsule(const Vector& point, const Vector& origin)
+    {
+        // Player slots are reliable across stock and replacement survivor models,
+        // while network class strings and ICollideable bounds are not. Approximate
+        // the visible character with a generous vertical capsule instead.
+        constexpr float kCapsuleRadius = 24.0f;
+        constexpr float kCapsuleBottomZ = 12.0f;
+        constexpr float kCapsuleTopZ = 60.0f;
+        const float nearestZ = std::clamp(point.z, origin.z + kCapsuleBottomZ, origin.z + kCapsuleTopZ);
+        const float dx = point.x - origin.x;
+        const float dy = point.y - origin.y;
+        const float dz = point.z - nearestZ;
+        const float axisDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
+        return std::max(0.0f, axisDistance - kCapsuleRadius);
+    }
+
+    bool AdaptiveNearClipViewHitsSelfBody(
+        const Vector& eyePosition,
+        const Vector& viewForward,
+        const Vector& playerOrigin,
+        float minimumLookDownSine,
+        bool expandedForExit)
+    {
+        const auto finiteVector = [](const Vector& value)
+            {
+                return std::isfinite(value.x) &&
+                    std::isfinite(value.y) &&
+                    std::isfinite(value.z);
+            };
+        if (!finiteVector(eyePosition) ||
+            !finiteVector(viewForward) ||
+            !finiteVector(playerOrigin) ||
+            -viewForward.z < std::clamp(minimumLookDownSine, 0.0f, 1.0f))
+        {
+            return false;
+        }
+
+        const float halfWidth = expandedForExit ? 30.0f : 24.0f;
+        const float bottomOffset = expandedForExit ? -4.0f : 0.0f;
+        const float topOffset = expandedForExit ? 60.0f : 56.0f;
+        const float maxDistance = expandedForExit ? 112.0f : 96.0f;
+        const Vector mins(
+            playerOrigin.x - halfWidth,
+            playerOrigin.y - halfWidth,
+            playerOrigin.z + bottomOffset);
+        const Vector maxs(
+            playerOrigin.x + halfWidth,
+            playerOrigin.y + halfWidth,
+            playerOrigin.z + topOffset);
+
+        float rayEnter = 0.0f;
+        float rayExit = maxDistance;
+        for (int axis = 0; axis < 3; ++axis)
+        {
+            const float direction = viewForward[axis];
+            const float start = eyePosition[axis];
+            if (std::fabs(direction) <= 0.0001f)
+            {
+                if (start < mins[axis] || start > maxs[axis])
+                    return false;
+                continue;
+            }
+
+            float axisEnter = (mins[axis] - start) / direction;
+            float axisExit = (maxs[axis] - start) / direction;
+            if (axisEnter > axisExit)
+                std::swap(axisEnter, axisExit);
+            rayEnter = (std::max)(rayEnter, axisEnter);
+            rayExit = (std::min)(rayExit, axisExit);
+            if (rayEnter > rayExit)
+                return false;
+        }
+
+        return rayExit >= 0.0f && rayEnter <= maxDistance;
+    }
+
+    bool VrHandsAimIsFinite(const Vector& v)
+    {
+        return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+    }
+
+    float VrHandsAimDot(const Vector& a, const Vector& b)
+    {
+        return a.x * b.x + a.y * b.y + a.z * b.z;
+    }
+
+    Vector VrHandsAimCross(const Vector& a, const Vector& b)
+    {
+        return Vector(
+            a.y * b.z - a.z * b.y,
+            a.z * b.x - a.x * b.z,
+            a.x * b.y - a.y * b.x);
+    }
+
+    bool VrHandsAimNormalize(Vector& v)
+    {
+        if (!VrHandsAimIsFinite(v))
+            return false;
+
+        const float len = VectorLength(v);
+        if (!std::isfinite(len) || len <= 0.0001f)
+            return false;
+
+        v *= 1.0f / len;
+        return true;
+    }
+
+    Vector VrHandsAimNormalizedLerp(
+        const Vector& from,
+        const Vector& to,
+        float t,
+        const Vector& fallback)
+    {
+        t = std::clamp(t, 0.0f, 1.0f);
+        Vector result = from * (1.0f - t) + to * t;
+        if (!VrHandsAimNormalize(result))
+            result = fallback;
+        return result;
+    }
+
+    bool VrHandsAimBuildBasis(
+        const Vector& forwardIn,
+        const Vector& referenceUpIn,
+        const Vector& fallbackRightIn,
+        Vector& outForward,
+        Vector& outRight,
+        Vector& outUp)
+    {
+        Vector forward = forwardIn;
+        if (!VrHandsAimNormalize(forward))
+            return false;
+
+        Vector up = referenceUpIn - forward * VrHandsAimDot(referenceUpIn, forward);
+        if (!VrHandsAimNormalize(up))
+        {
+            Vector right = fallbackRightIn - forward * VrHandsAimDot(fallbackRightIn, forward);
+            if (!VrHandsAimNormalize(right))
+            {
+                const Vector worldUp(0.0f, 0.0f, 1.0f);
+                right = VrHandsAimCross(forward, worldUp);
+                if (!VrHandsAimNormalize(right))
+                {
+                    right = Vector(0.0f, -1.0f, 0.0f);
+                    if (!VrHandsAimNormalize(right))
+                        return false;
+                }
+            }
+
+            up = VrHandsAimCross(right, forward);
+            if (!VrHandsAimNormalize(up))
+                return false;
+        }
+
+        Vector right = VrHandsAimCross(forward, up);
+        if (!VrHandsAimNormalize(right))
+            return false;
+
+        up = VrHandsAimCross(right, forward);
+        if (!VrHandsAimNormalize(up))
+            return false;
+
+        outForward = forward;
+        outRight = right;
+        outUp = up;
+        return true;
+    }
+}
+
+bool VR::ResolvePavlovTwoHandedAimBasis(
+    const Vector& leftControllerPosAbs,
+    const Vector& rightControllerPosAbs,
+    const Vector& rightControllerForward,
+    const Vector& rightControllerRight,
+    const Vector& rightControllerUp,
+    const Vector& hmdPosAbs,
+    const Vector& hmdForward,
+    const Vector& hmdRight,
+    const Vector& hmdUp,
+    float sourceUnitsPerMeter,
+    Vector& outForward,
+    Vector& outRight,
+    Vector& outUp) const
+{
+    if (!IsVrHandsTwoHandedGripPoseActive() || m_MouseModeEnabled)
+        return false;
+
+    if (!VrHandsAimIsFinite(leftControllerPosAbs) ||
+        !VrHandsAimIsFinite(rightControllerPosAbs) ||
+        !VrHandsAimIsFinite(rightControllerForward) ||
+        !VrHandsAimIsFinite(rightControllerRight) ||
+        !VrHandsAimIsFinite(rightControllerUp))
+    {
+        return false;
+    }
+
+    Vector baseForward = rightControllerForward;
+    Vector baseRight = rightControllerRight;
+    Vector baseUp = rightControllerUp;
+    if (!VrHandsAimBuildBasis(baseForward, baseUp, baseRight, baseForward, baseRight, baseUp))
+        return false;
+
+    const float scale = std::max(1.0f, std::fabs(sourceUnitsPerMeter));
+    const Vector rearGrip = rightControllerPosAbs;
+    Vector frontGrip = leftControllerPosAbs;
+    if (!m_VrHandsTwoHandedAimMountFriendly)
+    {
+        frontGrip += baseForward * (m_VrHandsTwoHandedAimOffhandOffsetMeters.x * scale);
+        frontGrip += baseRight * (m_VrHandsTwoHandedAimOffhandOffsetMeters.y * scale);
+        frontGrip += baseUp * (m_VrHandsTwoHandedAimOffhandOffsetMeters.z * scale);
+    }
+
+    Vector handDelta = frontGrip - rearGrip;
+    float handDistance = VectorLength(handDelta);
+    if (!std::isfinite(handDistance) || handDistance <= 0.01f * scale)
+        return false;
+
+    Vector twoHandForward = handDelta * (1.0f / handDistance);
+
+    const float maxDistance = std::max(0.0f, m_VrHandsTwoHandedAimMaxHandDistanceMeters) * scale;
+    if (maxDistance > 0.01f * scale && handDistance > maxDistance)
+    {
+        frontGrip = rearGrip + twoHandForward * maxDistance;
+        handDistance = maxDistance;
+    }
+
+    float twoHandStrength = 0.0f;
+    float virtualStockStrength = 0.0f;
+    if (!m_VrHandsTwoHandedGripPistol)
+    {
+        const float minDistance = std::max(0.0f, m_VrHandsTwoHandedAimMinHandDistanceMeters) * scale;
+        float distanceWeight = 1.0f;
+        if (!m_VrHandsTwoHandedGripPistol &&
+            minDistance > 0.01f * scale && handDistance < minDistance)
+        {
+            distanceWeight = std::clamp(handDistance / minDistance, 0.0f, 1.0f);
+        }
+
+        twoHandStrength = std::clamp(m_VrHandsTwoHandedAimStrength, 0.0f, 1.0f) * distanceWeight;
+        virtualStockStrength = std::clamp(m_VrHandsVirtualStockStrength, 0.0f, 1.0f);
+    }
+
+    Vector resolvedForward = VrHandsAimNormalizedLerp(
+        baseForward,
+        twoHandForward,
+        twoHandStrength,
+        baseForward);
+
+    if (m_VrHandsVirtualStockEnabled &&
+        !m_VrHandsTwoHandedGripPistol && !m_Game->m_IsMeleeWeaponActive)
+    {
+        const Vector worldUp(0.0f, 0.0f, 1.0f);
+        Vector bodyForward = hmdForward;
+        bodyForward.z = 0.0f;
+        if (!VrHandsAimNormalize(bodyForward))
+        {
+            bodyForward = baseForward;
+            bodyForward.z = 0.0f;
+            if (!VrHandsAimNormalize(bodyForward))
+                bodyForward = Vector(1.0f, 0.0f, 0.0f);
+        }
+
+        Vector bodyRight = VrHandsAimCross(bodyForward, worldUp);
+        if (!VrHandsAimNormalize(bodyRight))
+        {
+            bodyRight = hmdRight;
+            bodyRight.z = 0.0f;
+            if (!VrHandsAimNormalize(bodyRight))
+                bodyRight = baseRight;
+        }
+
+        const float dominantSide = m_LeftHanded ? -1.0f : 1.0f;
+        Vector shoulder = hmdPosAbs;
+        shoulder += bodyForward * (m_VrHandsVirtualStockOffsetMeters.x * scale);
+        shoulder += bodyRight * (m_VrHandsVirtualStockOffsetMeters.y * dominantSide * scale);
+        shoulder += worldUp * (m_VrHandsVirtualStockOffsetMeters.z * scale);
+
+        Vector stockDirection = frontGrip - shoulder;
+        if (VrHandsAimNormalize(stockDirection))
+        {
+            resolvedForward = VrHandsAimNormalizedLerp(
+                resolvedForward,
+                stockDirection,
+                virtualStockStrength,
+                resolvedForward);
+        }
+    }
+
+    Vector referenceUp = baseUp;
+    if (m_VrHandsVirtualStockEnabled &&
+        !m_VrHandsTwoHandedGripPistol && !m_Game->m_IsMeleeWeaponActive
+        && !hmdUp.IsZero())
+        {
+            referenceUp = VrHandsAimNormalizedLerp(baseUp, hmdUp, 0.15f, baseUp);
+        }
+
+    return VrHandsAimBuildBasis(
+        resolvedForward,
+        referenceUp,
+        baseRight,
+        outForward,
+        outRight,
+        outUp);
+}
+
+void VR::ApplyPavlovTwoHandedAimSmoothing(Vector& forward, Vector& right, Vector& up)
+{
+    const float tau = std::clamp(m_VrHandsTwoHandedAimSmoothingSeconds, 0.0f, 0.25f);
+    if (tau <= 0.0001f)
+    {
+        m_VrHandsTwoHandedAimSmoothingValid = false;
+        return;
+    }
+
+    const float dt = std::clamp(m_LastFrameDuration, 0.0f, 0.1f);
+    const float alpha = (dt <= 0.0f) ? 1.0f : (1.0f - expf(-dt / tau));
+    if (!m_VrHandsTwoHandedAimSmoothingValid)
+    {
+        m_VrHandsTwoHandedAimForwardSmoothed = forward;
+        m_VrHandsTwoHandedAimUpSmoothed = up;
+        m_VrHandsTwoHandedAimSmoothingValid = true;
+        return;
+    }
+
+    Vector smoothedForward = VrHandsAimNormalizedLerp(
+        m_VrHandsTwoHandedAimForwardSmoothed,
+        forward,
+        alpha,
+        forward);
+    Vector smoothedUp = VrHandsAimNormalizedLerp(
+        m_VrHandsTwoHandedAimUpSmoothed,
+        up,
+        alpha,
+        up);
+
+    if (VrHandsAimBuildBasis(smoothedForward, smoothedUp, right, forward, right, up))
+    {
+        m_VrHandsTwoHandedAimForwardSmoothed = forward;
+        m_VrHandsTwoHandedAimUpSmoothed = up;
+    }
+}
+
+void VR::ResetPavlovTwoHandedAimSmoothing()
+{
+    m_VrHandsTwoHandedAimSmoothingValid = false;
+}
+
+bool VR::ReadWorldPoseTrackingSnapshot(VRWorldPoseTrackingSnapshot& outSnapshot) const
+{
+    {
+        std::lock_guard<std::mutex> lock(m_WorldPoseTrackingSnapshotMutex);
+        outSnapshot = m_WorldPoseTrackingSnapshot;
+    }
+    if (!outSnapshot.initialized)
+        return false;
+
+    outSnapshot.twoHandedGripActive =
+        IsVrHandsTwoHandedGripPoseActive();
+    outSnapshot.emptyHandsActive =
+        m_ManualInventoryEmptyHandsActive.load(std::memory_order_acquire);
+
+    // State flags are anatomical, not gameplay-hand labels. In left-handed
+    // mode the physical left hand is dominant and the physical right hand is
+    // the optional support hand.
+    if (outSnapshot.emptyHandsActive)
+    {
+        outSnapshot.leftFingerUsesNativeAnimation = false;
+        outSnapshot.rightFingerUsesNativeAnimation = false;
+    }
+    else if (m_LeftHanded)
+    {
+        outSnapshot.leftFingerUsesNativeAnimation = true;
+        outSnapshot.rightFingerUsesNativeAnimation =
+            outSnapshot.twoHandedGripActive;
+    }
+    else
+    {
+        outSnapshot.leftFingerUsesNativeAnimation =
+            outSnapshot.twoHandedGripActive;
+        outSnapshot.rightFingerUsesNativeAnimation = true;
+    }
+
+    outSnapshot.leftFingerCurlsValid = false;
+    outSnapshot.rightFingerCurlsValid = false;
+    outSnapshot.leftFingerCurls = {};
+    outSnapshot.rightFingerCurls = {};
+
+    constexpr float kOpenVRThumbMinCurl = 0.0f;
+    constexpr float kOpenVRThumbMaxCurl = 2.0f;
+    constexpr float kOpenVRFingerMaxCurl = 2.0f;
+    const float curlScale = std::clamp(
+        m_NativeViewmodelLeftHandOpenVRCurlScale,
+        0.0f,
+        2.0f);
+    const bool magazinePoseActive =
+        m_MagazineInteractionLeftHandPoseActive.load(
+            std::memory_order_relaxed) != 0;
+    const bool magazinePoseUsesPhysicalLeft =
+        IsGameplayHandLeftPhysical(true);
+
+    auto finalizeAnatomicalCurls = [&](
+        std::array<float, 5>& curls,
+        bool applyMagazineGrip)
+    {
+        for (int finger = 0; finger < 5; ++finger)
+        {
+            const float baseCurl = std::clamp(
+                curls[static_cast<size_t>(finger)],
+                0.0f,
+                1.0f) * curlScale;
+            const float initialCurl =
+                finger < static_cast<int>(
+                    m_NativeViewmodelLeftHandOpenVRInitialCurl.size())
+                    ? m_NativeViewmodelLeftHandOpenVRInitialCurl[
+                        static_cast<size_t>(finger)]
+                    : 0.0f;
+            const float minimumCurl =
+                finger == 0 ? kOpenVRThumbMinCurl : 0.0f;
+            const float maximumCurl =
+                finger == 0
+                    ? kOpenVRThumbMaxCurl
+                    : kOpenVRFingerMaxCurl;
+            curls[static_cast<size_t>(finger)] = std::clamp(
+                baseCurl + initialCurl,
+                minimumCurl,
+                maximumCurl);
+        }
+
+        if (applyMagazineGrip)
+        {
+            static const float kMagazineGripMinCurl[5] =
+            {
+                kOpenVRThumbMinCurl, 0.60f, 0.66f, 0.68f, 0.68f,
+            };
+            for (int finger = 0; finger < 5; ++finger)
+            {
+                curls[static_cast<size_t>(finger)] = std::clamp(
+                    curls[static_cast<size_t>(finger)],
+                    kMagazineGripMinCurl[finger],
+                    finger == 0
+                        ? kOpenVRThumbMaxCurl
+                        : kOpenVRFingerMaxCurl);
+            }
+        }
+    };
+
+    // Match the cropped-hand state machine on the sender. Free/empty hands
+    // freeze Source finger animation and transmit the same scaled OpenVR curl
+    // values that are layered on that fixed base. Weapon and two-hand support
+    // poses remain native animation and therefore do not need curl payloads.
+    if (!outSnapshot.leftFingerUsesNativeAnimation)
+    {
+        std::array<float, 5> curls{};
+        const bool haveLiveCurls =
+            GetNativeViewmodelLeftHandOpenVRFingerCurls(curls);
+        if (haveLiveCurls || outSnapshot.emptyHandsActive)
+        {
+            finalizeAnatomicalCurls(
+                curls,
+                magazinePoseActive && magazinePoseUsesPhysicalLeft);
+            outSnapshot.leftFingerCurls = curls;
+            outSnapshot.leftFingerCurlsValid = true;
+        }
+    }
+
+    if (!outSnapshot.rightFingerUsesNativeAnimation)
+    {
+        std::array<float, 5> curls{};
+        const bool haveLiveCurls =
+            GetWorldPoseAnatomicalRightHandOpenVRFingerCurls(curls);
+        if (haveLiveCurls || outSnapshot.emptyHandsActive)
+        {
+            finalizeAnatomicalCurls(
+                curls,
+                magazinePoseActive && !magazinePoseUsesPhysicalLeft);
+            outSnapshot.rightFingerCurls = curls;
+            outSnapshot.rightFingerCurlsValid = true;
+        }
+    }
+
+    return true;
+}
+
+
+void VR::UpdateAdaptiveNearClip(C_BasePlayer* localPlayer)
+{
+    static int s_lastCandidateCount = -1;
+    const float contactNear = std::clamp(m_VRNearClip, 0.1f, 6.0f);
+    const float selfBodyNear = std::clamp(m_VRNearClipSelfBodyNearClip, 0.1f, 6.0f);
+
+    if (!localPlayer ||
+        !m_Game ||
+        !m_Game->m_EngineClient ||
+        !m_Game->m_ClientEntityList ||
+        !m_Game->m_EngineClient->IsInGame() ||
+        !VrHandsAimIsFinite(m_HmdPosAbs))
+    {
+        m_VRNearClipCharacterContactActive = false;
+        m_VRNearClipSelfBodyActive = false;
+        s_lastCandidateCount = -1;
+        m_VRNearClipClosestCharacterDistance.store(-1.0f, std::memory_order_relaxed);
+        m_VRNearClipEffective.store(6.0f, std::memory_order_relaxed);
+        m_RenderVRNearClipCharacterContactActive.store(0, std::memory_order_release);
+        return;
+    }
+
+    bool foundCharacter = false;
+    int candidateCount = 0;
+    float closestDistance = 1.0e30f;
+    if (m_VRNearClipAdaptive)
+    {
+        for (int entityIndex = 1; entityIndex < static_cast<int>(Game::kMaxPlayers); ++entityIndex)
+        {
+            if (!AdaptiveNearClipIsConnectedPlayer(m_Game->m_EngineClient, entityIndex))
+                continue;
+
+            C_BaseEntity* character = AdaptiveNearClipGetClientEntity(
+                m_Game->m_ClientEntityList,
+                entityIndex);
+            // GetPlayerInfo distinguishes real player slots from weapons and props whose
+            // entity indices can also fall below Game::kMaxPlayers on small servers.
+            if (!character || character == localPlayer || !IsEntityAlive(character))
+                continue;
+
+            int team = 0;
+            if (!AdaptiveNearClipGetPlayerTeam(character, team) || (team != 2 && team != 3))
+                continue;
+
+            Vector characterOrigin{};
+            if (!AdaptiveNearClipGetAbsOrigin(character, characterOrigin))
+                continue;
+
+            const float distance = AdaptiveNearClipDistanceToCharacterCapsule(m_HmdPosAbs, characterOrigin);
+            if (!std::isfinite(distance))
+                continue;
+
+            foundCharacter = true;
+            ++candidateCount;
+            closestDistance = (std::min)(closestDistance, distance);
+        }
+    }
+
+    const float enterDistance = std::clamp(m_VRNearClipEnterDistance, 0.0f, 128.0f);
+    const float exitDistance = std::clamp(m_VRNearClipExitDistance, enterDistance, 192.0f);
+    const bool wasActive = m_VRNearClipCharacterContactActive;
+    if (!m_VRNearClipAdaptive)
+    {
+        m_VRNearClipCharacterContactActive = false;
+        s_lastCandidateCount = -1;
+    }
+    else if (m_VRNearClipCharacterContactActive)
+    {
+        if (!foundCharacter || closestDistance >= exitDistance)
+            m_VRNearClipCharacterContactActive = false;
+    }
+    else if (foundCharacter && closestDistance <= enterDistance)
+    {
+        m_VRNearClipCharacterContactActive = true;
+    }
+
+    if (m_VRNearClipDebugLog && candidateCount != s_lastCandidateCount)
+    {
+        Game::logMsg(
+            "[VR][NearClip] player-slot candidates=%d closest=%.2f enter=%.2f exit=%.2f clip=%.2f",
+            candidateCount,
+            foundCharacter ? closestDistance : -1.0f,
+            enterDistance,
+            exitDistance,
+            contactNear);
+        s_lastCandidateCount = candidateCount;
+    }
+    if (m_VRNearClipDebugLog && wasActive != m_VRNearClipCharacterContactActive)
+    {
+        Game::logMsg(
+            "[VR][NearClip] contact %s closest=%.2f effective=%.2f",
+            m_VRNearClipCharacterContactActive ? "entered" : "exited",
+            foundCharacter ? closestDistance : -1.0f,
+            m_VRNearClipCharacterContactActive ? contactNear : 6.0f);
+    }
+
+    const bool wasSelfBodyActive = m_VRNearClipSelfBodyActive;
+    bool selfBodyViewHit = false;
+    Vector localPlayerOrigin{};
+    const bool selfBodyEligible =
+        m_VRNearClipSelfBody &&
+        m_FirstPersonBodyEnabled &&
+        !m_IsThirdPersonCamera &&
+        AdaptiveNearClipGetAbsOrigin(localPlayer, localPlayerOrigin);
+    if (selfBodyEligible)
+    {
+        const float configuredDegrees = std::clamp(
+            m_VRNearClipSelfBodyLookDownDegrees,
+            0.0f,
+            85.0f);
+        const float requiredDegrees = m_VRNearClipSelfBodyActive
+            ? std::max(0.0f, configuredDegrees - 10.0f)
+            : configuredDegrees;
+        constexpr float kDegreesToRadians = 3.14159265358979323846f / 180.0f;
+        const float minimumLookDownSine = std::sin(requiredDegrees * kDegreesToRadians);
+        selfBodyViewHit = AdaptiveNearClipViewHitsSelfBody(
+            m_HmdPosAbs,
+            m_HmdForward,
+            localPlayerOrigin,
+            minimumLookDownSine,
+            m_VRNearClipSelfBodyActive);
+    }
+    m_VRNearClipSelfBodyActive = selfBodyEligible && selfBodyViewHit;
+    if (m_VRNearClipDebugLog && wasSelfBodyActive != m_VRNearClipSelfBodyActive)
+    {
+        Game::logMsg(
+            "[VR][NearClip] self-body %s effective=%.2f",
+            m_VRNearClipSelfBodyActive ? "entered" : "exited",
+            m_VRNearClipSelfBodyActive ? selfBodyNear :
+                (m_VRNearClipCharacterContactActive ? contactNear : 6.0f));
+    }
+
+    float effectiveNear = 6.0f;
+    if (m_VRNearClipCharacterContactActive)
+        effectiveNear = contactNear;
+    if (m_VRNearClipSelfBodyActive)
+        effectiveNear = m_VRNearClipCharacterContactActive
+            ? (std::min)(effectiveNear, selfBodyNear)
+            : selfBodyNear;
+
+    m_VRNearClipClosestCharacterDistance.store(
+        foundCharacter ? closestDistance : -1.0f,
+        std::memory_order_relaxed);
+    m_VRNearClipEffective.store(effectiveNear, std::memory_order_relaxed);
+    m_RenderVRNearClipCharacterContactActive.store(
+        (m_VRNearClipCharacterContactActive || m_VRNearClipSelfBodyActive) ? 1 : 0,
+        std::memory_order_release);
+}
+
+void VR::UpdateTracking()
+{
+    GetPoses();
+    // Map load / reconnect detection:
+    // - Some transitions briefly report observer-like netvars on the local player (even when alive).
+    // - We arm a short cooldown window whenever we (re)enter "in game" or we lose/regain the local player pointer.
+    // - The render hook will use this window to suppress observer-driven third-person latching.
+    const bool inGameNow = (m_Game && m_Game->m_EngineClient && m_Game->m_EngineClient->IsInGame());
+    if (m_WasInGamePrev && !inGameNow && m_Game)
+        m_Game->ResetVRPoseServerSession();
+    if (!m_WasInGamePrev && inGameNow){
+        m_FirstPersonControlReady.store(false, std::memory_order_release);
+        m_ThirdPersonMapLoadCooldownPending = true;
+        Hooks::s_ServerUnderstandsVR = false;
+        m_ServerHookFallbackPending = true;
+        m_ServerHookFallbackForcedNonVRServerMovement = false;
+        m_ServerHookFallbackCheckTime = {};
+        m_ForceNonVRServerMovement = m_ConfigForceNonVRServerMovement;
+    }
+    m_WasInGamePrev = inGameNow;
+    int playerIndex = inGameNow ? m_Game->m_EngineClient->GetLocalPlayer() : -1;
+    C_BasePlayer* localPlayer =
+        (inGameNow && playerIndex > 0)
+        ? (C_BasePlayer*)m_Game->GetClientEntity(playerIndex)
+        : nullptr;
+    if (!localPlayer) {
+        m_FirstPersonControlReady.store(false, std::memory_order_release);
+        ClearPlayerModelMaterialsSnapshot();
+        // Never let a reconnect/map transition publish tracking coordinates
+        // anchored to the previous local player or map.
+        {
+            std::lock_guard<std::mutex> lock(m_WorldPoseTrackingSnapshotMutex);
+            m_WorldPoseTrackingSnapshot = {};
+        }
+        m_ScopeWeaponIsFirearm = false;
+        // If we temporarily lose the local player (connect/disconnect/map change),
+        // clear mounted-gun edge tracking so we don't trigger a bogus reset later.
+        m_UsingMountedGunPrev = false;
+        m_ResetPositionAfterMountedGunExitPending = false;
+        CancelTeleportTargeting();
+        ClearTeleportServerTarget();
+        ClearTeleportVisualScout();
+        m_HadLocalPlayerPrev = false;
+        m_ResetPositionStableFrames.store(0u, std::memory_order_release);
+        m_ResetPositionStableEyeZValid = false;
+        m_StairStepCameraSmoothValid = false;
+        m_StairStepCameraSmoothLastT = {};
+        m_ThirdPersonMapLoadCooldownPending = true;
+        m_ThirdPersonMapLoadCooldownEnd = {};
+        UpdateAdaptiveNearClip(nullptr);
+        if (m_ServerHookFallbackPending)
+            m_ServerHookFallbackCheckTime = {};
+
+        // Publish a safe "no local player" snapshot for the render thread.
+        {
+            uint32_t seq = m_RenderViewParamsSeq.load(std::memory_order_relaxed);
+            m_RenderViewParamsSeq.store(seq + 1, std::memory_order_release);
+
+            m_RenderHasLocalPlayer.store(0, std::memory_order_relaxed);
+            m_RenderCameraAnchorPhaseAlignEligible.store(0, std::memory_order_relaxed);
+            m_RenderBodyVelocityX.store(0.0f, std::memory_order_relaxed);
+            m_RenderBodyVelocityY.store(0.0f, std::memory_order_relaxed);
+            m_RenderHasViewEntityOverride.store(0, std::memory_order_relaxed);
+            m_RenderViewEntityHandle.store(0, std::memory_order_relaxed);
+            m_RenderBeingRevived.store(0, std::memory_order_relaxed);
+            m_RenderRevivingOther.store(0, std::memory_order_relaxed);
+            m_RenderUsingMountedGun.store(0, std::memory_order_relaxed);
+            m_RenderPlayerIncap.store(0, std::memory_order_relaxed);
+            m_RenderPlayerControlledBySI.store(0, std::memory_order_relaxed);
+            m_RenderInThirdPersonMapLoadCooldown.store(0, std::memory_order_relaxed);
+
+            m_RenderTpWantsThirdPerson.store(0, std::memory_order_relaxed);
+            m_RenderTpObserver.store(0, std::memory_order_relaxed);
+            m_RenderTpDead.store(0, std::memory_order_relaxed);
+            m_RenderTpLifeState.store(0, std::memory_order_relaxed);
+            m_RenderTpObserverMode.store(0, std::memory_order_relaxed);
+            m_RenderTpObserverTarget.store(0, std::memory_order_relaxed);
+            m_RenderTpIncap.store(0, std::memory_order_relaxed);
+            m_RenderTpLedge.store(0, std::memory_order_relaxed);
+            m_RenderTpTongue.store(0, std::memory_order_relaxed);
+            m_RenderTpPinned.store(0, std::memory_order_relaxed);
+            m_RenderTpSelfMedkit.store(0, std::memory_order_relaxed);
+
+    m_RenderAimLineAllowed.store(0, std::memory_order_relaxed);
+    m_RenderAimLineShow.store(0, std::memory_order_relaxed);
+    m_RenderWeaponLaserSightActive.store(0, std::memory_order_relaxed);
+
+            m_RenderViewParamsSeq.store(seq + 2, std::memory_order_release);
+        }
+        return;
+    }
+    ApplyPendingTeleportVisualWorldDelta();
+
+    if (Hooks::s_ServerUnderstandsVR)
+    {
+        m_ServerHookFallbackPending = false;
+        m_ServerHookFallbackForcedNonVRServerMovement = false;
+        m_ServerHookFallbackCheckTime = {};
+        m_ForceNonVRServerMovement = m_ConfigForceNonVRServerMovement;
+    }
+    else if (m_ServerHookFallbackPending)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (m_ServerHookFallbackCheckTime.time_since_epoch().count() == 0)
+        {
+            const int delayMs = (m_ServerHookFallbackDelayMs > 0) ? m_ServerHookFallbackDelayMs : kServerHookFallbackDefaultDelayMs;
+            m_ServerHookFallbackCheckTime = now + std::chrono::milliseconds(delayMs);
+        }
+        else if (now >= m_ServerHookFallbackCheckTime)
+        {
+            m_ServerHookFallbackForcedNonVRServerMovement = true;
+            m_ForceNonVRServerMovement = true;
+            m_ServerHookFallbackPending = false;
+        }
+    }
+    // Rising edge: local player pointer recovered (after connect/disconnect/map load).
+    if (!m_HadLocalPlayerPrev)
+    {
+        m_FirstPersonControlReady.store(false, std::memory_order_release);
+        m_HadLocalPlayerPrev = true;
+        m_PlayerModelMaterialsLogSession.fetch_add(1u, std::memory_order_acq_rel);
+        if (m_ThirdPersonMapLoadCooldownPending && m_ThirdPersonMapLoadCooldownMs > 0)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            m_ThirdPersonMapLoadCooldownEnd = now + std::chrono::milliseconds(m_ThirdPersonMapLoadCooldownMs);
+        }
+        else
+        {
+            m_ThirdPersonMapLoadCooldownEnd = {};
+        }
+        m_ThirdPersonMapLoadCooldownPending = false;
+        // Clear any latched third-person state from the previous map/session.
+        m_IsThirdPersonCamera = false;
+        m_ThirdPersonHoldFrames = 0;
+    }
+    // Death flicker guard: latch a short first-person window on alive->dead transition.
+    RefreshDeathFirstPersonLock(localPlayer);
+    if (IsDeathFirstPersonLockActive())
+    {
+        // Also clear third-person hold state so the render hook won't immediately reassert 3P.
+        m_IsThirdPersonCamera = false;
+        m_ThirdPersonHoldFrames = 0;
+    }
+
+    // Observer state (used for in-eye spectator anchor/viewmodel stability).
+    const unsigned char* base = reinterpret_cast<const unsigned char*>(localPlayer);
+    const int teamNum = *reinterpret_cast<const int*>(base + kTeamNumOffset);
+    const unsigned char lifeState = *reinterpret_cast<const unsigned char*>(base + kLifeStateOffset);
+    const bool isObserver = (teamNum == 1) || (lifeState != 0);
+    const int obsMode = *reinterpret_cast<const int*>(base + kObserverModeOffset);
+    const int obsTarget = *reinterpret_cast<const int*>(base + kObserverTargetOffset);
+    auto handleValid = [](int h)
+        {
+            const unsigned int handle = static_cast<unsigned int>(h);
+            if (handle == 0u || handle == 0xFFFFFFFFu)
+                return false;
+
+            const unsigned int entityIndex = handle & 0x0FFFu;
+            return entityIndex > 0u && entityIndex < 2048u;
+        };
+
+    C_BasePlayer* viewPlayer = localPlayer;
+    bool inEyeObserver = false;
+    if (isObserver && obsMode == 4 && handleValid(obsTarget) && m_Game && m_Game->m_ClientEntityList)
+    {
+        if (C_BaseEntity* ent = (C_BaseEntity*)m_Game->m_ClientEntityList->GetClientEntityFromHandle(obsTarget))
+        {
+            viewPlayer = (C_BasePlayer*)ent;
+            inEyeObserver = true;
+        }
+    }
+
+    if (!inEyeObserver)
+    {
+        m_ObserverInEyeWasActivePrev = false;
+        m_ObserverInEyeTargetPrev = 0;
+        m_ResetPositionAfterObserverTargetSwitchPending = false;
+    }
+    else
+    {
+        if (!m_ObserverInEyeWasActivePrev || obsTarget != m_ObserverInEyeTargetPrev)
+        {
+            m_ResetPositionAfterObserverTargetSwitchPending = true;
+            m_ObserverInEyeTargetPrev = obsTarget;
+        }
+        m_ObserverInEyeWasActivePrev = true;
+    }
+
+    // Spectator/observer: default to free-roaming camera (instead of chase cam locked to a teammate).
+    // We only do this once per observer session, so the user can still manually switch modes afterwards.
+    if (m_ObserverDefaultFreeCam)
+    {
+        if (!isObserver)
+        {
+            m_ObserverWasActivePrev = false;
+            m_ObserverForcedFreeCamThisObserver = false;
+            m_ObserverFreeCamAttemptCount = 0;
+            m_ObserverLastFreeCamAttempt = {};
+        }
+        else
+        {
+            if (!m_ObserverWasActivePrev)
+            {
+                // New observer session: allow one auto-switch.
+                m_ObserverForcedFreeCamThisObserver = false;
+                m_ObserverFreeCamAttemptCount = 0;
+                m_ObserverLastFreeCamAttempt = {};
+            }
+
+            // Source observer modes (typical):
+            //   1=deathcam, 2=freeze-cam, 3=fixed, 4=in-eye, 5=chase, 6=roaming/free.
+            // We avoid fighting 1/2, and we keep retrying spec_mode 6 a few times because
+            // some servers/joins ignore early client commands during connection/spawn.
+            if (obsMode == 6)
+            {
+                m_ObserverForcedFreeCamThisObserver = true; // success; stop retrying
+            }
+            else if (!m_ObserverForcedFreeCamThisObserver && m_Game->m_EngineClient->IsInGame() && obsMode >= 3)
+            {
+                constexpr int kMaxAttempts = 10;
+                constexpr auto kRetryInterval = std::chrono::milliseconds(350);
+                auto now = std::chrono::steady_clock::now();
+                if (m_ObserverFreeCamAttemptCount < kMaxAttempts && (now - m_ObserverLastFreeCamAttempt) >= kRetryInterval)
+                {
+                    m_Game->ClientCmd_Unrestricted("spec_mode 6");
+                    m_ObserverLastFreeCamAttempt = now;
+                    m_ObserverFreeCamAttemptCount++;
+                }
+            }
+
+            m_ObserverWasActivePrev = true;
+        }
+    }
+
+    // Mounted gun (.50cal/minigun):
+    // - Render hook forces first-person while mounted.
+    // - When we exit the mounted gun, do a one-shot ResetPosition to re-align anchors.
+    const bool usingMountedGunNow = IsUsingMountedGun(localPlayer);
+    if (m_UsingMountedGunPrev && !usingMountedGunNow)
+        m_ResetPositionAfterMountedGunExitPending = true;
+    m_UsingMountedGunPrev = usingMountedGunNow;
+
+    // The scout camera is temporary and camera-only. If the real body enters any
+    // state that needs immediate feedback or authoritative camera placement, return
+    // before rendering another detached frame.
+    if (m_TeleportVisualScoutActive)
+    {
+        const bool incapacitated = (*reinterpret_cast<const unsigned char*>(base + kIsIncapacitatedOffset) != 0);
+        const bool hangingFromLedge = (*reinterpret_cast<const unsigned char*>(base + kIsHangingFromLedgeOffset) != 0);
+        const int tongueOwner = *reinterpret_cast<const int*>(base + kTongueOwnerOffset);
+        const bool hangingFromTongue = (*reinterpret_cast<const unsigned char*>(base + 0x1F84) != 0);
+        const int carryAttacker = *reinterpret_cast<const int*>(base + kCarryAttackerOffset);
+        const int pummelAttacker = *reinterpret_cast<const int*>(base + kPummelAttackerOffset);
+        const int pounceAttacker = *reinterpret_cast<const int*>(base + kPounceAttackerOffset);
+        const int jockeyAttacker = *reinterpret_cast<const int*>(base + kJockeyAttackerOffset);
+        const bool controlledBySpecialInfected =
+            hangingFromTongue || handleValid(tongueOwner) || handleValid(carryAttacker) ||
+            handleValid(pummelAttacker) || handleValid(pounceAttacker) || handleValid(jockeyAttacker);
+
+        if (isObserver || obsMode != 0 || incapacitated || hangingFromLedge ||
+            controlledBySpecialInfected || usingMountedGunNow)
+        {
+            ExitTeleportVisualScout();
+        }
+    }
+
+    m_Game->m_IsMeleeWeaponActive = viewPlayer->IsMeleeWeaponActive();
+
+    // Scope weapon classification (non-firearm can still use scope when front-view 3P forces it).
+    m_ScopeWeaponIsFirearm = false;
+    if (C_BaseCombatWeapon* active = viewPlayer->GetActiveWeapon())
+    {
+        if (C_WeaponCSBase* weapon = (C_WeaponCSBase*)active)
+            m_ScopeWeaponIsFirearm = IsFirearmWeaponId(weapon->GetWeaponID());
+    }
+    RefreshActiveViewmodelAdjustment(viewPlayer);
+    RefreshActiveScopeAdjustment(viewPlayer);
+
+    if (!m_IsThirdPersonCamera)
+    {
+        Vector eyeOrigin = viewPlayer->EyePosition();
+        if (!eyeOrigin.IsZero())
+        {
+            // Apply vertical comfort smoothing where the world anchor is actually
+            // produced. The render-hook copy is overwritten by EyePosition() here,
+            // so filtering only there never affected m_CameraAnchor.z.
+            //
+            // Keep jumps/falls fully responsive: stair/ground smoothing is active
+            // only while the live local player is grounded in normal first person.
+            const bool verticalComfortEligible =
+                viewPlayer == localPlayer &&
+                !inEyeObserver &&
+                !isObserver &&
+                obsMode == 0 &&
+                !usingMountedGunNow &&
+                !m_TeleportVisualScoutActive &&
+                localPlayer->m_hGroundEntity != -1 &&
+                m_StairStepCameraSmoothMs > 0 &&
+                std::isfinite(eyeOrigin.z);
+
+            if (verticalComfortEligible)
+            {
+                const auto now = std::chrono::steady_clock::now();
+                const float rawZ = eyeOrigin.z;
+                const bool discontinuity =
+                    !m_StairStepCameraSmoothValid ||
+                    !std::isfinite(m_StairStepCameraSmoothedZ) ||
+                    std::fabs(rawZ - m_StairStepCameraSmoothedZ) > 48.0f;
+
+                if (discontinuity)
+                {
+                    m_StairStepCameraSmoothedZ = rawZ;
+                    m_StairStepCameraSmoothValid = true;
+                }
+                else
+                {
+                    float dt = m_LastFrameDuration;
+                    if (m_StairStepCameraSmoothLastT.time_since_epoch().count() != 0)
+                        dt = std::chrono::duration<float>(now - m_StairStepCameraSmoothLastT).count();
+                    if (!std::isfinite(dt) || dt <= 0.0f)
+                        dt = 1.0f / 90.0f;
+                    dt = std::clamp(dt, 1.0f / 240.0f, 0.050f);
+
+                    const float tau = static_cast<float>(m_StairStepCameraSmoothMs) / 1000.0f;
+                    const float alpha = std::clamp(1.0f - std::exp(-dt / tau), 0.0f, 1.0f);
+                    m_StairStepCameraSmoothedZ +=
+                        (rawZ - m_StairStepCameraSmoothedZ) * alpha;
+                }
+
+                m_StairStepCameraSmoothLastT = now;
+                eyeOrigin.z = m_StairStepCameraSmoothedZ;
+            }
+            else
+            {
+                m_StairStepCameraSmoothValid = false;
+                m_StairStepCameraSmoothLastT = {};
+            }
+
+            m_SetupOrigin = eyeOrigin;
+            if (m_SetupOriginPrev.IsZero())
+                m_SetupOriginPrev = eyeOrigin;
+        }
+    }
+    else
+    {
+        m_StairStepCameraSmoothValid = false;
+        m_StairStepCameraSmoothLastT = {};
+    }
+
+    // --- Fix: third-person camera shifts CViewSetup::origin behind the player.
+    // In this codebase, controller world positions are anchored off m_CameraAnchor (NOT directly off m_SetupOrigin),
+    // and m_CameraAnchor is advanced by (m_SetupOrigin - m_SetupOriginPrev). If third-person origin pollutes
+    // m_SetupOrigin even briefly, m_CameraAnchor "learns" the offset and controllers/aimline look glued to the
+    // animated player model. So we must rebase BOTH m_SetupOrigin and m_CameraAnchor.
+    {
+        Vector absOrigin = viewPlayer->GetAbsOrigin();
+
+        // Desired anchor: follow player XY. Keep current Z from the view setup (eye height/crouch),
+        // because Z is used by height logic later.
+        Vector desired = m_SetupOrigin;
+        if (desired.IsZero())
+            desired = absOrigin + Vector(0, 0, 64);
+        desired.x = absOrigin.x;
+        desired.y = absOrigin.y;
+
+        Vector delta = desired - m_SetupOrigin;
+        delta.z = 0.0f; // only rebase planar drift from third-person camera
+
+        // If we haven't initialized anchors yet, initialize cleanly (don't "add huge delta" to zero state).
+        if (m_SetupOrigin.IsZero() || m_SetupOriginPrev.IsZero() || m_CameraAnchor.IsZero())
+        {
+            m_SetupOrigin = desired;
+            m_SetupOriginPrev = desired;
+            if (m_CameraAnchor.IsZero())
+                m_CameraAnchor = desired;
+        }
+        else if (VectorLength(delta) > 1.0f)
+        {
+            // Rebase camera anchor and previous setup origin so we DON'T get a one-frame spike
+            // in (m_SetupOrigin - m_SetupOriginPrev), and controllers immediately stop sticking to the model.
+            m_CameraAnchor += delta;
+            m_SetupOriginPrev += delta;
+            m_SetupOrigin = desired;
+        }
+    }
+
+    // Mouse-mode yaw smoothing (scheme A): delta-drain.
+    // - CreateMove converts cmd->mousedx to a yaw delta (degrees) and accumulates it into
+    //   m_MouseModeYawDeltaRemainingDeg.
+    // - UpdateTracking runs at VR render rate and applies a fraction of the remaining delta per frame.
+    //   This prevents the "inertial coast" feeling (fast flick -> extra turning after the mouse stops),
+    //   because we never apply more rotation than what was actually accumulated from the mouse.
+    if (m_MouseModeEnabled)
+    {
+        if (m_MouseModeTurnSmoothing > 0.0f)
+        {
+            const float dt = std::max(0.0f, m_LastFrameDuration);
+            const float tau = std::max(0.0001f, m_MouseModeTurnSmoothing);
+            const float alpha = 1.0f - expf(-dt / tau);
+
+            if (!m_MouseModeYawDeltaInitialized)
+            {
+                m_MouseModeYawDeltaRemainingDeg = 0.0f;
+                m_MouseModeYawDeltaInitialized = true;
+            }
+
+            // Drain a fraction of the remaining yaw delta each frame.
+            float step = m_MouseModeYawDeltaRemainingDeg * alpha;
+
+            // Snap tiny remainders to zero to avoid denormal drift.
+            if (fabsf(m_MouseModeYawDeltaRemainingDeg) < 0.00001f)
+            {
+                m_MouseModeYawDeltaRemainingDeg = 0.0f;
+                step = 0.0f;
+            }
+            else
+            {
+                m_MouseModeYawDeltaRemainingDeg -= step;
+            }
+
+            m_RotationOffset += step;
+            // Wrap to [0, 360)
+            m_RotationOffset -= 360.0f * std::floor(m_RotationOffset / 360.0f);
+        }
+        else
+        {
+            // Legacy: yaw was already applied directly on CreateMove ticks.
+            m_MouseModeYawDeltaRemainingDeg = 0.0f;
+            m_MouseModeYawDeltaInitialized = false;
+        }
+    }
+    else
+    {
+        m_MouseModeYawDeltaRemainingDeg = 0.0f;
+        m_MouseModeYawDeltaInitialized = false;
+        m_MouseModeYawTargetInitialized = false; // legacy field
+    }
+
+    // Mouse-mode pitch smoothing (aim pitch + optional view pitch):
+    // - cmd->mousedy arrives at CreateMove rate (tickrate), but VR rendering/tracking updates faster.
+    // - If we apply pitch only on CreateMove ticks, aiming up/down feels like it's "stuttering".
+    // So: CreateMove updates pitch targets, and here we smoothly converge per-frame.
+    if (m_MouseModeEnabled)
+    {
+        if (!m_MouseModePitchTargetInitialized)
+        {
+            m_MouseModePitchTarget = m_MouseAimPitchOffset;
+            m_MouseModePitchTargetInitialized = true;
+        }
+        if (!m_MouseModeViewPitchTargetOffsetInitialized)
+        {
+            m_MouseModeViewPitchTargetOffset = m_MouseModeViewPitchOffset;
+            m_MouseModeViewPitchTargetOffsetInitialized = true;
+        }
+
+        if (m_MouseModePitchSmoothing > 0.0f)
+        {
+            const float dt = std::max(0.0f, m_LastFrameDuration);
+            const float tau = std::max(0.0001f, m_MouseModePitchSmoothing);
+            const float alpha = 1.0f - expf(-dt / tau);
+
+            m_MouseAimPitchOffset += (m_MouseModePitchTarget - m_MouseAimPitchOffset) * alpha;
+
+            if (m_MouseModePitchAffectsView)
+            {
+                m_MouseModeViewPitchOffset += (m_MouseModeViewPitchTargetOffset - m_MouseModeViewPitchOffset) * alpha;
+            }
+        }
+        else
+        {
+            // Smoothing disabled: keep legacy immediate behavior.
+            m_MouseAimPitchOffset = m_MouseModePitchTarget;
+            if (m_MouseModePitchAffectsView)
+                m_MouseModeViewPitchOffset = m_MouseModeViewPitchTargetOffset;
+        }
+
+        if (m_MouseAimPitchOffset > 89.f)  m_MouseAimPitchOffset = 89.f;
+        if (m_MouseAimPitchOffset < -89.f) m_MouseAimPitchOffset = -89.f;
+    }
+    else
+    {
+        m_MouseModePitchTargetInitialized = false;
+        m_MouseModeViewPitchTargetOffsetInitialized = false;
+    }
+
+    // HMD tracking
+    QAngle hmdAngLocal = m_HmdPose.TrackedDeviceAng;
+    const float rawHmdLocalYaw = hmdAngLocal.y;
+    const bool routeHmdYawThroughTurnPath =
+        m_QueuedRenderHmdYawUsesTurnPath &&
+        (m_Game != nullptr) &&
+        (m_Game->GetMatQueueMode() != 0) &&
+        !m_MouseModeEnabled;
+    if (routeHmdYawThroughTurnPath)
+    {
+        if (!m_QueuedRenderHmdYawTurnPathInitialized)
+        {
+            m_QueuedRenderHmdYawTurnPathPrevLocalYaw = hmdAngLocal.y;
+            m_QueuedRenderHmdYawTurnPathInitialized = true;
+        }
+        else
+        {
+            float yawDelta = rawHmdLocalYaw - m_QueuedRenderHmdYawTurnPathPrevLocalYaw;
+            yawDelta -= 360.0f * std::floor((yawDelta + 180.0f) / 360.0f);
+
+            m_RotationOffset += yawDelta;
+            m_RotationOffset -= 360.0f * std::floor(m_RotationOffset / 360.0f);
+
+            // Cancel the local-pose yaw change so the final view is unchanged, but the body/render
+            // path now matches thumbstick turning under queued rendering.
+            hmdAngLocal.y -= yawDelta;
+            hmdAngLocal.y -= 360.0f * std::floor((hmdAngLocal.y + 180.0f) / 360.0f);
+
+            m_QueuedRenderHmdYawTurnPathPrevLocalYaw = rawHmdLocalYaw;
+        }
+    }
+    else
+    {
+        m_QueuedRenderHmdYawTurnPathInitialized = false;
+        m_QueuedRenderHmdYawTurnPathPrevLocalYaw = rawHmdLocalYaw;
+    }
+    Vector hmdPosLocal = m_HmdPose.TrackedDevicePos;
+
+    Vector deltaPosition = hmdPosLocal - m_HmdPosLocalPrev;
+    Vector hmdPosCorrected = m_HmdPosCorrectedPrev + deltaPosition;
+
+    VectorPivotXY(hmdPosCorrected, m_HmdPosCorrectedPrev, m_RotationOffset);
+
+    hmdAngLocal.y += m_RotationOffset;
+    // Wrap angle from -180 to 180
+    hmdAngLocal.y -= 360 * std::floor((hmdAngLocal.y + 180) / 360);
+
+    // Mouse-mode pitch: optional view tilt driven by mouse Y.
+    if (m_MouseModeEnabled && m_MouseModePitchAffectsView)
+    {
+        hmdAngLocal.x += m_MouseModeViewPitchOffset;
+        // Wrap to [-180, 180]
+        hmdAngLocal.x -= 360 * std::floor((hmdAngLocal.x + 180) / 360);
+        // Keep pitch in a sane range (Source viewangles expect [-89, 89]).
+        if (hmdAngLocal.x > 89.f)  hmdAngLocal.x = 89.f;
+        if (hmdAngLocal.x < -89.f) hmdAngLocal.x = -89.f;
+    }
+
+    auto wrapAngle = [](float angle)
+        {
+            return angle - 360.0f * std::floor((angle + 180.0f) / 360.0f);
+        };
+
+    const float headSmoothingStrength = std::clamp(m_HeadSmoothing, 0.0f, 0.99f);
+    if (!m_HeadSmoothingInitialized)
+    {
+        m_HmdPosSmoothed = hmdPosCorrected;
+        m_HmdAngSmoothed = hmdAngLocal;
+        m_HeadSmoothingInitialized = true;
+    }
+
+    if (headSmoothingStrength > 0.0f)
+    {
+        const float lerpFactor = 1.0f - headSmoothingStrength;
+        auto smoothVector = [&](const Vector& target, Vector& current)
+            {
+                current.x += (target.x - current.x) * lerpFactor;
+                current.y += (target.y - current.y) * lerpFactor;
+                current.z += (target.z - current.z) * lerpFactor;
+            };
+
+        auto smoothAngleComponent = [&](float target, float& current)
+            {
+                float diff = target - current;
+                diff -= 360.0f * std::floor((diff + 180.0f) / 360.0f);
+                current += diff * lerpFactor;
+            };
+
+        smoothVector(hmdPosCorrected, m_HmdPosSmoothed);
+        smoothAngleComponent(hmdAngLocal.x, m_HmdAngSmoothed.x);
+        smoothAngleComponent(hmdAngLocal.y, m_HmdAngSmoothed.y);
+        smoothAngleComponent(hmdAngLocal.z, m_HmdAngSmoothed.z);
+    }
+    else
+    {
+        m_HmdPosSmoothed = hmdPosCorrected;
+        m_HmdAngSmoothed = hmdAngLocal;
+    }
+
+    m_HmdAngSmoothed.x = wrapAngle(m_HmdAngSmoothed.x);
+    m_HmdAngSmoothed.y = wrapAngle(m_HmdAngSmoothed.y);
+    m_HmdAngSmoothed.z = wrapAngle(m_HmdAngSmoothed.z);
+
+    Vector hmdPosSmoothed = m_HmdPosSmoothed;
+    QAngle hmdAngSmoothed = m_HmdAngSmoothed;
+
+    m_HmdPosCorrectedPrev = hmdPosCorrected;
+    m_HmdPosLocalPrev = hmdPosLocal;
+
+    QAngle::AngleVectors(hmdAngSmoothed, &m_HmdForward, &m_HmdRight, &m_HmdUp);
+
+    m_HmdPosLocalInWorld = hmdPosSmoothed * m_VRScale;
+
+    // Roomscale setup
+    Vector cameraMovingDirection = m_SetupOrigin - m_SetupOriginPrev;
+    ConsumeTeleportEngineAnchorCompensation(cameraMovingDirection);
+    Vector cameraToPlayer = m_HmdPosAbsPrev - m_SetupOriginPrev;
+    cameraMovingDirection.z = 0;
+    cameraToPlayer.z = 0;
+    float cameraFollowing = DotProduct(cameraMovingDirection, cameraToPlayer);
+    float cameraDistance = VectorLength(cameraToPlayer);
+
+    // Roomscale camera behavior:
+    // - Legacy: only allow roomscale camera anchoring while "standing still" (velocity==0), and disable while thumbstick locomotion is active.
+    // - 1:1 server roomscale (ForceNonVRServerMovement=false): optionally keep the camera fully decoupled from the tick-rate player origin
+    //   so HMD motion stays smooth at headset refresh rate.
+    // - Thumbstick movement cannot be gated by the current input sample alone. Source prediction/interpolation may keep moving the player
+    //   for a few frames after the stick sample drops to zero. Keep the anchor coupled while the engine still reports horizontal velocity,
+    //   plus a short drain window so the final predicted origin delta is not skipped. Direct server-hook roomscale SetOrigin does not create
+    //   player velocity, so physical 1:1 walking remains decoupled and is not double-applied visually.
+    const float engineLocomotionSpeed2D = localPlayer->m_vecVelocity.Length2D();
+    const bool engineLocomotionActive =
+        std::isfinite(engineLocomotionSpeed2D) && engineLocomotionSpeed2D > 0.5f;
+    static std::chrono::steady_clock::time_point s_roomscale1To1EngineLocomotionCoupleUntil{};
+    const auto roomscale1To1CoupleNow = std::chrono::steady_clock::now();
+    if (!m_Roomscale1To1Movement)
+    {
+        s_roomscale1To1EngineLocomotionCoupleUntil = {};
+    }
+    else if (m_LocomotionActive || engineLocomotionActive)
+    {
+        s_roomscale1To1EngineLocomotionCoupleUntil =
+            roomscale1To1CoupleNow + std::chrono::milliseconds(150);
+    }
+    const bool keepAnchorCoupledForEngineLocomotion =
+        roomscale1To1CoupleNow < s_roomscale1To1EngineLocomotionCoupleUntil;
+    const bool want1to1DecoupledCamera =
+        m_Roomscale1To1Movement &&
+        !m_ForceNonVRServerMovement &&
+        m_Roomscale1To1DecoupleCamera &&
+        !m_IsThirdPersonCamera &&
+        !keepAnchorCoupledForEngineLocomotion &&
+        !usingMountedGunNow;
+
+    if (m_IsThirdPersonCamera && m_Roomscale1To1Movement && m_Roomscale1To1DecoupleCamera)
+    {
+        m_Roomscale1To1LastEngineEyeValid = false;
+        m_Roomscale1To1PendingVisualWorldDeltaValid = false;
+    }
+
+    if (inEyeObserver)
+    {
+        m_RoomscaleActive = false;
+    }
+    else if (usingMountedGunNow)
+    {
+        // Mounted guns force first-person render path; keep roomscale anchor coupled to avoid
+        // first/third-person render-path thrashing when decoupled camera mode is enabled.
+        m_RoomscaleActive = false;
+    }
+    else if (want1to1DecoupledCamera)
+    {
+        // In 1:1 mode, the camera should not be dragged by the player's tick-rate origin updates.
+        m_RoomscaleActive = true;
+    }
+    else if (localPlayer->m_hGroundEntity != -1 && localPlayer->m_vecVelocity.IsZero())
+    {
+        m_RoomscaleActive = true;
+    }
+    else
+    {
+        m_RoomscaleActive = false;
+    }
+
+    // Keep the legacy "camera following" escape hatch, but never override the explicit 1:1 decoupled camera mode.
+    if (!want1to1DecoupledCamera)
+    {
+        if ((cameraFollowing < 0 && cameraDistance > 1) || (m_LocomotionActive))
+            m_RoomscaleActive = false;
+    }
+    else
+    {
+        if (m_LocomotionActive)
+            m_RoomscaleActive = false;
+    }
+
+    if (m_TeleportVisualScoutActive)
+    {
+        // Keep the detached scout camera fixed at the chosen world-space anchor.
+        // HMD room motion still applies through m_HmdPosLocalInWorld below.
+        m_RoomscaleActive = true;
+        m_CameraAnchor = m_TeleportVisualScoutCameraAnchor;
+    }
+    else
+    {
+        if (!m_RoomscaleActive)
+            m_CameraAnchor += m_SetupOrigin - m_SetupOriginPrev;
+
+        m_CameraAnchor.z = m_SetupOrigin.z + m_HeightOffset;
+    }
+
+    // A real teleport is queued before this frame's local HMD pose is refreshed. Apply
+    // its final XY recenter here so the camera lands exactly on the accepted body origin
+    // instead of inheriting a stale forward/sideways roomscale offset.
+    if (!m_TeleportVisualScoutActive && m_TeleportPendingCameraPlanarRecenterValid)
+    {
+        if (IsFiniteTeleportVector(m_TeleportPendingCameraPlanarRecenterTarget) &&
+            IsFiniteTeleportVector(m_HmdPosLocalInWorld))
+        {
+            m_CameraAnchor.x = m_TeleportPendingCameraPlanarRecenterTarget.x - m_HmdPosLocalInWorld.x;
+            m_CameraAnchor.y = m_TeleportPendingCameraPlanarRecenterTarget.y - m_HmdPosLocalInWorld.y;
+        }
+        m_TeleportPendingCameraPlanarRecenterTarget = {};
+        m_TeleportPendingCameraPlanarRecenterValid = false;
+    }
+
+    const bool suppressTeleportCameraClip = m_TeleportCameraClipSuppressFrames > 0;
+    if (m_TeleportCameraClipSuppressFrames > 0)
+        --m_TeleportCameraClipSuppressFrames;
+
+    m_HmdPosAbs = m_CameraAnchor - Vector(0, 0, 64) + m_HmdPosLocalInWorld;
+
+    if (!m_TeleportVisualScoutActive && !suppressTeleportCameraClip)
+    {
+        // Check if camera is clipping inside wall. A detached scout camera deliberately
+        // crosses the space between the body and target, so this correction must not run
+        // while scouting.
+        CGameTrace trace;
+        Ray_t ray;
+        CTraceFilterSkipNPCsAndPlayers tracefilter((IHandleEntity*)localPlayer, 0);
+
+        Vector extendedHmdPos = m_HmdPosAbs - m_SetupOrigin;
+        VectorNormalize(extendedHmdPos);
+        extendedHmdPos = m_HmdPosAbs + (extendedHmdPos * 10);
+        ray.Init(m_SetupOrigin, extendedHmdPos);
+
+        m_Game->m_EngineTrace->TraceRay(ray, STANDARD_TRACE_MASK, &tracefilter, &trace);
+        if (trace.fraction < 1 && trace.fraction > 0)
+        {
+            Vector distanceInsideWall = trace.endpos - extendedHmdPos;
+            m_CameraAnchor += distanceInsideWall;
+            m_HmdPosAbs = m_CameraAnchor - Vector(0, 0, 64) + m_HmdPosLocalInWorld;
+        }
+    }
+
+    // Reset camera if it somehow gets too far. Detached scout view is allowed to
+    // exceed the normal roomscale safety radius until the user presses teleport again.
+    {
+        auto isFiniteVector = [](const Vector& value)
+            {
+                return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+            };
+
+        const bool liveLocalPlayer = (teamNum != 1) && (lifeState == 0) && (obsMode == 0);
+        const bool stableInEyeObserver = inEyeObserver && viewPlayer && IsEntityAlive(viewPlayer);
+        const Vector resetEyeOrigin = stableInEyeObserver ? viewPlayer->EyePosition() : localPlayer->EyePosition();
+        const bool resetCameraFinite =
+            isFiniteVector(resetEyeOrigin) &&
+            isFiniteVector(m_SetupOrigin) &&
+            isFiniteVector(m_HmdPosAbs) &&
+            isFiniteVector(m_HmdPosLocalInWorld);
+
+        bool resetVerticalMovementSafe = false;
+        if (stableInEyeObserver)
+        {
+            resetVerticalMovementSafe = true;
+        }
+        else if (liveLocalPlayer)
+        {
+            const float verticalSpeed = localPlayer->m_vecVelocity.z;
+            resetVerticalMovementSafe =
+                localPlayer->m_hGroundEntity != -1 &&
+                std::isfinite(verticalSpeed) &&
+                std::fabs(verticalSpeed) <= 4.0f;
+        }
+
+        const bool resetStateCandidate =
+            (liveLocalPlayer || stableInEyeObserver) &&
+            resetVerticalMovementSafe &&
+            !m_TeleportVisualScoutActive &&
+            !IsThirdPersonMapLoadCooldownActive();
+
+        uint32_t stableFrames = 0u;
+        if (resetStateCandidate && resetCameraFinite)
+        {
+            // ResetPosition writes the current Z delta into m_HeightOffset.  Keep the
+            // gate tight so jump, stair, slope, and ladder Z motion cannot be baked
+            // into the user's standing height.
+            constexpr float kMaxStableEyeZStep = 0.75f;
+            const bool eyeZStable =
+                !m_ResetPositionStableEyeZValid ||
+                std::fabs(resetEyeOrigin.z - m_ResetPositionStableEyeZ) <= kMaxStableEyeZStep;
+
+            stableFrames = eyeZStable
+                ? (std::min)(m_ResetPositionStableFrames.load(std::memory_order_relaxed) + 1u, 60u)
+                : 1u;
+            m_ResetPositionStableEyeZ = resetEyeOrigin.z;
+            m_ResetPositionStableEyeZValid = true;
+        }
+        else
+        {
+            m_ResetPositionStableEyeZValid = false;
+        }
+
+        m_ResetPositionStableFrames.store(stableFrames, std::memory_order_release);
+    }
+
+    m_SetupOriginToHMD = m_HmdPosAbs - m_SetupOrigin;
+    if (m_AutoRecenterSmooth &&
+        !m_TeleportVisualScoutActive &&
+        !suppressTeleportCameraClip &&
+        !m_IsThirdPersonCamera &&
+        !want1to1DecoupledCamera &&
+        CanApplyResetPositionNow())
+    {
+        Vector planarDrift = m_SetupOriginToHMD;
+        planarDrift.z = 0.0f;
+
+        const float driftLen = VectorLength(planarDrift);
+        const float softStart = std::clamp(m_AutoRecenterSoftStartDistance, 0.0f, 150.0f);
+        const float maxSpeed = std::max(0.0f, m_AutoRecenterMaxSpeed);
+        if (std::isfinite(driftLen) && driftLen > softStart && maxSpeed > 0.0f)
+        {
+            float dt = m_LastFrameDuration;
+            if (!std::isfinite(dt) || dt <= 0.0f)
+                dt = 1.0f / 90.0f;
+            dt = std::clamp(dt, 1.0f / 240.0f, 1.0f / 15.0f);
+
+            const float excessLen = driftLen - softStart;
+            const float stepLen = std::min(excessLen, maxSpeed * dt);
+            if (stepLen > 0.0001f)
+            {
+                const Vector correction = planarDrift * (-(stepLen / driftLen));
+                m_CameraAnchor += correction;
+                m_HmdPosAbs += correction;
+                m_SetupOriginToHMD += correction;
+            }
+        }
+    }
+
+    const float hardRecenterDistance = std::max(m_AutoRecenterSoftStartDistance + 1.0f, m_AutoRecenterHardDistance);
+    Vector hardRecenterDrift = m_SetupOriginToHMD;
+    hardRecenterDrift.z = 0.0f;
+    if (!m_TeleportVisualScoutActive && !suppressTeleportCameraClip && VectorLength(hardRecenterDrift) > hardRecenterDistance)
+        ResetPosition();
+    // Observer in-eye: when switching spectated target, re-align anchors once.
+    if (m_ResetPositionAfterObserverTargetSwitchPending)
+    {
+        ResetPosition();
+        m_ResetPositionAfterObserverTargetSwitchPending = false;
+    }
+    // If we just exited a mounted gun (.50cal/minigun), re-align anchors.
+   // Do this here (after m_HmdPosAbs has been updated for this frame) so the
+   // reset uses the latest tracking pose.
+    if (m_ResetPositionAfterMountedGunExitPending)
+    {
+        ResetPosition();
+        m_ResetPositionAfterMountedGunExitPending = false;
+    }
+    if (m_ResetPositionDeferredPending.load(std::memory_order_acquire) != 0u && CanApplyResetPositionNow())
+        ResetPosition();
+    m_HmdAngAbs = hmdAngSmoothed;
+
+    // Mouse aim initialization: decouple aim pitch from HMD pitch.
+    if (m_MouseModeEnabled)
+    {
+        if (!m_MouseAimInitialized)
+        {
+            m_MouseAimPitchOffset = m_HmdAngAbs.x;
+            m_MouseModeViewPitchOffset = 0.0f;
+            m_MouseAimInitialized = true;
+
+            // Initialize targets to avoid a one-frame jump when smoothing is enabled.
+            m_MouseModePitchTarget = m_MouseAimPitchOffset;
+            m_MouseModePitchTargetInitialized = true;
+            m_MouseModeViewPitchTargetOffset = m_MouseModeViewPitchOffset;
+            m_MouseModeViewPitchTargetOffsetInitialized = true;
+        }
+        // Clamp to sane pitch range.
+        if (m_MouseAimPitchOffset > 89.f)  m_MouseAimPitchOffset = 89.f;
+        if (m_MouseAimPitchOffset < -89.f) m_MouseAimPitchOffset = -89.f;
+    }
+    else
+    {
+        m_MouseAimInitialized = false;
+        m_MouseModeViewPitchOffset = 0.0f;
+        m_MouseModePitchTargetInitialized = false;
+        m_MouseModeViewPitchTargetOffsetInitialized = false;
+    }
+
+    m_HmdPosAbsPrev = m_HmdPosAbs;
+    m_SetupOriginPrev = m_SetupOrigin;
+
+    // Character proximity is sampled on this update thread. RenderView consumes
+    // only the published atomics, so queued rendering never dereferences entities.
+    UpdateAdaptiveNearClip(localPlayer);
+
+    GetViewParameters();
+    m_Ipd = m_EyeToHeadTransformPosRight.x * 2;
+    m_EyeZ = m_EyeToHeadTransformPosRight.z;
+
+    // Hand tracking
+    Vector leftControllerPosLocal = m_LeftControllerPose.TrackedDevicePos;
+    QAngle leftControllerAngLocal = m_LeftControllerPose.TrackedDeviceAng;
+
+    Vector rightControllerPosLocal = m_RightControllerPose.TrackedDevicePos;
+    QAngle rightControllerAngLocal = m_RightControllerPose.TrackedDeviceAng;
+
+    float controllerSmoothingStrength = std::clamp(m_ControllerSmoothing, 0.0f, 0.99f);
+
+    if (!m_ControllerSmoothingInitialized)
+    {
+        m_LeftControllerPosSmoothed = leftControllerPosLocal;
+        m_LeftControllerAngSmoothed = leftControllerAngLocal;
+        m_RightControllerPosSmoothed = rightControllerPosLocal;
+        m_RightControllerAngSmoothed = rightControllerAngLocal;
+        m_ControllerSmoothingInitialized = true;
+    }
+
+    if (controllerSmoothingStrength > 0.0f)
+    {
+        float lerpFactor = 1.0f - controllerSmoothingStrength;
+
+        auto smoothVector = [&](const Vector& target, Vector& current)
+            {
+                current.x += (target.x - current.x) * lerpFactor;
+                current.y += (target.y - current.y) * lerpFactor;
+                current.z += (target.z - current.z) * lerpFactor;
+            };
+
+        auto smoothAngleComponent = [&](float target, float& current)
+            {
+                float diff = target - current;
+                diff -= 360.0f * std::floor((diff + 180.0f) / 360.0f);
+                current += diff * lerpFactor;
+            };
+
+        smoothVector(leftControllerPosLocal, m_LeftControllerPosSmoothed);
+        smoothVector(rightControllerPosLocal, m_RightControllerPosSmoothed);
+
+        smoothAngleComponent(leftControllerAngLocal.x, m_LeftControllerAngSmoothed.x);
+        smoothAngleComponent(leftControllerAngLocal.y, m_LeftControllerAngSmoothed.y);
+        smoothAngleComponent(leftControllerAngLocal.z, m_LeftControllerAngSmoothed.z);
+
+        smoothAngleComponent(rightControllerAngLocal.x, m_RightControllerAngSmoothed.x);
+        smoothAngleComponent(rightControllerAngLocal.y, m_RightControllerAngSmoothed.y);
+        smoothAngleComponent(rightControllerAngLocal.z, m_RightControllerAngSmoothed.z);
+    }
+    else
+    {
+        m_LeftControllerPosSmoothed = leftControllerPosLocal;
+        m_LeftControllerAngSmoothed = leftControllerAngLocal;
+        m_RightControllerPosSmoothed = rightControllerPosLocal;
+        m_RightControllerAngSmoothed = rightControllerAngLocal;
+    }
+
+    auto wrapAngles = [&](QAngle& ang)
+        {
+            ang.x = wrapAngle(ang.x);
+            ang.y = wrapAngle(ang.y);
+            ang.z = wrapAngle(ang.z);
+        };
+
+    wrapAngles(m_LeftControllerAngSmoothed);
+    wrapAngles(m_RightControllerAngSmoothed);
+
+    Vector rightControllerPosSmoothed = m_RightControllerPosSmoothed;
+    Vector leftControllerPosSmoothed = m_LeftControllerPosSmoothed;
+    QAngle leftControllerAngSmoothed = m_LeftControllerAngSmoothed;
+    QAngle rightControllerAngSmoothed = m_RightControllerAngSmoothed;
+
+    Vector hmdToController = rightControllerPosSmoothed - hmdPosLocal;
+    Vector rightControllerPosCorrected = hmdPosSmoothed + hmdToController;
+    Vector leftHmdToController = leftControllerPosSmoothed - hmdPosLocal;
+    Vector leftControllerPosCorrected = hmdPosSmoothed + leftHmdToController;
+
+    // When using stick turning, pivot the controllers around the HMD
+    VectorPivotXY(rightControllerPosCorrected, hmdPosSmoothed, m_RotationOffset);
+    VectorPivotXY(leftControllerPosCorrected, hmdPosSmoothed, m_RotationOffset);
+
+    Vector rightControllerPosLocalInWorld = rightControllerPosCorrected * m_VRScale;
+    Vector leftControllerPosLocalInWorld = leftControllerPosCorrected * m_VRScale;
+
+    m_RightControllerPosAbs = m_CameraAnchor - Vector(0, 0, 64) + rightControllerPosLocalInWorld;
+    m_LeftControllerPosAbs = m_CameraAnchor - Vector(0, 0, 64) + leftControllerPosLocalInWorld;
+
+    leftControllerAngSmoothed.y += m_RotationOffset;
+    // Wrap angle from -180 to 180
+    leftControllerAngSmoothed.y -= 360 * std::floor((leftControllerAngSmoothed.y + 180) / 360);
+
+    rightControllerAngSmoothed.y += m_RotationOffset;
+    // Wrap angle from -180 to 180
+    rightControllerAngSmoothed.y -= 360 * std::floor((rightControllerAngSmoothed.y + 180) / 360);
+
+    // Preserve the anatomical controller rotations for multiplayer world-model
+    // reconstruction. Everything below this point is allowed to calibrate or
+    // redirect the gameplay/viewmodel aim basis and must not leak into the
+    // remote hand pose.
+    m_LeftControllerTrackedAngAbs = leftControllerAngSmoothed;
+    m_RightControllerTrackedAngAbs = rightControllerAngSmoothed;
+
+    // The gameplay controller fields are swapped in left-handed mode. Publish
+    // an anatomical snapshot so the physical left controller always drives the
+    // model's left arm (and likewise for the right arm).
+    {
+        VRWorldPoseTrackingSnapshot snapshot{};
+        snapshot.initialized = true;
+        snapshot.hmdValid =
+            m_Poses[vr::k_unTrackedDeviceIndex_Hmd].bPoseIsValid;
+
+        const vr::TrackedDeviceIndex_t physicalLeftIndex =
+            GetPhysicalControllerIndexForHand(true);
+        const vr::TrackedDeviceIndex_t physicalRightIndex =
+            GetPhysicalControllerIndexForHand(false);
+        snapshot.leftHandValid =
+            physicalLeftIndex < vr::k_unMaxTrackedDeviceCount &&
+            m_Poses[physicalLeftIndex].bPoseIsValid;
+        snapshot.rightHandValid =
+            physicalRightIndex < vr::k_unMaxTrackedDeviceCount &&
+            m_Poses[physicalRightIndex].bPoseIsValid;
+
+		// World-model poses are player-relative, not camera-anchor-relative. The
+		// camera anchor contains both roomscale recentering and HeightOffset; using
+		// any of its axes here makes a view turn rotate that anchor error into the
+		// hands and can put the IK target a full arm length away. Capture the live
+		// player origin in this same locked tracking sample instead. This retains
+		// locomotion phase coherence without changing the coordinate space.
+		snapshot.referenceOrigin = localPlayer->GetAbsOrigin();
+		snapshot.bodyYaw = localPlayer->GetAbsAngles().y;
+		snapshot.bodyYawValid = std::isfinite(snapshot.bodyYaw);
+        snapshot.hmdPosition = m_HmdPosAbs;
+        snapshot.hmdAngles = m_HmdAngAbs;
+        snapshot.leftHandPosition = m_LeftHanded
+            ? m_RightControllerPosAbs
+            : m_LeftControllerPosAbs;
+        snapshot.leftHandAngles = m_LeftHanded
+            ? m_RightControllerTrackedAngAbs
+            : m_LeftControllerTrackedAngAbs;
+        snapshot.rightHandPosition = m_LeftHanded
+            ? m_LeftControllerPosAbs
+            : m_RightControllerPosAbs;
+        snapshot.rightHandAngles = m_LeftHanded
+            ? m_LeftControllerTrackedAngAbs
+            : m_RightControllerTrackedAngAbs;
+
+        {
+            std::lock_guard<std::mutex> lock(m_WorldPoseTrackingSnapshotMutex);
+            m_WorldPoseTrackingSnapshot = snapshot;
+        }
+    }
+
+    QAngle::AngleVectors(leftControllerAngSmoothed, &m_LeftControllerForward, &m_LeftControllerRight, &m_LeftControllerUp);
+    QAngle::AngleVectors(rightControllerAngSmoothed, &m_RightControllerForward, &m_RightControllerRight, &m_RightControllerUp);
+
+    // Keep the existing off-hand/controller-model calibration.
+    m_LeftControllerForward = VectorRotate(m_LeftControllerForward, m_LeftControllerRight, -45.0);
+    m_LeftControllerUp = VectorRotate(m_LeftControllerUp, m_LeftControllerRight, -45.0);
+
+    // Calibrate the logical weapon hand's grip pose. This stays in the shared
+    // aim basis so the gun model, aim line, scope, and bullets remain aligned.
+    m_RightControllerForward = VectorRotate(
+        m_RightControllerForward,
+        m_RightControllerRight,
+        m_WeaponAimPitchOffsetDeg);
+    m_RightControllerUp = VectorRotate(
+        m_RightControllerUp,
+        m_RightControllerRight,
+        m_WeaponAimPitchOffsetDeg);
+
+    m_RightControllerForwardUnforced = m_RightControllerForward;
+    if (!m_RightControllerForwardUnforced.IsZero())
+        m_LastUnforcedAimDirection = m_RightControllerForwardUnforced;
+
+    const bool shouldForceEvadeAim =
+        m_SpecialInfectedWarningActionEnabled &&
+        m_SpecialInfectedWarningActionStep != SpecialInfectedWarningActionStep::None &&
+        m_SpecialInfectedWarningTargetActive;
+    const bool shouldForceAim = m_SpecialInfectedPreWarningActive || shouldForceEvadeAim;
+    const Vector forcedTarget = shouldForceEvadeAim
+        ? m_SpecialInfectedWarningTarget
+        : m_SpecialInfectedPreWarningTarget;
+
+    if (shouldForceAim)
+    {
+        Vector toTarget = forcedTarget - m_RightControllerPosAbs;
+        if (!toTarget.IsZero())
+        {
+            VectorNormalize(toTarget);
+            const float lerpFactor = m_SpecialInfectedDebug
+                ? std::max(0.0f, m_SpecialInfectedAutoAimLerp)
+                : std::clamp(m_SpecialInfectedAutoAimLerp, 0.0f, 1.0f);
+            if (m_SpecialInfectedAutoAimDirection.IsZero())
+                m_SpecialInfectedAutoAimDirection = toTarget;
+            else
+                m_SpecialInfectedAutoAimDirection += (toTarget - m_SpecialInfectedAutoAimDirection) * lerpFactor;
+
+            if (!m_SpecialInfectedAutoAimDirection.IsZero())
+            {
+                VectorNormalize(m_SpecialInfectedAutoAimDirection);
+                QAngle forcedAngles;
+                QAngle::VectorAngles(m_SpecialInfectedAutoAimDirection, m_HmdUp, forcedAngles);
+                QAngle::AngleVectors(forcedAngles, &m_RightControllerForward, &m_RightControllerRight, &m_RightControllerUp);
+            }
+        }
+    }
+    else
+    {
+        m_SpecialInfectedAutoAimDirection = m_RightControllerForward;
+    }
+
+    Vector pavlovAimForward{};
+    Vector pavlovAimRight{};
+    Vector pavlovAimUp{};
+    if (ResolvePavlovTwoHandedAimBasis(
+            m_LeftControllerPosAbs,
+            m_RightControllerPosAbs,
+            m_RightControllerForward,
+            m_RightControllerRight,
+            m_RightControllerUp,
+            m_HmdPosAbs,
+            m_HmdForward,
+            m_HmdRight,
+            m_HmdUp,
+            m_VRScale,
+            pavlovAimForward,
+            pavlovAimRight,
+            pavlovAimUp))
+    {
+        ApplyPavlovTwoHandedAimSmoothing(pavlovAimForward, pavlovAimRight, pavlovAimUp);
+        m_RightControllerForward = pavlovAimForward;
+        m_RightControllerRight = pavlovAimRight;
+        m_RightControllerUp = pavlovAimUp;
+        m_RightControllerForwardUnforced = m_RightControllerForward;
+        if (!m_RightControllerForwardUnforced.IsZero())
+            m_LastUnforcedAimDirection = m_RightControllerForwardUnforced;
+    }
+    else
+    {
+        ResetPavlovTwoHandedAimSmoothing();
+    }
+
+    // Update scope camera pose + look-through activation
+    const bool forceScopeForThirdPersonFrontView = m_ThirdPersonFrontViewEnabled && m_IsThirdPersonCamera;
+    const bool scopePosFromEyeInFrontView = forceScopeForThirdPersonFrontView && (localPlayer != nullptr);
+    const bool scopeFromEyeInFrontView = forceScopeForThirdPersonFrontView
+        && m_ThirdPersonFrontScopeFromEye
+        && (localPlayer != nullptr);
+    const bool steamVRScopeToggleActive = m_ScopeWeaponIsFirearm && m_ScopeToggleActive;
+    if (m_MouseModeEnabled && m_ScopeEnabled)
+    {
+        // Mouse mode: scope activation is driven by a toggle (not look-through).
+        m_ScopeActive = (m_ScopeWeaponIsFirearm && (m_MouseModeScopeToggleActive || m_ScopeToggleActive)) || forceScopeForThirdPersonFrontView;
+        if (m_ScopeActive)
+        {
+            if (scopeFromEyeInFrontView)
+            {
+                // Front-view 3P: scope should originate from the player eye.
+                QAngle eyeAng;
+                Vector eyeDir;
+                GetMouseModeEyeRay(eyeDir, &eyeAng);
+                if (!eyeDir.IsZero())
+                    VectorNormalize(eyeDir);
+
+                Vector f, r, u;
+                QAngle::AngleVectors(eyeAng, &f, &r, &u);
+                if (f.IsZero())
+                {
+                    f = eyeDir.IsZero() ? m_HmdForward : eyeDir;
+                    r = m_HmdRight;
+                    u = m_HmdUp;
+                }
+
+                m_RightControllerForward = f;
+                m_RightControllerRight = r;
+                m_RightControllerUp = u;
+
+                const Vector eyeOrigin = localPlayer->EyePosition();
+                m_ScopeCameraPosAbs = eyeOrigin
+                    + f * m_ScopeCameraOffset.x
+                    + r * m_ScopeCameraOffset.y
+                    + u * m_ScopeCameraOffset.z;
+                m_ScopeCameraAngAbs = eyeAng + m_ScopeCameraAngleOffset;
+                m_ScopeCameraAngAbs.x = wrapAngle(m_ScopeCameraAngAbs.x);
+                m_ScopeCameraAngAbs.y = wrapAngle(m_ScopeCameraAngAbs.y);
+                m_ScopeCameraAngAbs.z = wrapAngle(m_ScopeCameraAngAbs.z);
+            }
+            else
+            {
+                const Vector& anchor = m_MouseModeScopedViewmodelAnchorOffset;
+                const Vector gunOrigin = m_HmdPosAbs
+                    + (m_HmdForward * (anchor.x * m_VRScale))
+                    + (m_HmdRight * (anchor.y * m_VRScale))
+                    + (m_HmdUp * (anchor.z * m_VRScale));
+
+                // Mouse-mode scope aiming must use the same yaw basis as the viewmodel/bullets.
+                // - When MouseModeAimFromHmd is true: aim follows the HMD center ray.
+                // - Otherwise: aim follows mouse pitch  body yaw (m_RotationOffset), independent of head yaw.
+                Vector eyeDir;
+                GetMouseModeEyeRay(eyeDir);
+
+                const float converge = std::max(0.0f, m_MouseModeAimConvergeDistance);
+                const Vector target = gunOrigin + eyeDir * (converge > 0.0f ? converge : 2048.0f);
+
+                Vector aimDir = target - gunOrigin;
+                if (aimDir.IsZero())
+                    aimDir = m_HmdForward;
+                VectorNormalize(aimDir);
+
+                QAngle aimAng;
+                QAngle::VectorAngles(aimDir, m_HmdUp, aimAng);
+
+                Vector f, r, u;
+                QAngle::AngleVectors(aimAng, &f, &r, &u);
+                m_RightControllerForward = f;
+                m_RightControllerRight = r;
+                m_RightControllerUp = u;
+
+                m_ScopeCameraPosAbs = gunOrigin
+                    + f * m_ScopeCameraOffset.x
+                    + r * m_ScopeCameraOffset.y
+                    + u * m_ScopeCameraOffset.z;
+                m_ScopeCameraAngAbs = aimAng + m_ScopeCameraAngleOffset;
+            }
+        }
+        else
+        {
+            m_ScopeAimSensitivityInit = false;
+            m_ScopeStabilizationInit = false;
+            m_ScopeStabilizationLastTime = {};
+        }
+    }
+    else if (m_ScopeEnabled && (m_ScopeWeaponIsFirearm || forceScopeForThirdPersonFrontView))
+    {
+        // Raw scope camera pose (used for activation tests).
+        Vector scopePosRaw;
+        QAngle scopeAngRaw;
+        if (scopeFromEyeInFrontView)
+        {
+            // Front-view 3P: scope should originate from the player eye.
+            QAngle eyeAng = m_HmdAngAbs;
+            NormalizeAndClampViewAngles(eyeAng);
+
+            Vector eyeForward, eyeRight, eyeUp;
+            QAngle::AngleVectors(eyeAng, &eyeForward, &eyeRight, &eyeUp);
+
+            const Vector eyeOrigin = localPlayer->EyePosition();
+            scopePosRaw = eyeOrigin
+                + eyeForward * m_ScopeCameraOffset.x
+                + eyeRight * m_ScopeCameraOffset.y
+                + eyeUp * m_ScopeCameraOffset.z;
+
+            scopeAngRaw = eyeAng + m_ScopeCameraAngleOffset;
+        }
+        else
+        {
+            scopePosRaw = m_RightControllerPosAbs
+                + m_RightControllerForward * m_ScopeCameraOffset.x
+                + m_RightControllerRight * m_ScopeCameraOffset.y
+                + m_RightControllerUp * m_ScopeCameraOffset.z;
+
+            const Vector angUp = (forceScopeForThirdPersonFrontView && !m_HmdUp.IsZero()) ? m_HmdUp : m_RightControllerUp;
+            QAngle::VectorAngles(m_RightControllerForward, angUp, scopeAngRaw);
+            scopeAngRaw.x += m_ScopeCameraAngleOffset.x;
+            scopeAngRaw.y += m_ScopeCameraAngleOffset.y;
+            scopeAngRaw.z += m_ScopeCameraAngleOffset.z;
+            if (forceScopeForThirdPersonFrontView)
+                scopeAngRaw.z = 0.0f;
+        }
+        scopeAngRaw.x = wrapAngle(scopeAngRaw.x);
+        scopeAngRaw.y = wrapAngle(scopeAngRaw.y);
+        scopeAngRaw.z = wrapAngle(scopeAngRaw.z);
+
+        // Default: render pose == raw pose.
+        m_ScopeCameraPosAbs = scopePosRaw;
+        m_ScopeCameraAngAbs = scopeAngRaw;
+
+        if (forceScopeForThirdPersonFrontView)
+        {
+            m_ScopeActive = true;
+        }
+        else if (steamVRScopeToggleActive)
+        {
+            m_ScopeActive = true;
+        }
+        else if (m_ScopeRequireLookThrough)
+        {
+            const float maxDist = std::max(0.0f, m_ScopeLookThroughDistanceMeters) * m_VRScale;
+            Vector toScope = scopePosRaw - m_HmdPosAbs;
+            const float dist = VectorLength(toScope);
+            if (dist > 0.0f && dist <= maxDist)
+            {
+                toScope /= dist;
+                Vector scopeForward;
+                QAngle::AngleVectors(scopeAngRaw, &scopeForward, nullptr, nullptr);
+                if (!scopeForward.IsZero()) VectorNormalize(scopeForward);
+
+                const float maxAngleRad = std::clamp(m_ScopeLookThroughAngleDeg, 0.0f, 89.0f) * (3.14159265358979323846f / 180.0f);
+                const float minDot = cosf(maxAngleRad);
+
+                const float inFrontDot = DotProduct(m_HmdForward, toScope);
+                const float alignDot = DotProduct(m_HmdForward, scopeForward);
+                m_ScopeActive = (inFrontDot > 0.2f) && (alignDot >= minDot);
+            }
+            else
+            {
+                m_ScopeActive = false;
+            }
+        }
+        else
+        {
+            m_ScopeActive = false;
+        }
+
+        // Keep a working copy of the pose used for rendering. Look-through activation above is based on raw pose.
+        Vector scopePosFinal = scopePosRaw;
+        QAngle scopeAngFinal = scopeAngRaw;
+
+        // Scoped aim sensitivity scaling: apply to controller aim so scope camera, aim line and bullets stay in sync.
+        if (m_ScopeActive && !scopeFromEyeInFrontView)
+        {
+            QAngle aimAngRaw;
+            QAngle::VectorAngles(m_RightControllerForward, m_RightControllerUp, aimAngRaw);
+
+            // FOV changes alter GetScopeAimSensitivityScale(). If the old base angle is kept,
+            // the scaled aim angle moves even when the controller is still, which makes the
+            // scope image appear to zoom diagonally instead of around the reticle center.
+            if (m_ScopeFovAdjustingThisFrame)
+                m_ScopeAimSensitivityInit = false;
+
+            if (!m_ScopeAimSensitivityInit)
+            {
+                m_ScopeAimSensitivityInit = true;
+                m_ScopeAimSensitivityBaseAng = aimAngRaw;
+            }
+
+            const float gain = GetScopeAimSensitivityScale();
+
+            if (std::fabs(gain - 1.0f) > 0.001f)
+            {
+                auto wrapDelta = [](float d) -> float
+                    {
+                        d -= 360.0f * std::floor((d + 180.0f) / 360.0f);
+                        return d;
+                    };
+
+                QAngle aimAngScaled =
+                {
+                    wrapAngle(m_ScopeAimSensitivityBaseAng.x + wrapDelta(aimAngRaw.x - m_ScopeAimSensitivityBaseAng.x) * gain),
+                    wrapAngle(m_ScopeAimSensitivityBaseAng.y + wrapDelta(aimAngRaw.y - m_ScopeAimSensitivityBaseAng.y) * gain),
+                    wrapAngle(m_ScopeAimSensitivityBaseAng.z + wrapDelta(aimAngRaw.z - m_ScopeAimSensitivityBaseAng.z) * gain)
+                };
+
+                Vector f, r, u;
+                QAngle::AngleVectors(aimAngScaled, &f, &r, &u);
+                if (!f.IsZero()) VectorNormalize(f);
+                if (!r.IsZero()) VectorNormalize(r);
+                if (!u.IsZero()) VectorNormalize(u);
+
+                m_RightControllerForward = f;
+                m_RightControllerRight = r;
+                m_RightControllerUp = u;
+
+                // While scoped-in, keep the "unforced" aim direction consistent too (used by aim line in 3P).
+                m_RightControllerForwardUnforced = m_RightControllerForward;
+                if (!m_RightControllerForwardUnforced.IsZero())
+                    m_LastUnforcedAimDirection = m_RightControllerForwardUnforced;
+
+                // Recompute scope render pose from the scaled controller basis.
+                scopePosFinal = m_RightControllerPosAbs
+                    + m_RightControllerForward * m_ScopeCameraOffset.x
+                    + m_RightControllerRight * m_ScopeCameraOffset.y
+                    + m_RightControllerUp * m_ScopeCameraOffset.z;
+
+                const Vector angUp = (forceScopeForThirdPersonFrontView && !m_HmdUp.IsZero()) ? m_HmdUp : m_RightControllerUp;
+                QAngle::VectorAngles(m_RightControllerForward, angUp, scopeAngFinal);
+                scopeAngFinal.x += m_ScopeCameraAngleOffset.x;
+                scopeAngFinal.y += m_ScopeCameraAngleOffset.y;
+                scopeAngFinal.z += m_ScopeCameraAngleOffset.z;
+                if (forceScopeForThirdPersonFrontView)
+                    scopeAngFinal.z = 0.0f;
+                scopeAngFinal.x = wrapAngle(scopeAngFinal.x);
+                scopeAngFinal.y = wrapAngle(scopeAngFinal.y);
+                scopeAngFinal.z = wrapAngle(scopeAngFinal.z);
+
+                m_ScopeCameraPosAbs = scopePosFinal;
+                m_ScopeCameraAngAbs = scopeAngFinal;
+            }
+        }
+        else
+        {
+            m_ScopeAimSensitivityInit = false;
+        }
+
+        // Front-view 3P hybrid: keep scope camera anchored at eye, but keep controller-driven aim direction.
+        if (scopePosFromEyeInFrontView)
+        {
+            Vector f, r, u;
+            QAngle::AngleVectors(scopeAngFinal, &f, &r, &u);
+            if (f.IsZero() || r.IsZero() || u.IsZero())
+            {
+                f = m_RightControllerForward;
+                r = m_RightControllerRight;
+                u = m_RightControllerUp;
+            }
+
+            const Vector eyeOrigin = localPlayer->EyePosition();
+            scopePosFinal = eyeOrigin
+                + f * m_ScopeCameraOffset.x
+                + r * m_ScopeCameraOffset.y
+                + u * m_ScopeCameraOffset.z;
+            m_ScopeCameraPosAbs = scopePosFinal;
+            m_ScopeCameraAngAbs = scopeAngFinal;
+        }
+
+        // Visual stabilization: smooth the scope RTT camera pose ONLY when scoped-in.
+        // This does NOT affect shooting direction (bullets still use controller aim).
+        const bool allowScopeStabilization = m_ScopeStabilizationEnabled && m_ScopeActive;
+        if (allowScopeStabilization)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            float dt = 1.0f / 90.0f;
+            if (m_ScopeStabilizationInit && m_ScopeStabilizationLastTime.time_since_epoch().count() != 0)
+                dt = std::chrono::duration<float>(now - m_ScopeStabilizationLastTime).count();
+
+            // Clamp dt to avoid spikes (alt-tab, loading, etc.)
+            dt = std::clamp(dt, 1.0f / 240.0f, 1.0f / 20.0f);
+
+            // Initialize filter state on first scoped-in frame.
+            if (!m_ScopeStabilizationInit)
+            {
+                m_ScopeStabilizationInit = true;
+                m_ScopeStabPos = scopePosFinal;
+                m_ScopeStabPosDeriv = { 0.0f, 0.0f, 0.0f };
+                m_ScopeStabAng = scopeAngFinal;
+                m_ScopeStabAngDeriv = { 0.0f, 0.0f, 0.0f };
+            }
+            m_ScopeStabilizationLastTime = now;
+
+            // Slightly increase smoothing at very low FOV (high magnification).
+            const float fovScale = std::clamp(m_ScopeFov / 20.0f, 0.35f, 1.25f);
+            const float minCutoff = std::max(0.0001f, m_ScopeStabilizationMinCutoff * fovScale);
+
+            OneEuroFilterVec3(scopePosFinal, m_ScopeStabPos, m_ScopeStabPosDeriv, m_ScopeStabilizationInit,
+                dt, minCutoff, m_ScopeStabilizationBeta, m_ScopeStabilizationDCutoff);
+
+            OneEuroFilterAngles(scopeAngFinal, m_ScopeStabAng, m_ScopeStabAngDeriv, m_ScopeStabilizationInit,
+                dt, minCutoff, m_ScopeStabilizationBeta, m_ScopeStabilizationDCutoff);
+
+            m_ScopeCameraPosAbs = m_ScopeStabPos;
+            m_ScopeCameraAngAbs = m_ScopeStabAng;
+        }
+        else
+        {
+            m_ScopeStabilizationInit = false;
+            m_ScopeStabilizationLastTime = {};
+        }
+
+
+        // Final sync: while scoped-in, force the gameplay aim basis to match the scope camera.
+        // This keeps aim line, bullets, and scope RTT perfectly consistent (including stabilization + angle offsets).
+        if (m_ScopeActive)
+        {
+            Vector f, r, u;
+            QAngle::AngleVectors(m_ScopeCameraAngAbs, &f, &r, &u);
+            if (!f.IsZero()) VectorNormalize(f);
+            if (!r.IsZero()) VectorNormalize(r);
+            if (!u.IsZero()) VectorNormalize(u);
+            m_RightControllerForward = f;
+            m_RightControllerRight = r;
+            m_RightControllerUp = u;
+
+            // Keep the unforced direction consistent for 3P aim line code.
+            m_RightControllerForwardUnforced = m_RightControllerForward;
+            if (!m_RightControllerForwardUnforced.IsZero())
+                m_LastUnforcedAimDirection = m_RightControllerForwardUnforced;
+        }
+    }
+    else
+    {
+        m_ScopeActive = false;
+        m_ScopeStabilizationInit = false;
+        m_ScopeStabilizationLastTime = {};
+    }
+
+    UpdateScopeAimLineState();
+
+    QAngle::VectorAngles(m_RightControllerForward, m_RightControllerUp, m_RightControllerAngAbs);
+
+    if (m_RearMirrorEnabled || m_DesktopRearMirrorWindowEnabled)
+    {
+        m_RearMirrorCameraPosAbs =
+            m_HmdPosAbs
+            + m_HmdForward * m_RearMirrorCameraOffset.x
+            + m_HmdRight * m_RearMirrorCameraOffset.y
+            + m_HmdUp * m_RearMirrorCameraOffset.z;
+
+        QAngle mirrorAng = m_HmdAngAbs;
+        mirrorAng.y += 180.0f;
+        mirrorAng += m_RearMirrorCameraAngleOffset;
+        NormalizeAndClampViewAngles(mirrorAng);
+        m_RearMirrorCameraAngAbs = mirrorAng;
+    }
+
+    // Non-VR servers only understand cmd->viewangles. When ForceNonVRServerMovement is enabled,
+    // solve an eye-based aim hit point so rendered aim line and real hit point stay consistent.
+    UpdateNonVRAimSolution(localPlayer);
+    UpdateAimingLaser(localPlayer);
+
+    // controller angles
+    QAngle::VectorAngles(m_LeftControllerForward, m_LeftControllerUp, m_LeftControllerAngAbs);
+    QAngle::VectorAngles(m_RightControllerForward, m_RightControllerUp, m_RightControllerAngAbs);
+
+    if (m_AdjustingScope)
+    {
+        if (m_AdjustingScopeKey != m_CurrentScopeAdjustmentKey)
+        {
+            m_AdjustStartScopeLeftPos = m_LeftControllerPosAbs;
+            m_AdjustStartScopeOverlayOffset = { m_ScopeOverlayXOffset, m_ScopeOverlayYOffset, m_ScopeOverlayZOffset };
+            m_AdjustingScopeKey = m_CurrentScopeAdjustmentKey;
+        }
+
+        const Vector deltaPos = m_LeftControllerPosAbs - m_AdjustStartScopeLeftPos;
+        const float invScale = (m_VRScale > 0.0001f) ? (1.0f / m_VRScale) : 0.0f;
+        const float moveSpeed = std::clamp(m_ScopeOffsetAdjustMoveSpeed, 0.1f, 5.0f);
+        Vector scopeDelta =
+        {
+            DotProduct(deltaPos, m_RightControllerRight) * invScale * moveSpeed,
+            DotProduct(deltaPos, m_RightControllerUp) * invScale * moveSpeed,
+            -DotProduct(deltaPos, m_RightControllerForward) * invScale * moveSpeed
+        };
+
+        m_ScopeOverlayXOffset = m_AdjustStartScopeOverlayOffset.x + scopeDelta.x;
+        m_ScopeOverlayYOffset = m_AdjustStartScopeOverlayOffset.y + scopeDelta.y;
+        m_ScopeOverlayZOffset = m_AdjustStartScopeOverlayOffset.z + scopeDelta.z;
+
+        ScopeAdjustment& adjustment = EnsureScopeAdjustment(m_CurrentScopeAdjustmentKey);
+        adjustment.fov = std::clamp(m_ScopeFov, m_ScopeFovMin, m_ScopeFovMax);
+        adjustment.widthMeters = std::clamp(m_ScopeOverlayWidthMeters, m_ScopeSizeMin, m_ScopeSizeMax);
+        adjustment.overlayOffset = { m_ScopeOverlayXOffset, m_ScopeOverlayYOffset, m_ScopeOverlayZOffset };
+        m_ScopeAdjustmentsDirty = true;
+    }
+    else if (m_AdjustingViewmodel)
+    {
+        auto wrapDelta = [](float angle)
+            {
+                angle -= 360.0f * std::floor((angle + 180.0f) / 360.0f);
+                return angle;
+            };
+
+        if (m_AdjustingKey != m_CurrentViewmodelKey)
+        {
+            m_AdjustStartLeftPos = m_LeftControllerPosAbs;
+            m_AdjustStartLeftAng = m_LeftControllerAngAbs;
+            m_AdjustStartViewmodelPos = m_ViewmodelPosAdjust;
+            m_AdjustStartViewmodelAng = m_ViewmodelAngAdjust;
+            m_AdjustStickViewmodelAng = { 0.0f, 0.0f, 0.0f };
+            m_AdjustStartViewmodelForward = m_ViewmodelForward;
+            m_AdjustStartViewmodelRight = m_ViewmodelRight;
+            m_AdjustStartViewmodelUp = m_ViewmodelUp;
+            m_AdjustSuppressControllerUntil = {};
+            m_AdjustControllerSuppressed = false;
+            m_AdjustingKey = m_CurrentViewmodelKey;
+        }
+
+        const float moveSpeed = std::clamp(m_ViewmodelAdjustMoveSpeed, 0.1f, 5.0f);
+        const float rotateSpeed = std::clamp(m_ViewmodelAdjustRotateSpeed, 0.1f, 5.0f);
+
+        float stickX = 0.0f;
+        float stickY = 0.0f;
+        bool stickAdjustActive = false;
+        if (GetWalkAxis(stickX, stickY))
+        {
+            const float deadzone = 0.2f;
+            auto normalizeStick = [deadzone](float value)
+            {
+                const float absValue = std::fabs(value);
+                if (absValue <= deadzone)
+                    return 0.0f;
+                const float normalized = (absValue - deadzone) / (1.0f - deadzone);
+                return value < 0.0f ? -normalized : normalized;
+            };
+
+            const float nx = normalizeStick(stickX);
+            const float ny = normalizeStick(stickY);
+            if (std::fabs(nx) > 0.0001f || std::fabs(ny) > 0.0001f)
+            {
+                stickAdjustActive = true;
+                const float dtSeconds = std::clamp(m_LastFrameDuration, 0.0f, 0.1f);
+                const float degreesPerSecond = 90.0f * rotateSpeed;
+                m_AdjustStickViewmodelAng.x += -ny * degreesPerSecond * dtSeconds;
+                m_AdjustStickViewmodelAng.y += nx * degreesPerSecond * dtSeconds;
+                m_AdjustStickViewmodelAng.x -= 360.0f * std::floor((m_AdjustStickViewmodelAng.x + 180.0f) / 360.0f);
+                m_AdjustStickViewmodelAng.y -= 360.0f * std::floor((m_AdjustStickViewmodelAng.y + 180.0f) / 360.0f);
+            }
+        }
+
+        const auto adjustNow = std::chrono::steady_clock::now();
+        if (stickAdjustActive)
+            m_AdjustSuppressControllerUntil = adjustNow + std::chrono::seconds(1);
+
+        const bool suppressControllerAdjust = adjustNow < m_AdjustSuppressControllerUntil;
+        if (suppressControllerAdjust != m_AdjustControllerSuppressed)
+        {
+            m_AdjustStartLeftPos = m_LeftControllerPosAbs;
+            m_AdjustStartLeftAng = m_LeftControllerAngAbs;
+            m_AdjustStartViewmodelPos = m_ViewmodelPosAdjust;
+            m_AdjustStartViewmodelAng =
+            {
+                m_ViewmodelAngAdjust.x - m_AdjustStickViewmodelAng.x,
+                m_ViewmodelAngAdjust.y - m_AdjustStickViewmodelAng.y,
+                m_ViewmodelAngAdjust.z - m_AdjustStickViewmodelAng.z
+            };
+            m_AdjustControllerSuppressed = suppressControllerAdjust;
+        }
+
+        const Vector controllerPosForAdjust = suppressControllerAdjust ? m_AdjustStartLeftPos : m_LeftControllerPosAbs;
+        const QAngle controllerAngForAdjust = suppressControllerAdjust ? m_AdjustStartLeftAng : m_LeftControllerAngAbs;
+        Vector deltaPos = controllerPosForAdjust - m_AdjustStartLeftPos;
+        Vector viewmodelDelta =
+        {
+            -DotProduct(deltaPos, m_AdjustStartViewmodelForward),
+            -DotProduct(deltaPos, m_AdjustStartViewmodelRight),
+            -DotProduct(deltaPos, m_AdjustStartViewmodelUp)
+        };
+        QAngle deltaAng =
+        {
+            wrapDelta(controllerAngForAdjust.x - m_AdjustStartLeftAng.x),
+            wrapDelta(controllerAngForAdjust.y - m_AdjustStartLeftAng.y),
+            wrapDelta(controllerAngForAdjust.z - m_AdjustStartLeftAng.z)
+        };
+
+        m_ViewmodelPosAdjust = m_AdjustStartViewmodelPos + (viewmodelDelta * moveSpeed);
+        m_ViewmodelAngAdjust =
+        {
+            m_AdjustStartViewmodelAng.x + (deltaAng.x * rotateSpeed) + m_AdjustStickViewmodelAng.x,
+            m_AdjustStartViewmodelAng.y + (deltaAng.y * rotateSpeed) + m_AdjustStickViewmodelAng.y,
+            m_AdjustStartViewmodelAng.z + (deltaAng.z * rotateSpeed) + m_AdjustStickViewmodelAng.z
+        };
+        m_ViewmodelAdjustments[m_CurrentViewmodelKey] = { m_ViewmodelPosAdjust, m_ViewmodelAngAdjust };
+        m_ViewmodelAdjustmentsDirty = true;
+    }
+
+    PositionAngle viewmodelOffset = localPlayer->GetViewmodelOffset();
+
+    m_ViewmodelPosOffset = viewmodelOffset.position + m_ViewmodelPosAdjust;
+    m_ViewmodelAngOffset = viewmodelOffset.angle + m_ViewmodelAngAdjust;
+
+    if (m_MouseModeEnabled)
+    {
+        // Mouse mode viewmodel orientation:
+        //  - Default: aim is driven by mouse pitch + body yaw.
+        //  - Optional (MouseModeAimFromHmd): aim follows the HMD center ray, but the aim line
+        //    and viewmodel origin remain at the mouse-mode viewmodel anchor.
+        Vector eyeDir;
+        GetMouseModeEyeRay(eyeDir);
+
+        const Vector& anchor = IsMouseModeScopeActive() ? m_MouseModeScopedViewmodelAnchorOffset : m_MouseModeViewmodelAnchorOffset;
+        Vector gunOrigin = m_HmdPosAbs
+            + (m_HmdForward * (anchor.x * m_VRScale))
+            + (m_HmdRight * (anchor.y * m_VRScale))
+            + (m_HmdUp * (anchor.z * m_VRScale));
+
+        const float convergeDist = (m_MouseModeAimConvergeDistance > 0.0f) ? m_MouseModeAimConvergeDistance : 8192.0f;
+        Vector target = m_HmdPosAbs + eyeDir * convergeDist;
+
+        Vector aimDir = target - gunOrigin;
+        if (aimDir.IsZero())
+            aimDir = eyeDir;
+
+        if (aimDir.IsZero())
+        {
+            m_ViewmodelForward = m_RightControllerForward;
+            m_ViewmodelUp = m_RightControllerUp;
+            m_ViewmodelRight = m_RightControllerRight;
+        }
+        else
+        {
+            VectorNormalize(aimDir);
+            QAngle aimAng;
+            QAngle::VectorAngles(aimDir, aimAng);
+            NormalizeAndClampViewAngles(aimAng);
+
+            QAngle::AngleVectors(aimAng, &m_ViewmodelForward, &m_ViewmodelRight, &m_ViewmodelUp);
+        }
+    }
+    else
+    {
+        m_ViewmodelForward = m_RightControllerForward;
+        m_ViewmodelUp = m_RightControllerUp;
+        m_ViewmodelRight = m_RightControllerRight;
+    }
+
+    // Viewmodel yaw offset
+    m_ViewmodelForward = VectorRotate(m_ViewmodelForward, m_ViewmodelUp, m_ViewmodelAngOffset.y);
+    m_ViewmodelRight = VectorRotate(m_ViewmodelRight, m_ViewmodelUp, m_ViewmodelAngOffset.y);
+
+    // Viewmodel pitch offset
+    m_ViewmodelForward = VectorRotate(m_ViewmodelForward, m_ViewmodelRight, m_ViewmodelAngOffset.x);
+    m_ViewmodelUp = VectorRotate(m_ViewmodelUp, m_ViewmodelRight, m_ViewmodelAngOffset.x);
+
+    // Viewmodel roll offset
+    m_ViewmodelRight = VectorRotate(m_ViewmodelRight, m_ViewmodelForward, m_ViewmodelAngOffset.z);
+    m_ViewmodelUp = VectorRotate(m_ViewmodelUp, m_ViewmodelForward, m_ViewmodelAngOffset.z);
+
+    // Extra render-thread state (local player / third-person / aim line) captured on the update thread.
+    Vector __rtLocalEye = localPlayer->EyePosition();
+    const unsigned char* __lp = reinterpret_cast<const unsigned char*>(localPlayer);
+    const int __viewEnt = *reinterpret_cast<const int*>(__lp + 0x142c); // m_hViewEntity
+    const int __reviveOwner = *reinterpret_cast<const int*>(__lp + 0x1f88); // m_reviveOwner
+    const int __reviveTarget = *reinterpret_cast<const int*>(__lp + 0x1f8c); // m_reviveTarget
+    const bool __beingRevived = handleValid(__reviveOwner);
+    const bool __revivingOther = handleValid(__reviveTarget);
+    const bool __usingMountedGun = usingMountedGunNow;
+    const bool __playerIncap = (*reinterpret_cast<const unsigned char*>(__lp + 0x1ea9) != 0); // m_isIncapacitated
+
+    // Third-person state debug (mirrors hooks.cpp::ShouldForceThirdPersonByState).
+    const int __tpLifeState = (int)(*reinterpret_cast<const unsigned char*>(__lp + 0x147)); // m_lifeState
+    const int __tpObserverMode = *reinterpret_cast<const int*>(__lp + 0x1450); // m_iObserverMode
+    const int __tpObserverTarget = *reinterpret_cast<const int*>(__lp + 0x1454); // m_hObserverTarget
+    const bool __tpIncap = __playerIncap;
+    const bool __tpLedge = (*reinterpret_cast<const unsigned char*>(__lp + 0x25ec) != 0); // m_isHangingFromLedge
+    const int __tongueOwner = *reinterpret_cast<const int*>(__lp + 0x1f6c); // m_tongueOwner
+    const bool __hangingTongue = (*reinterpret_cast<const unsigned char*>(__lp + 0x1f84) != 0); // m_isHangingFromTongue
+    const bool __tpTongue = __hangingTongue || handleValid(__tongueOwner);
+
+    const int __carryAttacker = *reinterpret_cast<const int*>(__lp + 0x2714); // m_carryAttacker
+    const int __pummelAttacker = *reinterpret_cast<const int*>(__lp + 0x2720); // m_pummelAttacker
+    const int __pounceAttacker = *reinterpret_cast<const int*>(__lp + 0x272c); // m_pounceAttacker
+    const int __jockeyAttacker = *reinterpret_cast<const int*>(__lp + 0x274c); // m_jockeyAttacker
+    const bool __tpPinned = handleValid(__carryAttacker) || handleValid(__pummelAttacker) || handleValid(__pounceAttacker) || handleValid(__jockeyAttacker);
+
+    const int __useAction = *reinterpret_cast<const int*>(__lp + 0x1ba8); // m_iCurrentUseAction
+    const int __useActionOwner = *reinterpret_cast<const int*>(__lp + 0x1ba4); // m_useActionOwner
+    const int __useActionTarget = *reinterpret_cast<const int*>(__lp + 0x1ba0); // m_useActionTarget
+    bool __tpSelfMedkit = false;
+    if (__useAction == 1 && m_Game && m_Game->m_ClientEntityList && handleValid(__useActionOwner) && handleValid(__useActionTarget))
+    {
+        auto* ownerEnt = (C_BaseEntity*)m_Game->m_ClientEntityList->GetClientEntityFromHandle(__useActionOwner);
+        auto* targetEnt = (C_BaseEntity*)m_Game->m_ClientEntityList->GetClientEntityFromHandle(__useActionTarget);
+        __tpSelfMedkit = (ownerEnt == localPlayer) && (targetEnt == localPlayer);
+    }
+
+    const bool __tpDead = (__tpLifeState == 2) || ((__tpLifeState == 1) && !__tpIncap);
+    const bool __tpObserver = (__tpObserverMode != 0) && (__tpDead || handleValid(__tpObserverTarget));
+    const bool __tpWantsThirdPerson = __tpDead || __tpObserver || __tpLedge || __tpTongue || __tpPinned || __tpSelfMedkit;
+
+    // Update main-thread controlled-by-SI flag (used by aiming logic).
+    m_PlayerControlledBySI = (__tpTongue || __tpPinned);
+
+    // Aim line gating computed on update thread (render thread only consumes).
+    C_WeaponCSBase* __activeWeapon = nullptr;
+    if (C_BaseCombatWeapon* aw = localPlayer->GetActiveWeapon())
+        __activeWeapon = (C_WeaponCSBase*)aw;
+    const bool __aimAllowed = ShouldDrawAimLine(__activeWeapon);
+    const bool __aimShow = __aimAllowed && ShouldShowAimLine(__activeWeapon);
+    const bool __weaponLaserSightActive = IsWeaponLaserSightActive(__activeWeapon);
+
+    const bool __inMapLoadCooldown = IsThirdPersonMapLoadCooldownActive();
+    const bool __cameraAnchorPhaseAlignEligible =
+        viewPlayer == localPlayer &&
+        !inEyeObserver &&
+        teamNum != 1 &&
+        lifeState == 0 &&
+        obsMode == 0 &&
+        !m_RoomscaleActive &&
+        !m_TeleportVisualScoutActive &&
+        !m_TeleportPendingCameraPlanarRecenterValid &&
+        !m_IsThirdPersonCamera &&
+        m_ThirdPersonHoldFrames <= 0 &&
+        !m_ThirdPersonDefault &&
+        !(m_ThirdPersonRenderOnCustomWalk && m_CustomWalkHeld) &&
+        !handleValid(__viewEnt) &&
+        !__beingRevived &&
+        !__revivingOther &&
+        !__usingMountedGun &&
+        !__playerIncap &&
+        !__tpDead &&
+        !__tpObserver &&
+        !__tpLedge &&
+        !__tpTongue &&
+        !__tpPinned &&
+        !__tpSelfMedkit &&
+        !__inMapLoadCooldown;
+
+    // Publish a stable snapshot of view/tracking parameters for the render thread (mat_queue_mode!=0).
+    // The render hook will consume these with a seqlock and combine them with a render-thread WaitGetPoses() sample
+    // to avoid screen/viewmodel jitter and head-turn ghosting under queued rendering.
+    {
+        uint32_t seq = m_RenderViewParamsSeq.load(std::memory_order_relaxed);
+        // Mark write in-progress (odd).
+        m_RenderViewParamsSeq.store(seq + 1, std::memory_order_release);
+
+        m_RenderCameraAnchorX.store(m_CameraAnchor.x, std::memory_order_relaxed);
+        m_RenderCameraAnchorY.store(m_CameraAnchor.y, std::memory_order_relaxed);
+        m_RenderCameraAnchorZ.store(m_CameraAnchor.z, std::memory_order_relaxed);
+        m_RenderCameraAnchorReferenceX.store(m_SetupOrigin.x, std::memory_order_relaxed);
+        m_RenderCameraAnchorReferenceY.store(m_SetupOrigin.y, std::memory_order_relaxed);
+        m_RenderBodyVelocityX.store(localPlayer->m_vecVelocity.x, std::memory_order_relaxed);
+        m_RenderBodyVelocityY.store(localPlayer->m_vecVelocity.y, std::memory_order_relaxed);
+        m_RenderCameraAnchorPhaseAlignEligible.store(
+            __cameraAnchorPhaseAlignEligible ? 1u : 0u,
+            std::memory_order_relaxed);
+        m_RenderRotationOffset.store(m_RotationOffset, std::memory_order_relaxed);
+        m_RenderVRScale.store(m_VRScale, std::memory_order_relaxed);
+        m_RenderIpdScale.store(m_IpdScale, std::memory_order_relaxed);
+        m_RenderEyeZ.store(m_EyeZ, std::memory_order_relaxed);
+        m_RenderIpd.store(m_Ipd, std::memory_order_relaxed);
+
+        m_RenderHmdPosLocalPrevX.store(m_HmdPosLocalPrev.x, std::memory_order_relaxed);
+        m_RenderHmdPosLocalPrevY.store(m_HmdPosLocalPrev.y, std::memory_order_relaxed);
+        m_RenderHmdPosLocalPrevZ.store(m_HmdPosLocalPrev.z, std::memory_order_relaxed);
+        m_RenderHmdPosCorrectedPrevX.store(m_HmdPosCorrectedPrev.x, std::memory_order_relaxed);
+        m_RenderHmdPosCorrectedPrevY.store(m_HmdPosCorrectedPrev.y, std::memory_order_relaxed);
+        m_RenderHmdPosCorrectedPrevZ.store(m_HmdPosCorrectedPrev.z, std::memory_order_relaxed);
+
+        m_RenderViewmodelPosOffsetX.store(m_ViewmodelPosOffset.x, std::memory_order_relaxed);
+        m_RenderViewmodelPosOffsetY.store(m_ViewmodelPosOffset.y, std::memory_order_relaxed);
+        m_RenderViewmodelPosOffsetZ.store(m_ViewmodelPosOffset.z, std::memory_order_relaxed);
+        m_RenderViewmodelAngOffsetX.store(m_ViewmodelAngOffset.x, std::memory_order_relaxed);
+        m_RenderViewmodelAngOffsetY.store(m_ViewmodelAngOffset.y, std::memory_order_relaxed);
+        m_RenderViewmodelAngOffsetZ.store(m_ViewmodelAngOffset.z, std::memory_order_relaxed);
+        m_RenderWeaponAimPitchOffsetDeg.store(m_WeaponAimPitchOffsetDeg, std::memory_order_relaxed);
+
+        // Local player / third-person / aim line state for the render thread.
+        m_RenderHasLocalPlayer.store(1, std::memory_order_relaxed);
+        m_RenderLocalEyePosX.store(__rtLocalEye.x, std::memory_order_relaxed);
+        m_RenderLocalEyePosY.store(__rtLocalEye.y, std::memory_order_relaxed);
+        m_RenderLocalEyePosZ.store(__rtLocalEye.z, std::memory_order_relaxed);
+        m_RenderHasViewEntityOverride.store(handleValid(__viewEnt) ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderViewEntityHandle.store(__viewEnt, std::memory_order_relaxed);
+        m_RenderBeingRevived.store(__beingRevived ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderRevivingOther.store(__revivingOther ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderUsingMountedGun.store(__usingMountedGun ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderPlayerIncap.store(__playerIncap ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderPlayerControlledBySI.store((__tpTongue || __tpPinned) ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderInThirdPersonMapLoadCooldown.store(__inMapLoadCooldown ? 1u : 0u, std::memory_order_relaxed);
+
+        m_RenderTpWantsThirdPerson.store(__tpWantsThirdPerson ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderTpObserver.store(__tpObserver ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderTpDead.store(__tpDead ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderTpLifeState.store(__tpLifeState, std::memory_order_relaxed);
+        m_RenderTpObserverMode.store(__tpObserverMode, std::memory_order_relaxed);
+        m_RenderTpObserverTarget.store(__tpObserverTarget, std::memory_order_relaxed);
+        m_RenderTpIncap.store(__tpIncap ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderTpLedge.store(__tpLedge ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderTpTongue.store(__tpTongue ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderTpPinned.store(__tpPinned ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderTpSelfMedkit.store(__tpSelfMedkit ? 1u : 0u, std::memory_order_relaxed);
+
+        m_RenderAimLineAllowed.store(__aimAllowed ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderAimLineShow.store(__aimShow ? 1u : 0u, std::memory_order_relaxed);
+        m_RenderWeaponLaserSightActive.store(__weaponLaserSightActive ? 1u : 0u, std::memory_order_relaxed);
+
+        // Mark write complete (even).
+        m_RenderViewParamsSeq.store(seq + 2, std::memory_order_release);
+    }
+
+    UpdateMotionGestures(localPlayer);
+}
+
+void VR::UpdateMotionGestures(C_BasePlayer* localPlayer)
+{
+    const auto now = std::chrono::steady_clock::now();
+    const float deltaSeconds = m_LastGestureUpdateTime.time_since_epoch().count() == 0
+        ? 0.0f
+        : std::chrono::duration<float>(now - m_LastGestureUpdateTime).count();
+    m_LastGestureUpdateTime = now;
+
+    if (!m_MotionGestureInitialized)
+    {
+        m_PrevLeftControllerLocalPos = m_LeftControllerPose.TrackedDevicePos;
+        m_PrevRightControllerLocalPos = m_RightControllerPose.TrackedDevicePos;
+        m_PrevHmdLocalPos = m_HmdPose.TrackedDevicePos;
+        m_MotionGestureInitialized = true;
+        return;
+    }
+
+    if (deltaSeconds <= 0.0f)
+    {
+        m_PrevLeftControllerLocalPos = m_LeftControllerPose.TrackedDevicePos;
+        m_PrevRightControllerLocalPos = m_RightControllerPose.TrackedDevicePos;
+        m_PrevHmdLocalPos = m_HmdPose.TrackedDevicePos;
+        return;
+    }
+
+    if (!m_MotionGesturesEnabled)
+    {
+        m_SecondaryAttackGestureHoldUntil = {};
+        m_ReloadGestureHoldUntil = {};
+        m_JumpGestureHoldUntil = {};
+        m_SecondaryGestureCooldownEnd = {};
+        m_ReloadGestureCooldownEnd = {};
+        m_JumpGestureCooldownEnd = {};
+        m_PrevLeftControllerLocalPos = m_LeftControllerPose.TrackedDevicePos;
+        m_PrevRightControllerLocalPos = m_RightControllerPose.TrackedDevicePos;
+        m_PrevHmdLocalPos = m_HmdPose.TrackedDevicePos;
+        return;
+    }
+
+    const Vector leftDelta = m_LeftControllerPose.TrackedDevicePos - m_PrevLeftControllerLocalPos;
+    const Vector rightDelta = m_RightControllerPose.TrackedDevicePos - m_PrevRightControllerLocalPos;
+    const Vector hmdDelta = m_HmdPose.TrackedDevicePos - m_PrevHmdLocalPos;
+
+    const float rightDownSpeed = (-rightDelta.z) / deltaSeconds;
+    const float hmdVerticalSpeed = hmdDelta.z / deltaSeconds;
+
+    auto startHold = [&](std::chrono::steady_clock::time_point& holdUntil)
+        {
+            holdUntil = now + std::chrono::duration_cast<std::chrono::steady_clock::time_point::duration>(
+                std::chrono::duration<float>(m_MotionGestureHoldDuration));
+        };
+
+    auto startCooldown = [&](std::chrono::steady_clock::time_point& cooldownEnd)
+        {
+            cooldownEnd = now + std::chrono::duration_cast<std::chrono::steady_clock::time_point::duration>(
+                std::chrono::duration<float>(m_MotionGestureCooldown));
+        };
+
+    const Vector leftForwardHorizontal{ m_LeftControllerForward.x, m_LeftControllerForward.y, 0.0f };
+    const float leftForwardHorizontalLength = VectorLength(leftForwardHorizontal);
+    const Vector leftForwardHorizontalNorm = leftForwardHorizontalLength > 0.0f
+        ? leftForwardHorizontal / leftForwardHorizontalLength
+        : Vector(0.0f, 0.0f, 0.0f);
+
+    const float leftOutwardHorizontalSpeed = std::max(0.0f, DotProduct(leftDelta, leftForwardHorizontalNorm)) / deltaSeconds;
+    const float leftHorizontalSpeed = VectorLength(Vector(leftDelta.x, leftDelta.y, 0.0f)) / deltaSeconds;
+    const float leftOutwardSpeed = leftForwardHorizontalLength > 0.01f ? leftOutwardHorizontalSpeed : leftHorizontalSpeed;
+    const bool inventoryQuickSwitchHeld = m_InventoryQuickSwitchEnabled && PressedDigitalAction(m_ActionInventoryQuickSwitch);
+    if (leftOutwardSpeed >= m_MotionGestureSwingThreshold && now >= m_SecondaryGestureCooldownEnd)
+    {
+        startHold(m_SecondaryAttackGestureHoldUntil);
+        startCooldown(m_SecondaryGestureCooldownEnd);
+    }
+
+    if (inventoryQuickSwitchHeld)
+    {
+        m_ReloadGestureHoldUntil = {};
+    }
+    else if (rightDownSpeed >= m_MotionGestureDownSwingThreshold && now >= m_ReloadGestureCooldownEnd)
+    {
+        startHold(m_ReloadGestureHoldUntil);
+        startCooldown(m_ReloadGestureCooldownEnd);
+    }
+
+    const bool onGround = localPlayer && localPlayer->m_hGroundEntity != -1;
+    if (onGround && hmdVerticalSpeed >= m_MotionGestureJumpThreshold && now >= m_JumpGestureCooldownEnd)
+    {
+        startHold(m_JumpGestureHoldUntil);
+        startCooldown(m_JumpGestureCooldownEnd);
+    }
+
+    m_PrevLeftControllerLocalPos = m_LeftControllerPose.TrackedDevicePos;
+    m_PrevRightControllerLocalPos = m_RightControllerPose.TrackedDevicePos;
+    m_PrevHmdLocalPos = m_HmdPose.TrackedDevicePos;
+}

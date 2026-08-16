@@ -1,0 +1,1271 @@
+#include "vr.h"
+#include "game.h"
+#include "sdk.h"
+#include "offsets.h"
+#include "MinHook.h"
+#include "d3d9_vr.h"
+#include "bmvr_flags.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cctype>
+#include <cstring>
+#include <mutex>
+#include <string>
+
+namespace
+{
+    using tPresent = HRESULT(__stdcall*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+    using tSetRenderTarget = HRESULT(__stdcall*)(IDirect3DDevice9*, DWORD, IDirect3DSurface9*);
+
+    tPresent g_OrigPresent = nullptr;
+    tSetRenderTarget g_OrigSetRenderTarget = nullptr;
+    bool g_DeviceHooksEnabled = false;
+
+    constexpr UINT kIDirect3DDevice9_Present = 17;
+    constexpr UINT kIDirect3DDevice9_SetRenderTarget = 37;
+
+    template <typename T>
+    void ReleaseT(T*& p)
+    {
+        if (p)
+        {
+            p->Release();
+            p = nullptr;
+        }
+    }
+
+    QAngle HmdMatrixToSourceAngles(const vr::HmdMatrix34_t& mat)
+    {
+        QAngle ang;
+        ang.x = asinf(mat.m[1][2]) * (180.0f / 3.141592654f);
+        ang.y = atan2f(mat.m[0][2], mat.m[2][2]) * (180.0f / 3.141592654f);
+        ang.z = 0.f;
+        return ang;
+    }
+
+    Vector HmdMatrixToSourcePos(const vr::HmdMatrix34_t& mat, float scale)
+    {
+        Vector pos;
+        pos.x = -mat.m[2][3] * scale;
+        pos.y = -mat.m[0][3] * scale;
+        pos.z = mat.m[1][3] * scale;
+        return pos;
+    }
+
+    HRESULT __stdcall HookedPresent(IDirect3DDevice9* device, const RECT* src, const RECT* dst, HWND hwnd, const RGNDATA* dirty)
+    {
+        if (g_Game && g_Game->m_VR)
+            g_Game->m_VR->CaptureFrameBeforePresent();
+        if (!g_OrigPresent)
+            return D3DERR_INVALIDCALL;
+        return g_OrigPresent(device, src, dst, hwnd, dirty);
+    }
+
+    HRESULT __stdcall HookedSetRenderTarget(IDirect3DDevice9* device, DWORD index, IDirect3DSurface9* rt)
+    {
+        if (index == 0 && g_Game && g_Game->m_VR && device && !g_Game->m_VR->m_CaptureReentry)
+        {
+            IDirect3DSurface9* oldRt = nullptr;
+            D3DVIEWPORT9 vp{};
+            device->GetRenderTarget(0, &oldRt);
+            const bool haveVp = SUCCEEDED(device->GetViewport(&vp));
+            if (oldRt && oldRt != rt)
+            {
+                g_Game->m_VR->CaptureGameColorOnUnbind(
+                    oldRt,
+                    haveVp ? vp.X : 0,
+                    haveVp ? vp.Y : 0,
+                    haveVp ? vp.Width : 0,
+                    haveVp ? vp.Height : 0);
+            }
+            if (oldRt)
+                oldRt->Release();
+        }
+        if (!g_OrigSetRenderTarget)
+            return D3DERR_INVALIDCALL;
+        return g_OrigSetRenderTarget(device, index, rt);
+    }
+
+    bool QueryGameClientSize(UINT& w, UINT& h)
+    {
+        HWND hwnd = FindWindowA("Valve001", nullptr);
+        if (!hwnd)
+            hwnd = FindWindowA(nullptr, "Black Mesa");
+        if (!hwnd)
+            return false;
+        RECT rc{};
+        if (!GetClientRect(hwnd, &rc))
+            return false;
+        w = static_cast<UINT>(rc.right - rc.left);
+        h = static_cast<UINT>(rc.bottom - rc.top);
+        return w >= 640 && h >= 360;
+    }
+
+    using tBeginRTAlloc = void(__thiscall*)(void*);
+    using tEndRTAlloc = void(__thiscall*)(void*);
+    using tCreateNamedRTEx = ITexture*(__thiscall*)(void*, const char*, int, int, int, int, int, unsigned, unsigned);
+
+    ITexture* SehCreateNamedEyeRT(tCreateNamedRTEx fn, void* mat, const char* name, int w, int h)
+    {
+        ITexture* tex = nullptr;
+        if (!fn || !mat)
+            return nullptr;
+        __try
+        {
+            tex = fn(mat, name, w, h, RT_SIZE_LITERAL, IMAGE_FORMAT_BGRA8888,
+                MATERIAL_RT_DEPTH_SEPARATE, TEXTUREFLAGS_NOMIP, 0);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            tex = nullptr;
+        }
+        return tex;
+    }
+
+    void SehBeginRTAlloc(tBeginRTAlloc fn, void* mat, bool& ok)
+    {
+        ok = false;
+        if (!fn || !mat)
+            return;
+        __try
+        {
+            fn(mat);
+            ok = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            ok = false;
+        }
+    }
+
+    void SehEndRTAlloc(tEndRTAlloc fn, void* mat)
+    {
+        if (!fn || !mat)
+            return;
+        __try
+        {
+            fn(mat);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    const char* SehGetLevelNameShort(IEngineClient* eng)
+    {
+        const char* map = nullptr;
+        if (!eng)
+            return "";
+        __try
+        {
+            map = eng->GetLevelNameShort();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            map = nullptr;
+        }
+        return map ? map : "";
+    }
+}
+
+VR::VR(Game* game)
+    : m_Game(game)
+{
+    Game::logMsg("VR ctor: L4D2VR OpenVR + IDirect3DVR9 path (Black Mesa capture)");
+    m_IsInitialized = InitOpenVR();
+}
+
+bool VR::IsGameplayMapName(const char* map)
+{
+    if (!map || !map[0])
+        return false;
+    const char* slash = strrchr(map, '/');
+    const char* bslash = strrchr(map, '\\');
+    if (bslash && (!slash || bslash > slash))
+        slash = bslash;
+    const char* base = slash ? slash + 1 : map;
+    std::string name(base);
+    const auto dot = name.rfind('.');
+    if (dot != std::string::npos)
+        name = name.substr(0, dot);
+    for (char& c : name)
+        c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    if (name == "dedicated" || name.rfind("background", 0) == 0)
+        return false;
+    return true;
+}
+
+void VR::PollMapFromEngine()
+{
+    if (!m_Game || !m_Game->m_EngineClient)
+        return;
+    const char* map = SehGetLevelNameShort(m_Game->m_EngineClient);
+    const size_t n = strlen(map);
+    if (n > 96)
+        return;
+    for (size_t i = 0; i < n; ++i)
+    {
+        const unsigned char ch = static_cast<unsigned char>(map[i]);
+        if (ch < 32 || ch > 126)
+            return;
+    }
+    if (m_CurrentMapName == map)
+        return;
+    if (!map[0])
+    {
+        if (!m_CurrentMapName.empty())
+            OnLevelShutdown();
+        m_CurrentMapName.clear();
+        return;
+    }
+    OnLevelInit(map);
+}
+
+void VR::OnLevelInit(const char* newmap)
+{
+    m_CurrentMapName = newmap ? newmap : "";
+    m_GameplayEligible = IsGameplayMapName(newmap);
+    m_SeenGameplay = false;
+    m_GameplayFrames = 0;
+    m_EligiblePresents = 0;
+    m_SafeLookActive = false;
+    m_LookApplyEnabled = false;
+    m_HmdOriginLatched = false;
+    Game::logMsg("LevelInit map=%s eligible=%d", m_CurrentMapName.c_str(), m_GameplayEligible ? 1 : 0);
+}
+
+bool VR::ShouldCompositorSubmit() const
+{
+    if (!m_IsVREnabled)
+        return false;
+    if (m_GameplayEligible)
+        return true;
+    // background01 / menu. Pre-LevelInit StretchRect crashed; require a map name.
+    return bmvr::TryMenuCompositor() && !m_CurrentMapName.empty();
+}
+
+void VR::OnLevelShutdown()
+{
+    m_GameplayEligible = false;
+    m_SeenGameplay = false;
+    m_SafeLookActive = false;
+    m_LookApplyEnabled = false;
+    Game::logMsg("LevelShutdown");
+}
+
+void VR::HandleMissingRenderContext(const char* location)
+{
+    Game::logMsg("Missing render context at %s", location ? location : "?");
+}
+
+bool VR::InitOpenVR()
+{
+    ++m_OpenVRInitAttempts;
+
+    if (bmvr::g_OpenVRInitedFromCreateDevice && vr::VRSystem())
+    {
+        m_System = vr::VRSystem();
+        Game::logMsg("OpenVR already initialized from CreateDevice");
+    }
+    else
+    {
+        vr::EVRInitError error = vr::VRInitError_None;
+        m_System = vr::VR_Init(&error, vr::VRApplication_Scene);
+        if (error != vr::VRInitError_None || !m_System)
+        {
+            Game::logMsg("VR_Init failed (%d): %s", (int)error,
+                vr::VR_GetVRInitErrorAsEnglishDescription(error));
+            m_System = nullptr;
+            m_IsVREnabled = false;
+            return false;
+        }
+    }
+
+    m_Compositor = vr::VRCompositor();
+    if (!m_Compositor)
+    {
+        Game::logMsg("VRCompositor() returned null");
+        m_IsVREnabled = false;
+        return false;
+    }
+
+    m_Input = vr::VRInput();
+    m_Overlay = vr::VROverlay();
+
+    uint32_t recW = bmvr::g_RecommendedEyeWidth;
+    uint32_t recH = bmvr::g_RecommendedEyeHeight;
+    if (recW < 640 || recH < 360)
+        m_System->GetRecommendedRenderTargetSize(&recW, &recH);
+    if (recW >= 640 && recH >= 360)
+    {
+        bmvr::g_RecommendedEyeWidth = recW;
+        bmvr::g_RecommendedEyeHeight = recH;
+        // Do not assign m_RenderWidth/Height to the HMD size unless the
+        // swapchain retry is still enabled. Reset() forces the D3D9
+        // backbuffer to these values; 3168x3100 produced a black desktop
+        // and SteamVR waiting room on this DLL (2026-08-16).
+        if (bmvr::TryHmdSwapchain())
+        {
+            m_RenderWidth = recW;
+            m_RenderHeight = recH;
+        }
+    }
+    Game::logMsg("OpenVR recommended RT %ux%u (swapchain force=%d, eye/swapchain size %ux%u)",
+        recW, recH, bmvr::TryHmdSwapchain() ? 1 : 0, m_RenderWidth, m_RenderHeight);
+    RefreshIpdFromHmd();
+
+    float l_left = 0, l_right = 0, l_top = 0, l_bottom = 0;
+    m_System->GetProjectionRaw(vr::Eye_Left, &l_left, &l_right, &l_top, &l_bottom);
+    float r_left = 0, r_right = 0, r_top = 0, r_bottom = 0;
+    m_System->GetProjectionRaw(vr::Eye_Right, &r_left, &r_right, &r_top, &r_bottom);
+
+    const float tanHalfFovX = (std::max)({ -l_left, l_right, -r_left, r_right });
+    const float tanHalfFovY = (std::max)({ -l_top, l_bottom, -r_top, r_bottom });
+
+    // Same projection crop as L4D2VR, then swap vMin/vMax for Vulkan (OpenVR docs).
+    m_TextureBounds[0].uMin = 0.5f + 0.5f * l_left / tanHalfFovX;
+    m_TextureBounds[0].uMax = 0.5f + 0.5f * l_right / tanHalfFovX;
+    m_TextureBounds[0].vMin = 0.5f - 0.5f * l_bottom / tanHalfFovY;
+    m_TextureBounds[0].vMax = 0.5f - 0.5f * l_top / tanHalfFovY;
+    m_TextureBounds[1].uMin = 0.5f + 0.5f * r_left / tanHalfFovX;
+    m_TextureBounds[1].uMax = 0.5f + 0.5f * r_right / tanHalfFovX;
+    m_TextureBounds[1].vMin = 0.5f - 0.5f * r_bottom / tanHalfFovY;
+    m_TextureBounds[1].vMax = 0.5f - 0.5f * r_top / tanHalfFovY;
+    Game::logMsg("OpenVR projection UV L=(%.3f,%.3f)-(%.3f,%.3f) R=(%.3f,%.3f)-(%.3f,%.3f)",
+        m_TextureBounds[0].uMin, m_TextureBounds[0].vMin, m_TextureBounds[0].uMax, m_TextureBounds[0].vMax,
+        m_TextureBounds[1].uMin, m_TextureBounds[1].vMin, m_TextureBounds[1].uMax, m_TextureBounds[1].vMax);
+
+    m_Aspect = tanHalfFovX / tanHalfFovY;
+    m_Fov = 2.0f * atanf(tanHalfFovX) * 180.0f / 3.14159265358979323846f;
+
+    m_IsVREnabled = true;
+    m_Compositor->SetExplicitTimingMode(
+        vr::VRCompositorTimingMode_Explicit_ApplicationPerformsPostPresentHandoff);
+    m_Compositor->CompositorBringToFront();
+    StartPoseWaiter();
+    Game::logMsg("OpenVR scene app ready compositor=%p canRender=%d fov=%.1f aspect=%.3f",
+        (void*)m_Compositor, m_Compositor->CanRenderScene() ? 1 : 0, m_Fov, m_Aspect);
+    return true;
+}
+
+void VR::ApplyVulkanYFlip(vr::VRTextureBounds_t& bounds)
+{
+    const float tmp = bounds.vMin;
+    bounds.vMin = bounds.vMax;
+    bounds.vMax = tmp;
+}
+
+void VR::RefreshIpdFromHmd()
+{
+    if (!m_System)
+        return;
+    const vr::HmdMatrix34_t right = m_System->GetEyeToHeadTransform(vr::Eye_Right);
+    const float ipd = fabsf(right.m[0][3]) * 2.0f;
+    if (ipd >= 0.04f && ipd <= 0.10f)
+        m_Ipd = ipd;
+}
+
+bool VR::ResolveSurfaceSize(IDirect3DSurface9* surf, UINT& w, UINT& h, D3DSURFACE_DESC* outDesc)
+{
+    w = 0;
+    h = 0;
+    if (!surf)
+        return false;
+    D3DSURFACE_DESC desc{};
+    if (FAILED(surf->GetDesc(&desc)))
+        return false;
+    if (outDesc)
+        *outDesc = desc;
+    w = desc.Width;
+    h = desc.Height;
+    return w >= 2 && h >= 2;
+}
+
+UINT VR::KnownWindowWidth() const
+{
+    UINT w = 0, h = 0;
+    if (QueryGameClientSize(w, h))
+        return w;
+    if (m_VKBackBuffer.m_VulkanData.m_nWidth >= 640)
+        return m_VKBackBuffer.m_VulkanData.m_nWidth;
+    if (m_RenderWidth >= 640)
+        return m_RenderWidth;
+    return 1920;
+}
+
+UINT VR::KnownWindowHeight() const
+{
+    UINT w = 0, h = 0;
+    if (QueryGameClientSize(w, h))
+        return h;
+    if (m_VKBackBuffer.m_VulkanData.m_nHeight >= 360)
+        return m_VKBackBuffer.m_VulkanData.m_nHeight;
+    if (m_RenderHeight >= 360)
+        return m_RenderHeight;
+    return 1080;
+}
+
+void VR::ChooseEyeRenderSize()
+{
+    uint32_t recW = bmvr::g_RecommendedEyeWidth;
+    uint32_t recH = bmvr::g_RecommendedEyeHeight;
+    if ((recW < 640 || recH < 360) && m_System)
+        m_System->GetRecommendedRenderTargetSize(&recW, &recH);
+    if (recW < 640 || recH < 360)
+    {
+        recW = KnownWindowWidth();
+        recH = KnownWindowHeight();
+    }
+
+    // Keep HMD aspect (fixes 16:9 stretched into ~square FOV). Cap the long
+    // side so two eye views stay cheaper than a full recommended 2536x2480.
+    const uint32_t longSide = (std::max)(recW, recH);
+    if (longSide > 1920)
+    {
+        const float s = 1920.0f / static_cast<float>(longSide);
+        recW = (std::max)(640u, static_cast<uint32_t>(recW * s));
+        recH = (std::max)(360u, static_cast<uint32_t>(recH * s));
+    }
+    recW = (recW + 1u) & ~1u;
+    recH = (recH + 1u) & ~1u;
+    if (m_RenderWidth != recW || m_RenderHeight != recH)
+        Game::logMsg("Eye RT size %ux%u (recommended %ux%u aspect=%.3f)",
+            recW, recH, bmvr::g_RecommendedEyeWidth, bmvr::g_RecommendedEyeHeight, m_Aspect);
+    m_RenderWidth = recW;
+    m_RenderHeight = recH;
+}
+
+Vector VR::GetViewAngle() const
+{
+    return Vector(m_HmdAngAbs.x, m_HmdAngAbs.y, m_HmdAngAbs.z);
+}
+
+void VR::WaitPosesForStereoFrame()
+{
+    if (m_PosesWaitedThisFrame)
+        return;
+    UpdateTracking();
+    m_PosesWaitedThisFrame = true;
+}
+
+void VR::StartPoseWaiter()
+{
+    if (m_PoseWaiterThread)
+        return;
+    m_PoseWaiterStop.store(false, std::memory_order_release);
+    m_PoseWaiterThread = CreateThread(nullptr, 0, &VR::PoseWaiterThreadMain, this, 0, nullptr);
+    if (m_PoseWaiterThread)
+        Game::logMsg("Pose waiter thread started (WaitGetPoses off Present)");
+    else
+        Game::logMsg("Pose waiter CreateThread failed err=%lu", GetLastError());
+}
+
+DWORD WINAPI VR::PoseWaiterThreadMain(LPVOID param)
+{
+    VR* vr = static_cast<VR*>(param);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+    Game::logMsg("Pose waiter running");
+    while (!vr->m_PoseWaiterStop.load(std::memory_order_acquire))
+    {
+        if (!vr->m_Compositor)
+        {
+            Sleep(8);
+            continue;
+        }
+        vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount]{};
+        const DWORD t0 = GetTickCount();
+        const vr::EVRCompositorError err = vr->m_Compositor->WaitGetPoses(
+            poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
+        const DWORD dt = GetTickCount() - t0;
+        {
+            std::lock_guard<std::mutex> lock(vr->m_PoseMutex);
+            std::memcpy(vr->m_WaitedPoses, poses, sizeof(poses));
+        }
+        vr->m_LastPoseWaitError.store(static_cast<int>(err), std::memory_order_release);
+        vr->m_WaitedPoseTick.store(GetTickCount(), std::memory_order_release);
+        vr->m_PoseWaitCount.fetch_add(1, std::memory_order_relaxed);
+        if (dt > 50)
+            vr->m_PoseWaitOvershootCount.fetch_add(1, std::memory_order_relaxed);
+        static int s_poseLog;
+        if (s_poseLog < 4 || dt > 100)
+        {
+            Game::logMsg("Pose waiter WaitGetPoses err=%d dt=%ums valid=%d connected=%d",
+                (int)err, dt,
+                poses[vr::k_unTrackedDeviceIndex_Hmd].bPoseIsValid ? 1 : 0,
+                poses[vr::k_unTrackedDeviceIndex_Hmd].bDeviceIsConnected ? 1 : 0);
+            ++s_poseLog;
+        }
+    }
+    return 0;
+}
+
+bool VR::RefreshBackBufferTexture(bool forceRefresh)
+{
+    if (!g_D3DVR9)
+        return false;
+    if (!forceRefresh && m_BackBufferTextureValid)
+        return true;
+    const HRESULT hr = g_D3DVR9->GetBackBufferData(&m_VKBackBuffer);
+    const UINT w = m_VKBackBuffer.m_VulkanData.m_nWidth;
+    const UINT h = m_VKBackBuffer.m_VulkanData.m_nHeight;
+    m_BackBufferTextureValid = SUCCEEDED(hr) && m_VKBackBuffer.m_VulkanData.m_nImage && w >= 640 && h >= 360;
+    if (m_BackBufferTextureValid && (m_RenderWidth == 0 || m_RenderHeight == 0))
+    {
+        m_RenderWidth = w;
+        m_RenderHeight = h;
+        Game::logMsg("Backbuffer VR desc %ux%u fmt=%u", w, h, m_VKBackBuffer.m_VulkanData.m_nFormat);
+    }
+    else if (!m_BackBufferTextureValid)
+    {
+        static int s_stubLog;
+        if (s_stubLog < 3)
+        {
+            Game::logMsg("GetBackBufferData stub/unresolved hr=0x%08X %ux%u image=%llu",
+                (unsigned)hr, w, h, (unsigned long long)m_VKBackBuffer.m_VulkanData.m_nImage);
+            ++s_stubLog;
+        }
+    }
+    return m_BackBufferTextureValid;
+}
+
+bool VR::FillSharedTexture(IDirect3DSurface9* surface, SharedTextureHolder& holder)
+{
+    if (!g_D3DVR9 || !surface)
+        return false;
+    D3D9_TEXTURE_VR_DESC desc{};
+    if (FAILED(g_D3DVR9->GetVRDesc(surface, &desc)) || !desc.Image)
+        return false;
+    std::memcpy(&holder.m_VulkanData, &desc, sizeof(holder.m_VulkanData));
+    holder.m_VRTexture.handle = &holder.m_VulkanData;
+    holder.m_VRTexture.eType = vr::TextureType_Vulkan;
+    holder.m_VRTexture.eColorSpace = vr::ColorSpace_Auto;
+    return holder.m_VulkanData.m_nImage != 0;
+}
+
+void VR::ReleaseVRRenderTargetsForDeviceReset()
+{
+    std::lock_guard<TextureStateMutex> lock(m_TextureMutex);
+    ReleaseT(m_D9LeftEyeSurface);
+    ReleaseT(m_D9RightEyeSurface);
+    ReleaseT(m_D9LeftEyeTexture);
+    ReleaseT(m_D9RightEyeTexture);
+    ReleaseT(m_D9FrameColorSurface);
+    m_LeftEyeTexture = nullptr;
+    m_RightEyeTexture = nullptr;
+    m_UsedNamedRenderTargets = false;
+    m_DirectEyeSubmit = false;
+    m_StereoRenderViewActive = false;
+    m_FrameCopyWidth = 0;
+    m_FrameCopyHeight = 0;
+    m_CreatedVRTextures.store(false, std::memory_order_release);
+    m_BackBufferTextureValid = false;
+    m_FrameCopyLatched = false;
+    m_RenderedNewFrame.store(false, std::memory_order_release);
+    m_SkipBlockingPoseWait = true;
+    m_HasSubmittedSceneFrame.store(false, std::memory_order_release);
+    Game::logMsg("Released VR render targets for device reset");
+}
+
+void VR::InstallDeviceHooks(IDirect3DDevice9* device)
+{
+    if (m_D3DHooksInstalled || !device)
+        return;
+
+    void** vtbl = *reinterpret_cast<void***>(device);
+    if (!vtbl)
+        return;
+
+    MH_STATUS st = MH_Initialize();
+    if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED)
+    {
+        Game::logMsg("MinHook init for D3D hooks failed %d", (int)st);
+        return;
+    }
+
+    if (MH_CreateHook(vtbl[kIDirect3DDevice9_Present], reinterpret_cast<LPVOID>(&HookedPresent),
+            reinterpret_cast<LPVOID*>(&g_OrigPresent)) != MH_OK)
+    {
+        Game::logMsg("MH_CreateHook Present failed");
+        return;
+    }
+    if (MH_CreateHook(vtbl[kIDirect3DDevice9_SetRenderTarget], reinterpret_cast<LPVOID>(&HookedSetRenderTarget),
+            reinterpret_cast<LPVOID*>(&g_OrigSetRenderTarget)) != MH_OK)
+    {
+        Game::logMsg("MH_CreateHook SetRenderTarget failed");
+        return;
+    }
+    if (MH_EnableHook(vtbl[kIDirect3DDevice9_Present]) != MH_OK ||
+        MH_EnableHook(vtbl[kIDirect3DDevice9_SetRenderTarget]) != MH_OK)
+    {
+        Game::logMsg("MH_EnableHook D3D present/RT failed");
+        return;
+    }
+
+    m_D3DHooksInstalled = true;
+    g_DeviceHooksEnabled = true;
+    Game::logMsg("D3D9 Present + SetRenderTarget hooks installed (pre-Present capture)");
+}
+
+bool VR::EnsureFrameCopySurface(IDirect3DDevice9* device, uint32_t width, uint32_t height)
+{
+    if (!device || width < 640 || height < 360)
+        return false;
+    if (m_D9FrameColorSurface && m_FrameCopyWidth == width && m_FrameCopyHeight == height)
+        return true;
+
+    IDirect3DSurface9* surf = nullptr;
+    const HRESULT hr = device->CreateRenderTarget(
+        width, height, D3DFMT_A8R8G8B8,
+        D3DMULTISAMPLE_NONE, 0, FALSE, &surf, nullptr);
+    if (FAILED(hr) || !surf)
+    {
+        Game::logMsg("Frame copy RT create failed hr=0x%08X %ux%u", (unsigned)hr, width, height);
+        return false;
+    }
+    ReleaseT(m_D9FrameColorSurface);
+    m_D9FrameColorSurface = surf;
+    m_FrameCopyWidth = width;
+    m_FrameCopyHeight = height;
+    Game::logMsg("Frame copy RT ready %ux%u", width, height);
+    return true;
+}
+
+bool VR::EnsureNamedEyeTextures()
+{
+    if (m_UsedNamedRenderTargets && m_LeftEyeTexture && m_RightEyeTexture
+        && m_D9LeftEyeSurface && m_D9RightEyeSurface)
+        return true;
+    if (!bmvr::TryNamedRenderTargets() || !bmvr::TryStereoRenderView())
+        return false;
+    if (!m_Game || !m_Game->m_MaterialSystem || !m_Game->m_Offsets)
+        return false;
+    // Present-thread CreateNamed during 1 FPS map load killed the process
+    // (2026-08-16). L4D2VR creates these from RenderView after the game is up.
+    if (m_SubmitCount < 90)
+        return false;
+
+    auto& o = *m_Game->m_Offsets;
+    if (!o.BeginRTAlloc.valid || !o.EndRTAlloc.valid || !o.CreateNamedRTEx.valid)
+        return false;
+
+    const uint32_t oldW = m_RenderWidth;
+    const uint32_t oldH = m_RenderHeight;
+    ChooseEyeRenderSize();
+    const int w = static_cast<int>(m_RenderWidth);
+    const int h = static_cast<int>(m_RenderHeight);
+    if (w < 640 || h < 360)
+    {
+        m_RenderWidth = oldW;
+        m_RenderHeight = oldH;
+        return false;
+    }
+
+    void* mat = m_Game->m_MaterialSystem;
+    auto* running = reinterpret_cast<uint8_t*>(mat) + Offsets::kCMaterialSystem_isGameRunning;
+    const uint8_t prevRunning = *running;
+
+    auto beginFn = reinterpret_cast<tBeginRTAlloc>(o.BeginRTAlloc.address);
+    auto endFn = reinterpret_cast<tEndRTAlloc>(o.EndRTAlloc.address);
+    auto createFn = reinterpret_cast<tCreateNamedRTEx>(o.CreateNamedRTEx.address);
+
+    bmvr::BeginRisky(L"named_rt");
+    *running = 0;
+    bool beginOk = false;
+    SehBeginRTAlloc(beginFn, mat, beginOk);
+    *running = 1;
+
+    ReleaseT(m_D9LeftEyeSurface);
+    ReleaseT(m_D9RightEyeSurface);
+
+    m_CreatingTextureID = Texture_LeftEye;
+    ITexture* left = SehCreateNamedEyeRT(createFn, mat, "leftEye0", w, h);
+    m_CreatingTextureID = Texture_RightEye;
+    ITexture* right = SehCreateNamedEyeRT(createFn, mat, "rightEye0", w, h);
+    m_CreatingTextureID = Texture_None;
+
+    SehEndRTAlloc(endFn, mat);
+    *running = prevRunning;
+
+    const bool d3dOk = m_D9LeftEyeSurface && m_D9RightEyeSurface
+        && FillSharedTexture(m_D9LeftEyeSurface, m_VKLeftEye)
+        && FillSharedTexture(m_D9RightEyeSurface, m_VKRightEye);
+    if (!beginOk || !left || !right || !d3dOk)
+    {
+        Game::logMsg("Named eye RTs failed begin=%d L=%p R=%p d3d=%d %dx%d",
+            beginOk ? 1 : 0, (void*)left, (void*)right, d3dOk ? 1 : 0, w, h);
+        m_LeftEyeTexture = nullptr;
+        m_RightEyeTexture = nullptr;
+        m_UsedNamedRenderTargets = false;
+        m_RenderWidth = oldW;
+        m_RenderHeight = oldH;
+        bmvr::EndRisky(L"named_rt");
+        if (g_D3DVR9)
+        {
+            IDirect3DDevice9* device = nullptr;
+            if (SUCCEEDED(g_D3DVR9->GetD3DDevice(&device)) && device)
+            {
+                EnsurePrivateEyeSurfaces(device);
+                device->Release();
+            }
+        }
+        return false;
+    }
+
+    m_LeftEyeTexture = left;
+    m_RightEyeTexture = right;
+    m_UsedNamedRenderTargets = true;
+    m_CreatedVRTextures.store(true, std::memory_order_release);
+    bmvr::EndRisky(L"named_rt");
+    Game::logMsg("Named eye RTs ready leftEye0/rightEye0 %dx%d created=1 L=%p R=%p d3dL=%p d3dR=%p",
+        w, h, (void*)left, (void*)right, (void*)m_D9LeftEyeSurface, (void*)m_D9RightEyeSurface);
+    return true;
+}
+
+bool VR::EnsurePrivateEyeSurfaces(IDirect3DDevice9* device)
+{
+    if (!device)
+        return false;
+
+    // Private capture path must match the desktop backbuffer. HMD-aspect
+    // 1920x1878 eyes + letterbox Submit crashed during map load (2026-08-16).
+    const UINT w = KnownWindowWidth();
+    const UINT h = KnownWindowHeight();
+    if (w < 640 || h < 360)
+        return false;
+
+    if (m_CreatedVRTextures.load(std::memory_order_acquire) && m_D9LeftEyeSurface && m_D9RightEyeSurface
+        && m_VKLeftEye.m_VulkanData.m_nWidth == w && m_VKLeftEye.m_VulkanData.m_nHeight == h)
+        return true;
+
+    std::lock_guard<TextureStateMutex> lock(m_TextureMutex);
+
+    auto createEye = [&](TextureID id, IDirect3DTexture9** tex, IDirect3DSurface9** surf, SharedTextureHolder& vk) -> bool {
+        ReleaseT(*surf);
+        ReleaseT(*tex);
+        m_CreatingTextureID = id;
+        const HRESULT hr = device->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, tex, nullptr);
+        m_CreatingTextureID = Texture_None;
+        if (FAILED(hr) || !*tex)
+        {
+            Game::logMsg("CreateTexture eye id=%d hr=0x%08X", (int)id, (unsigned)hr);
+            return false;
+        }
+        if (!*surf)
+            (*tex)->GetSurfaceLevel(0, surf);
+        if (!FillSharedTexture(*surf, vk))
+        {
+            Game::logMsg("GetVRDesc failed for eye id=%d surf=%p", (int)id, (void*)*surf);
+            return false;
+        }
+        Game::logMsg("Eye RT id=%d %ux%u img=%llu", (int)id, vk.m_VulkanData.m_nWidth, vk.m_VulkanData.m_nHeight,
+            (unsigned long long)vk.m_VulkanData.m_nImage);
+        return true;
+    };
+
+    const bool leftOk = createEye(Texture_LeftEye, &m_D9LeftEyeTexture, &m_D9LeftEyeSurface, m_VKLeftEye);
+    const bool rightOk = createEye(Texture_RightEye, &m_D9RightEyeTexture, &m_D9RightEyeSurface, m_VKRightEye);
+    EnsureFrameCopySurface(device, w, h);
+
+    m_CreatedVRTextures.store(leftOk && rightOk && m_VKLeftEye.m_VulkanData.m_nImage && m_VKRightEye.m_VulkanData.m_nImage,
+        std::memory_order_release);
+    Game::logMsg("VR D3D eye RTs ready=%d L=%p R=%p copy=%p %ux%u",
+        m_CreatedVRTextures.load() ? 1 : 0,
+        (void*)m_D9LeftEyeSurface, (void*)m_D9RightEyeSurface, (void*)m_D9FrameColorSurface, w, h);
+    return m_CreatedVRTextures.load();
+}
+
+void VR::CreateVRTextures()
+{
+    Game::logMsg("CreateVRTextures begin presents=%u", m_EligiblePresents);
+    if (!g_D3DVR9)
+        return;
+    IDirect3DDevice9* device = nullptr;
+    if (FAILED(g_D3DVR9->GetD3DDevice(&device)) || !device)
+        return;
+    RefreshBackBufferTexture(true);
+    EnsurePrivateEyeSurfaces(device);
+    device->Release();
+}
+
+void VR::CaptureGameColorOnUnbind(IDirect3DSurface9* oldRt, uint32_t vpX, uint32_t vpY, uint32_t vpW, uint32_t vpH)
+{
+    (void)oldRt;
+    (void)vpX;
+    (void)vpY;
+    (void)vpW;
+    (void)vpH;
+    // FullFrameFB unbind StretchRect after Present raced and crashed on this
+    // DLL (2026-08-16). PrePresent capture is enough for the loading/menu path.
+}
+
+void VR::CaptureFrameBeforePresent()
+{
+    if (m_DirectEyeSubmit)
+        return;
+    if (!m_IsVREnabled || !g_D3DVR9)
+        return;
+    if (!ShouldCompositorSubmit())
+        return;
+
+    if (m_FrameCopyLatched && m_D9FrameColorSurface)
+    {
+        m_RenderedNewFrame.store(true, std::memory_order_release);
+        return;
+    }
+
+    IDirect3DDevice9* device = nullptr;
+    if (FAILED(g_D3DVR9->GetD3DDevice(&device)) || !device)
+        return;
+
+    IDirect3DSurface9* rt0 = nullptr;
+    device->GetRenderTarget(0, &rt0);
+
+    UINT probeW = 0, probeH = 0;
+    const bool rtUsable = ResolveSurfaceSize(rt0, probeW, probeH) && probeW >= 640 && probeH >= 360;
+
+    IDirect3DSurface9* bb = nullptr;
+    if (!rtUsable)
+        device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
+
+    IDirect3DSurface9* srcSurf = rtUsable ? rt0 : bb;
+
+    UINT rtW = 0, rtH = 0;
+    D3DSURFACE_DESC rtDesc{};
+    const bool rtOk = ResolveSurfaceSize(srcSurf, rtW, rtH, &rtDesc);
+    const UINT winW = KnownWindowWidth();
+    const UINT winH = KnownWindowHeight();
+
+    D3DVIEWPORT9 vp{};
+    const bool vpRawOk = SUCCEEDED(device->GetViewport(&vp)) && vp.Width >= 640 && vp.Height >= 360;
+    const bool vpOk = vpRawOk && vp.Width <= winW + 16 && vp.Height <= winH + 16;
+
+    LONG x0 = 0, y0 = 0;
+    UINT cropW = 0, cropH = 0;
+    const char* name = "none";
+    if (rtOk && srcSurf && rtW >= 640 && rtH >= 360)
+    {
+        if (srcSurf == bb)
+        {
+            cropW = rtW;
+            cropH = rtH;
+            name = "bb";
+        }
+        else if (vpOk)
+        {
+            x0 = (LONG)vp.X;
+            y0 = (LONG)vp.Y;
+            cropW = (std::min)((UINT)vp.Width, winW);
+            cropH = (std::min)((UINT)vp.Height, winH);
+            name = "rt0-vp";
+        }
+        else if (rtW > winW + 16 || rtH > winH + 16)
+        {
+            cropW = (std::min)(rtW, winW);
+            cropH = (std::min)(rtH, winH);
+            x0 = 0;
+            y0 = (rtH > cropH) ? (LONG)(rtH - cropH) : 0;
+            name = "rt0-bl";
+        }
+        else
+        {
+            cropW = rtW;
+            cropH = rtH;
+            name = "rt0";
+        }
+    }
+
+    HRESULT hr = E_FAIL;
+    if (cropW >= 640 && cropH >= 360 && EnsureFrameCopySurface(device, cropW, cropH))
+    {
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        cropW = (std::min)(cropW, rtW - (UINT)x0);
+        cropH = (std::min)(cropH, rtH - (UINT)y0);
+        RECT src{ x0, y0, x0 + (LONG)cropW, y0 + (LONG)cropH };
+        const bool useRect = (x0 != 0 || y0 != 0 || rtW > winW + 16 || rtH > winH + 16);
+        m_CaptureReentry = true;
+        hr = device->StretchRect(srcSurf, useRect ? &src : nullptr, m_D9FrameColorSurface, nullptr, D3DTEXF_NONE);
+        m_CaptureReentry = false;
+        if (SUCCEEDED(hr))
+        {
+            m_RenderedNewFrame.store(true, std::memory_order_release);
+            m_FrameCopyLatched = true;
+            static int s_preLog;
+            if (s_preLog < 6)
+            {
+                Game::logMsg("PrePresent capture %s %ux%u from src=%ux%u hr=0x%08X",
+                    name, cropW, cropH, rtW, rtH, (unsigned)hr);
+                ++s_preLog;
+            }
+        }
+        else
+        {
+            static int s_srLog;
+            if (s_srLog < 6)
+            {
+                Game::logMsg("PrePresent StretchRect %s failed hr=0x%08X src=%ux%u crop=%ux%u",
+                    name, (unsigned)hr, rtW, rtH, cropW, cropH);
+                ++s_srLog;
+            }
+        }
+    }
+    else
+    {
+        static int s_noneLog;
+        if (s_noneLog < 6)
+        {
+            UINT bbW = 0, bbH = 0;
+            ResolveSurfaceSize(bb, bbW, bbH);
+            Game::logMsg("PrePresent capture NONE (rt0=%dx%d bb=%ux%u win=%ux%u vp=%u,%u %ux%u)",
+                rtUsable ? (int)probeW : -1, rtUsable ? (int)probeH : -1,
+                bbW, bbH, winW, winH,
+                vpRawOk ? vp.X : 0u, vpRawOk ? vp.Y : 0u,
+                vpRawOk ? vp.Width : 0u, vpRawOk ? vp.Height : 0u);
+            ++s_noneLog;
+        }
+    }
+
+    if (rt0)
+        rt0->Release();
+    if (bb)
+        bb->Release();
+    device->Release();
+}
+
+void VR::SubmitVRTextures()
+{
+    if (!m_Compositor || !g_D3DVR9 || !m_IsVREnabled)
+        return;
+    if (!m_CreatedVRTextures.load(std::memory_order_acquire))
+        return;
+    if (m_LastPoseWaitError.load(std::memory_order_acquire) ==
+        static_cast<int>(vr::VRCompositorError_DoNotHaveFocus))
+        return;
+
+    const bool directEyes = m_DirectEyeSubmit && m_D9LeftEyeSurface && m_D9RightEyeSurface;
+    const bool haveFrame = m_RenderedNewFrame.load(std::memory_order_acquire) && m_D9FrameColorSurface;
+    if (!directEyes && !haveFrame)
+        return;
+
+    static int s_submitEnter;
+    if (s_submitEnter < 4)
+    {
+        Game::logMsg("Submit enter direct=%d frame=%d named=%d eye=%ux%u",
+            directEyes ? 1 : 0, haveFrame ? 1 : 0, m_UsedNamedRenderTargets ? 1 : 0,
+            m_RenderWidth, m_RenderHeight);
+        ++s_submitEnter;
+    }
+
+    IDirect3DDevice9* device = nullptr;
+    if (FAILED(g_D3DVR9->GetD3DDevice(&device)) || !device)
+        return;
+
+    HRESULT hrL = S_OK, hrR = S_OK;
+    LONG usedOff = 0;
+    D3DSURFACE_DESC srcDesc{};
+    D3DSURFACE_DESC dstDesc{};
+
+    if (!directEyes)
+    {
+        const bool haveSrc = SUCCEEDED(m_D9FrameColorSurface->GetDesc(&srcDesc)) && srcDesc.Width >= 64 && srcDesc.Height >= 64;
+        const bool haveDst = m_D9LeftEyeSurface && SUCCEEDED(m_D9LeftEyeSurface->GetDesc(&dstDesc)) && dstDesc.Width >= 64;
+
+        hrL = E_FAIL;
+        hrR = E_FAIL;
+        if (haveSrc && haveDst && m_D9LeftEyeSurface)
+        {
+            m_CaptureReentry = true;
+            if (m_StereoCopyOffset && m_D9RightEyeSurface)
+            {
+                LONG useOff = m_StereoOffsetPx;
+                if (useOff <= 0)
+                    useOff = (std::max)(8L, (LONG)(srcDesc.Width / 64));
+                const LONG maxOff = (LONG)(srcDesc.Width / 8);
+                if (useOff > maxOff) useOff = maxOff;
+                usedOff = useOff;
+                RECT leftSrc{ useOff, 0, (LONG)srcDesc.Width, (LONG)srcDesc.Height };
+                RECT rightSrc{ 0, 0, (LONG)srcDesc.Width - useOff, (LONG)srcDesc.Height };
+                hrL = device->StretchRect(m_D9FrameColorSurface, &leftSrc, m_D9LeftEyeSurface, nullptr, D3DTEXF_LINEAR);
+                hrR = device->StretchRect(m_D9FrameColorSurface, &rightSrc, m_D9RightEyeSurface, nullptr, D3DTEXF_LINEAR);
+            }
+            else
+            {
+                hrL = device->StretchRect(m_D9FrameColorSurface, nullptr, m_D9LeftEyeSurface, nullptr, D3DTEXF_LINEAR);
+                hrR = m_D9RightEyeSurface
+                    ? device->StretchRect(m_D9FrameColorSurface, nullptr, m_D9RightEyeSurface, nullptr, D3DTEXF_LINEAR)
+                    : hrL;
+            }
+            m_CaptureReentry = false;
+        }
+
+        if (FAILED(hrL))
+        {
+            device->Release();
+            m_RenderedNewFrame.store(false, std::memory_order_release);
+            m_FrameCopyLatched = false;
+            return;
+        }
+    }
+    else
+    {
+        if (m_D9LeftEyeSurface)
+            m_D9LeftEyeSurface->GetDesc(&dstDesc);
+        srcDesc = dstDesc;
+        hrR = S_OK;
+    }
+
+    g_D3DVR9->LockDevice();
+    const BOOL waitGpu = bmvr::TryWaitDeviceIdle() ? TRUE : FALSE;
+    if (bmvr::TryWaitDeviceIdle())
+        bmvr::BeginRisky(L"wait_idle");
+    const bool okL = SUCCEEDED(g_D3DVR9->TransferSurface(m_D9LeftEyeSurface, waitGpu)) && FillSharedTexture(m_D9LeftEyeSurface, m_VKLeftEye);
+    bool okR = false;
+    if (m_D9RightEyeSurface && SUCCEEDED(hrR))
+        okR = SUCCEEDED(g_D3DVR9->TransferSurface(m_D9RightEyeSurface, waitGpu)) && FillSharedTexture(m_D9RightEyeSurface, m_VKRightEye);
+    if (bmvr::TryWaitDeviceIdle() && g_D3DVR9)
+        g_D3DVR9->WaitDeviceIdle();
+    if (bmvr::TryWaitDeviceIdle())
+        bmvr::EndRisky(L"wait_idle");
+    g_D3DVR9->UnlockDevice();
+
+    if (!okL)
+    {
+        device->Release();
+        return;
+    }
+
+    if (FAILED(g_D3DVR9->LockSubmissionQueue()))
+    {
+        device->Release();
+        return;
+    }
+
+    vr::VRTextureBounds_t leftBounds{};
+    vr::VRTextureBounds_t rightBounds{};
+    if (directEyes)
+    {
+        leftBounds = m_TextureBounds[0];
+        rightBounds = m_TextureBounds[1];
+    }
+    else
+    {
+        // 16:9 game blit is not an HMD-projection eye RT. GetProjectionRaw UVs
+        // showed the left strip of the pause menu, 180° rotated, rest black
+        // (WMR portal 2026-08-16). Keep v unflipped. Crop U so 16:9 matches
+        // HMD aspect (~1.1) instead of stretching vertically into the FOV.
+        leftBounds = { 0.f, 0.f, 1.f, 1.f };
+        const float imgW = srcDesc.Width > 0 ? (float)srcDesc.Width : (float)dstDesc.Width;
+        const float imgH = srcDesc.Height > 0 ? (float)srcDesc.Height : (float)dstDesc.Height;
+        if (imgW >= 64.f && imgH >= 64.f && m_Aspect > 0.1f)
+        {
+            const float imgAspect = imgW / imgH;
+            if (imgAspect > m_Aspect * 1.02f)
+            {
+                const float vis = m_Aspect / imgAspect;
+                const float du = (1.f - vis) * 0.5f;
+                leftBounds.uMin = du;
+                leftBounds.uMax = 1.f - du;
+            }
+        }
+        rightBounds = leftBounds;
+        static int s_boundsLog;
+        if (s_boundsLog < 3)
+        {
+            Game::logMsg("Capture Submit UV u=%.3f..%.3f v=%.3f..%.3f img=%ux%u hmdAspect=%.3f",
+                leftBounds.uMin, leftBounds.uMax, leftBounds.vMin, leftBounds.vMax,
+                srcDesc.Width, srcDesc.Height, m_Aspect);
+            ++s_boundsLog;
+        }
+    }
+
+    vr::EVRCompositorError eL = m_Compositor->Submit(vr::Eye_Left, &m_VKLeftEye.m_VRTexture, &leftBounds, vr::Submit_Default);
+    vr::EVRCompositorError eR = vr::VRCompositorError_None;
+    if (okR)
+        eR = m_Compositor->Submit(vr::Eye_Right, &m_VKRightEye.m_VRTexture, &rightBounds, vr::Submit_Default);
+    else
+        eR = m_Compositor->Submit(vr::Eye_Right, &m_VKLeftEye.m_VRTexture, &rightBounds, vr::Submit_Default);
+
+    g_D3DVR9->UnlockSubmissionQueue();
+
+    m_ActualCompositorSubmitCount.fetch_add(1, std::memory_order_relaxed);
+    ++m_SubmitCount;
+
+    if (!m_LoggedFirstSubmit)
+    {
+        m_LoggedFirstSubmit = true;
+        Game::logMsg("OpenVR Submit %s src=%ux%u eye=%ux%u stereoCopy=%d off=%ld namedRT=%d eL=%d eR=%d",
+            directEyes ? "direct-eyes" : "capture",
+            srcDesc.Width, srcDesc.Height, dstDesc.Width, dstDesc.Height,
+            m_StereoCopyOffset ? 1 : 0, usedOff, m_UsedNamedRenderTargets ? 1 : 0, (int)eL, (int)eR);
+    }
+    else if ((m_SubmitCount % 120) == 0)
+    {
+        Game::logMsg("OpenVR submit #%d eL=%d eR=%d captured=%ux%u",
+            m_SubmitCount, (int)eL, (int)eR, m_FrameCopyWidth, m_FrameCopyHeight);
+    }
+
+    m_RenderedNewFrame.store(false, std::memory_order_release);
+    m_FrameCopyLatched = false;
+    if (eL == vr::VRCompositorError_None || eL == vr::VRCompositorError_AlreadySubmitted)
+        m_HasSubmittedSceneFrame.store(true, std::memory_order_release);
+    device->Release();
+}
+
+void VR::UpdateTracking()
+{
+    m_HmdPoseValid = false;
+    vr::TrackedDevicePose_t hmd{};
+    const vr::EVRCompositorError err = static_cast<vr::EVRCompositorError>(
+        m_LastPoseWaitError.load(std::memory_order_acquire));
+    {
+        std::lock_guard<std::mutex> lock(m_PoseMutex);
+        hmd = m_WaitedPoses[vr::k_unTrackedDeviceIndex_Hmd];
+    }
+    if (m_WaitedPoseTick.load(std::memory_order_acquire) == 0)
+        return;
+    if (err == vr::VRCompositorError_DoNotHaveFocus)
+    {
+        if (m_Compositor)
+            m_Compositor->CompositorBringToFront();
+        static int s_focusLog;
+        if (s_focusLog < 6)
+        {
+            Game::logMsg("WaitGetPoses DoNotHaveFocus (SteamVR waiting room still owns the compositor)");
+            ++s_focusLog;
+        }
+        return;
+    }
+    if (err != vr::VRCompositorError_None)
+        return;
+
+    if (!hmd.bPoseIsValid || !hmd.bDeviceIsConnected)
+        return;
+
+    QAngle ang = HmdMatrixToSourceAngles(hmd.mDeviceToAbsoluteTracking);
+    if (ang.x > 89.f) ang.x = 89.f;
+    if (ang.x < -89.f) ang.x = -89.f;
+    ang.z = 0.f;
+    if (!std::isfinite(ang.x) || !std::isfinite(ang.y))
+        return;
+
+    m_HmdAngAbs = ang;
+    m_HmdPosAbs = HmdMatrixToSourcePos(hmd.mDeviceToAbsoluteTracking, m_VRScale);
+    QAngle::AngleVectors(m_HmdAngAbs, &m_HmdForward, &m_HmdRight, &m_HmdUp);
+    m_HmdPoseValid = true;
+    RefreshIpdFromHmd();
+
+    if (m_GameplayEligible)
+    {
+        if (!m_HmdOriginLatched)
+        {
+            m_HmdPosAbsZero = m_HmdPosAbs;
+            m_HmdAngAbsZero = m_HmdAngAbs;
+            m_HmdOriginLatched = true;
+            m_PrevAppliedHmdYaw = m_HmdAngAbs.y;
+            m_PrevAppliedHmdPitch = m_HmdAngAbs.x;
+        }
+        ++m_GameplayFrames;
+        if (m_LookApplyWanted)
+        {
+            m_SafeLookActive = true;
+            m_LookApplyEnabled = true;
+        }
+    }
+}
+
+void VR::Update()
+{
+    if (!m_Game)
+        return;
+
+    if (!m_IsVREnabled && m_OpenVRInitAttempts < 8)
+        m_IsInitialized = InitOpenVR();
+    if (!m_IsVREnabled)
+        return;
+
+    PollMapFromEngine();
+
+    ++m_PresentTick;
+    const bool inGame = m_Game->m_EngineClient && m_Game->m_EngineClient->IsInGame();
+    static DWORD s_fpsLogMs;
+    static uint32_t s_fpsLogTick;
+    const DWORD nowMs = GetTickCount();
+    if (m_PresentTick == 1 || nowMs - s_fpsLogMs >= 1000)
+    {
+        const uint32_t dt = s_fpsLogMs ? (nowMs - s_fpsLogMs) : 0;
+        const uint32_t dn = m_PresentTick - s_fpsLogTick;
+        const unsigned fps = (dt > 0) ? (dn * 1000u / dt) : 0;
+        Game::logMsg("present tick n=%u ~%ufps inGame=%d eligible=%d map=%s createdRT=%d namedRT=%d stereo=%d direct=%d poseWait=%u poseAge=%ums",
+            m_PresentTick, fps,
+            inGame ? 1 : 0, m_GameplayEligible ? 1 : 0,
+            m_CurrentMapName.c_str(),
+            m_CreatedVRTextures.load(std::memory_order_acquire) ? 1 : 0,
+            m_UsedNamedRenderTargets ? 1 : 0,
+            m_StereoRenderViewActive ? 1 : 0,
+            m_DirectEyeSubmit ? 1 : 0,
+            m_PoseWaitCount.load(std::memory_order_relaxed),
+            m_WaitedPoseTick.load(std::memory_order_acquire)
+                ? (nowMs - m_WaitedPoseTick.load(std::memory_order_acquire)) : 0xffffffffu);
+        s_fpsLogMs = nowMs;
+        s_fpsLogTick = m_PresentTick;
+    }
+
+    const DWORD poseTickEarly = m_WaitedPoseTick.load(std::memory_order_acquire);
+    const DWORD poseAgeEarly = poseTickEarly ? (nowMs - poseTickEarly) : 0xffffffffu;
+    // PostPresentHandoff can block the same way WaitGetPoses does when WMR
+    // stops vsync (headset off). Only hand off after a fresh waiter pose.
+    // First WaitGetPoses does not need this call.
+    if (m_Compositor && poseTickEarly != 0 && poseAgeEarly <= 500)
+        m_Compositor->PostPresentHandoff();
+
+    // Capture+Submit on background01 when menu_vr is still enabled. Look/stereo
+    // stay gated on real maps. Named RTs / WaitDeviceIdle stay skipped.
+    if (!ShouldCompositorSubmit())
+        return;
+
+    static int s_menuRisky;
+    if (!m_GameplayEligible && s_menuRisky == 0)
+    {
+        bmvr::BeginRisky(L"menu_vr");
+        s_menuRisky = 1;
+        Game::logMsg("Menu compositor begin map=%s", m_CurrentMapName.c_str());
+    }
+
+    if (g_D3DVR9 && !m_CreatedVRTextures.load(std::memory_order_acquire))
+        CreateVRTextures();
+
+    if (!m_PosesWaitedThisFrame)
+        UpdateTracking();
+    m_PosesWaitedThisFrame = false;
+    const DWORD poseTick = m_WaitedPoseTick.load(std::memory_order_acquire);
+    const DWORD poseAge = poseTick ? (GetTickCount() - poseTick) : 0xffffffffu;
+    if (poseTick == 0 || poseAge > 500)
+    {
+        static int s_staleLog;
+        if (s_staleLog < 6)
+        {
+            Game::logMsg("Skipping Submit, pose waiter %s age=%ums",
+                poseTick == 0 ? "not ready" : "stalled", poseAge);
+            ++s_staleLog;
+        }
+        return;
+    }
+    SubmitVRTextures();
+    if (!m_GameplayEligible && s_menuRisky == 1 && m_SubmitCount >= 120)
+    {
+        bmvr::EndRisky(L"menu_vr");
+        s_menuRisky = 2;
+    }
+    static int s_updLog;
+    if (s_updLog < 3)
+    {
+        Game::logMsg("Update done poses=%d created=%d", m_HmdPoseValid ? 1 : 0,
+            m_CreatedVRTextures.load() ? 1 : 0);
+        ++s_updLog;
+    }
+}
+
+extern "C" void __cdecl L4D2VR_ShutdownSystemMouseInputSuppression()
+{
+}

@@ -1,0 +1,24 @@
+# codebase-memory-mcp indexing noise
+.git/
+.vs/
+.ghidra/
+.vmt/
+.workbuddy/
+
+# Build outputs
+Debug/
+Release/
+x64/
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.log
+
+# Vendored/generated dependency trees
+dxvk_new/
+thirdparty/
+
+# Archives and temporary test artifacts
+*.zip
+tmp_*

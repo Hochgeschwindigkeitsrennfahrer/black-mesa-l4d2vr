@@ -1,0 +1,14 @@
+build/
+.vs/
+out/
+*.user
+*.log
+*.pdb
+*.exp
+bmvr_log.txt
+bmvr_heartbeat.txt
+bmvr_skip.txt
+bmvr_in_*.flag
+probe_logs/
+CMakeUserPresets.json
+.git.upstream/

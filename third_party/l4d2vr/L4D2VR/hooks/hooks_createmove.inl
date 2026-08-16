@@ -1,0 +1,1865 @@
+bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime, CUserCmd* cmd)
+{
+	// When returning from spectator/observer back to a live player entity ("rescued"),
+	// VR origin can be desynced. Force a recenter/reset once on that transition.
+	// Netvars (client):
+	// - m_lifeState     @ 0x147
+	// - m_iObserverMode @ 0x1450
+	static bool s_prevSpectatorLike = false;
+	static bool s_prevSpectatorLikeInitialized = false;
+
+	// Non-VR server melee feel state (ForceNonVRServerMovement=true only)
+	static int s_nonvrMeleeHoldTicks = 0;
+	static bool s_nonvrMeleeArmed = true;
+	static QAngle s_nonvrMeleeLockedAngles = { 0,0,0 };
+	static std::chrono::steady_clock::time_point s_nonvrMeleeLockUntil{};
+	static std::chrono::steady_clock::time_point s_nonvrMeleeCooldownUntil{};
+	static bool s_nonvrMeleePending = false;
+	static std::chrono::steady_clock::time_point s_nonvrMeleeFireAt{};
+	static QAngle s_nonvrMeleePendingAngles = { 0,0,0 };
+	static int s_nonvrMeleePendingHoldTicks = 0;
+	static bool s_nonvrMeleeHasPrev = false;
+	static Vector s_nonvrMeleePrevCtrlPos = { 0,0,0 };
+	static Vector s_nonvrMeleePrevHmdPos = { 0,0,0 };
+
+	// Third-person melee: lock cmd->viewangles toward rendered reticle convergence (VR-aware servers)
+	static bool s_tpMeleePrevAttackDown = false;
+	static std::chrono::steady_clock::time_point s_tpMeleeLockUntil{};
+	static QAngle s_tpMeleeLockedAngles = { 0,0,0 };
+	static uintptr_t s_vrAwareThrowableAimWeapon = 0;
+	static bool s_vrAwareThrowableAimPrevAttackDown = false;
+	static uintptr_t s_manualCarryThrowWeapon = 0;
+	static bool s_manualCarryThrowPhysicalAttackDown = false;
+	static bool s_manualInventoryThrowPhysicalUseDown = false;
+	static bool s_manualInventoryThrowArmed = false;
+	static bool s_vrAwareThrowableAimPrevWeaponThrowable = false;
+	static int s_vrAwareThrowableAimTicks = 0;
+	// Auto-repeat spray-push for pump/chrome shotguns and AWP/scout:
+	// detect a real shot/shell spend and queue a short IN_ATTACK2.
+	static uintptr_t s_autoRepeatSprayPushWeapon = 0;
+	static int s_autoRepeatSprayPushPrevClip1 = -1;
+	static int s_autoRepeatSprayPushDelayTicks = 0;
+	static int s_autoRepeatSprayPushHoldTicks = 0;
+	// Auto fast-melee state (hold-to-pulse + optional weapon-switch cancel).
+	static bool s_autoFastMeleeHoldPrev = false;
+	static int s_autoFastMeleeNextSwingCmd = -1;
+	static uintptr_t s_autoFastMeleeWeapon = 0;
+	static bool s_autoFastMeleeSwitchOutPending = false;
+	static bool s_autoFastMeleeSwitchBackPending = false;
+	static int s_autoFastMeleeSwitchOutCmd = -1;
+	static int s_autoFastMeleeSwitchBackCmd = -1;
+	static int s_autoFastMeleeLastIntentCmd = -1;
+	static std::chrono::steady_clock::time_point s_effectiveRangeMeleeNextCycleAt{};
+	static uintptr_t s_effectiveRangeMeleeWeapon = 0;
+	static bool s_effectiveRangeMeleeSwitchOutPending = false;
+	static bool s_effectiveRangeMeleeSwitchBackPending = false;
+	static int s_effectiveRangeMeleeSwitchOutCmd = -1;
+	static int s_effectiveRangeMeleeSwitchBackCmd = -1;
+	static int s_effectiveRangeMeleeCycleEndCmd = -1;
+	// Give effective-range auto-fire a short humanized reaction window instead of
+	// attacking on the same command that first acquires a target.
+	static bool s_effectiveRangeAutoFireDelayPending = false;
+	static std::chrono::steady_clock::time_point s_effectiveRangeAutoFireAt{};
+	static uintptr_t s_effectiveRangeAutoFireTarget = 0;
+	static uintptr_t s_effectiveRangeAutoFireWeapon = 0;
+	static uint32_t s_effectiveRangeAutoFireRandomState = 0;
+
+	static int s_lastButtons = 0;
+
+	auto updateFirstPersonBodyLocalState = [&](bool hasRealUserCmd)
+		{
+			C_BasePlayer* localPlayer = nullptr;
+			if (m_Game && m_Game->m_EngineClient)
+			{
+				const int localIndex = m_Game->m_EngineClient->GetLocalPlayer();
+				if (localIndex > 0)
+				{
+					localPlayer = reinterpret_cast<C_BasePlayer*>(
+						m_Game->GetClientEntity(localIndex));
+				}
+			}
+			if (m_VR)
+				m_VR->UpdateObjectPullClientTargetMainThread(localPlayer);
+			HooksFirstPersonBodyUpdateLocalStateMainThread(localPlayer);
+			HooksUpdateFirstPersonControlReadyMainThread(
+				m_VR,
+				m_Game,
+				localPlayer,
+				hasRealUserCmd);
+			HooksWorldPoseEnsureWeaponSetupBonesHookMainThread(
+				m_VR,
+				m_Game);
+		};
+
+	if (!cmd)
+	{
+		const bool result = hkCreateMove.fOriginal(ecx, flInputSampleTime, cmd);
+		updateFirstPersonBodyLocalState(false);
+		return result;
+	}
+
+	if (!cmd->command_number)
+	{
+		const bool result = hkCreateMove.fOriginal(ecx, flInputSampleTime, cmd);
+		updateFirstPersonBodyLocalState(false);
+		return result;
+	}
+
+	// Keep the latest real CUserCmd number latched beyond this function call.
+	// On remote servers, ClientFireTerrorBullets can be reached by prediction replay
+	// outside the immediate CreateMove call stack; restoring the value here makes
+	// those replays look like fresh shots and causes repeated hit sounds.
+	if (m_VR)
+		m_VR->m_CurrentPredictedHitFeedbackCmdNumber = cmd->command_number;
+
+	bool result = hkCreateMove.fOriginal(ecx, flInputSampleTime, cmd);
+
+	// Keep lifecycle cleanup running even when Source emits command_number==0
+	// during loading, pause, disconnect, or menu transitions (handled above).
+	updateFirstPersonBodyLocalState(true);
+
+	// Server-hook roomscale movement is applied after the originating CreateMove.
+	// Consume its accepted-vs-visual correction before this command uses cached VR poses.
+	if (m_VR)
+		m_VR->ApplyPendingRoomscale1To1ServerVisualCorrection();
+
+	m_VR->m_EffectiveAttackRangeAutoFireActive = false;
+	auto resetEffectiveRangeAutoFireDelay = [&]()
+		{
+			s_effectiveRangeAutoFireDelayPending = false;
+			s_effectiveRangeAutoFireAt = {};
+			s_effectiveRangeAutoFireTarget = 0;
+			s_effectiveRangeAutoFireWeapon = 0;
+		};
+
+	constexpr int kAutoActionIN_USE = (1 << 5);
+	const bool localUseButtonDownForAutoActions = (cmd->buttons & kAutoActionIN_USE) != 0;
+	C_BasePlayer* localPlayerForAutoActions = nullptr;
+	if (m_Game && m_Game->m_EngineClient)
+	{
+		const int lpIdx = m_Game->m_EngineClient->GetLocalPlayer();
+		localPlayerForAutoActions = (lpIdx > 0) ? (C_BasePlayer*)m_Game->GetClientEntity(lpIdx) : nullptr;
+	}
+	const bool suppressAutoActionsForUseOrRevive =
+		localUseButtonDownForAutoActions ||
+		m_VR->m_UseCmdOwned ||
+		IsPlayerDoingUseOrReviveAction(localPlayerForAutoActions);
+
+	if (m_VR && m_VR->m_TeleportVisualScoutActive)
+	{
+		// Detached scout view is local-only. Return before VR aim, melee helpers,
+		// auto-fire and roomscale code can mutate the authoritative body command.
+		// Keep command timing intact, but freeze body orientation and strip actions.
+		if (m_VR->m_TeleportVisualScoutBodyViewAnglesValid)
+			cmd->viewangles = m_VR->m_TeleportVisualScoutBodyViewAngles;
+		cmd->forwardmove = 0.0f;
+		cmd->sidemove = 0.0f;
+		cmd->upmove = 0.0f;
+		cmd->buttons = 0;
+		cmd->impulse = 0;
+		cmd->weaponselect = 0;
+		cmd->weaponsubtype = 0;
+		cmd->mousedx = 0;
+		cmd->mousedy = 0;
+		m_VR->m_PushingThumbstick = false;
+		m_VR->m_LocomotionActive = false;
+
+		// Drop transient attack helpers so returning to the body cannot replay a
+		// queued melee swing, auto-repeat pulse or effective-range cycle.
+		s_nonvrMeleeHoldTicks = 0;
+		s_nonvrMeleeArmed = true;
+		s_nonvrMeleeLockUntil = {};
+		s_nonvrMeleeCooldownUntil = {};
+		s_nonvrMeleePending = false;
+		s_nonvrMeleeFireAt = {};
+		s_nonvrMeleePendingHoldTicks = 0;
+		s_nonvrMeleeHasPrev = false;
+		s_tpMeleePrevAttackDown = false;
+		s_tpMeleeLockUntil = {};
+		s_manualCarryThrowWeapon = 0;
+		s_manualCarryThrowPhysicalAttackDown = false;
+		s_manualInventoryThrowPhysicalUseDown = false;
+		s_manualInventoryThrowArmed = false;
+		s_autoRepeatSprayPushWeapon = 0;
+		s_autoRepeatSprayPushPrevClip1 = -1;
+		s_autoRepeatSprayPushDelayTicks = 0;
+		s_autoRepeatSprayPushHoldTicks = 0;
+		s_autoFastMeleeHoldPrev = false;
+		s_autoFastMeleeNextSwingCmd = -1;
+		s_autoFastMeleeWeapon = 0;
+		s_autoFastMeleeSwitchOutPending = false;
+		s_autoFastMeleeSwitchBackPending = false;
+		s_autoFastMeleeSwitchOutCmd = -1;
+		s_autoFastMeleeSwitchBackCmd = -1;
+		s_autoFastMeleeLastIntentCmd = -1;
+		s_effectiveRangeMeleeNextCycleAt = {};
+		s_effectiveRangeMeleeWeapon = 0;
+		s_effectiveRangeMeleeSwitchOutPending = false;
+		s_effectiveRangeMeleeSwitchBackPending = false;
+		s_effectiveRangeMeleeSwitchOutCmd = -1;
+		s_effectiveRangeMeleeSwitchBackCmd = -1;
+		s_effectiveRangeMeleeCycleEndCmd = -1;
+		resetEffectiveRangeAutoFireDelay();
+		m_VR->m_EffectiveAttackRangeAutoFirePrevAttackDown = false;
+		m_VR->m_ManualThrowViewmodelInputState.store(0u, std::memory_order_release);
+		return result;
+	}
+
+	auto resetEffectiveRangeMeleeCycle = [&]()
+		{
+			s_effectiveRangeMeleeNextCycleAt = {};
+			s_effectiveRangeMeleeWeapon = 0;
+			s_effectiveRangeMeleeSwitchOutPending = false;
+			s_effectiveRangeMeleeSwitchBackPending = false;
+			s_effectiveRangeMeleeSwitchOutCmd = -1;
+			s_effectiveRangeMeleeSwitchBackCmd = -1;
+			s_effectiveRangeMeleeCycleEndCmd = -1;
+		};
+
+	if (m_VR->m_IsVREnabled) {
+		// Detect observer -> live transition and recenter once.
+	   // In L4D2, the local player entity persists while dead and enters observer modes.
+	   // When rescued, m_iObserverMode usually returns to 0 and m_lifeState becomes 0.
+		{
+			const int lpIdx = (m_Game->m_EngineClient) ? m_Game->m_EngineClient->GetLocalPlayer() : -1;
+			C_BasePlayer* lp = (lpIdx > 0) ? (C_BasePlayer*)m_Game->GetClientEntity(lpIdx) : nullptr;
+			if (lp)
+			{
+				const int lifeState = (int)ReadNetvar<uint8_t>(lp, 0x147); // m_lifeState
+				const int observerMode = (int)ReadNetvar<int>(lp, 0x1450); // m_iObserverMode
+				const bool spectatorLikeNow = (lifeState != 0) || (observerMode != 0);
+
+				if (s_prevSpectatorLikeInitialized)
+				{
+					// Transition: was spectator-like -> now fully alive (not observer).
+					if (s_prevSpectatorLike && !spectatorLikeNow)
+					{
+						// Note: ResetPosition is expected to exist on VR (used by the input action).
+						m_VR->ResetPosition();
+					}
+				}
+
+				s_prevSpectatorLike = spectatorLikeNow;
+				s_prevSpectatorLikeInitialized = true;
+			}
+			else
+			{
+				// No local player entity yet; don't latch state.
+				s_prevSpectatorLikeInitialized = false;
+			}
+		}
+		const bool treatServerAsNonVR = m_VR->m_ForceNonVRServerMovement;
+		constexpr int kIN_JUMP = (1 << 1);
+		const bool inputJumpHeld = (cmd->buttons & kIN_JUMP) != 0;
+
+		m_VR->ApplyOptionalCreateMoveFeatures(cmd, 0, inputJumpHeld, false, 0.0f, 0.0f, false);
+
+		bool effectiveRangeAutoFireEligible = false;
+		if (m_VR->m_EffectiveAttackRangeAutoFireEnabled
+			&& m_VR->m_AimLineEffectiveAttackRangeActive
+			&& !m_VR->m_AimLineEffectiveAttackRangeTargetIsWitch
+			&& !m_VR->m_SuppressPlayerInput
+			&& !m_VR->m_AdjustingViewmodel
+			&& !m_VR->m_AdjustingScope
+			&& !suppressAutoActionsForUseOrRevive)
+		{
+			const int lpIdx = (m_Game->m_EngineClient) ? m_Game->m_EngineClient->GetLocalPlayer() : -1;
+			C_BasePlayer* lp = (lpIdx > 0) ? (C_BasePlayer*)m_Game->GetClientEntity(lpIdx) : nullptr;
+			if (lp)
+			{
+				const int lifeState = (int)ReadNetvar<uint8_t>(lp, VR::kLifeStateOffset);
+				const int observerMode = (int)ReadNetvar<int>(lp, VR::kObserverModeOffset);
+				C_WeaponCSBase* activeWeapon = reinterpret_cast<C_WeaponCSBase*>(lp->GetActiveWeapon());
+				const C_WeaponCSBase::WeaponID weaponId = activeWeapon ? activeWeapon->GetWeaponID() : C_WeaponCSBase::WeaponID::NONE;
+				const bool isHoldToUseWeaponId =
+					(weaponId == C_WeaponCSBase::WeaponID::FIRST_AID_KIT) ||
+					(weaponId == C_WeaponCSBase::WeaponID::DEFIBRILLATOR) ||
+					(weaponId == C_WeaponCSBase::WeaponID::AMMO_PACK) ||
+					(weaponId == C_WeaponCSBase::WeaponID::INCENDIARY_AMMO) ||
+					(weaponId == C_WeaponCSBase::WeaponID::FRAG_AMMO) ||
+					(weaponId == C_WeaponCSBase::WeaponID::UPGRADE_ITEM);
+				const bool canAutoFire = (lifeState == 0) && (observerMode == 0) && !isHoldToUseWeaponId;
+				if (canAutoFire)
+				{
+					effectiveRangeAutoFireEligible = true;
+					const uintptr_t targetTag = m_VR->m_AimLineEffectiveAttackRangeTarget;
+					const uintptr_t weaponTag = reinterpret_cast<uintptr_t>(activeWeapon);
+					const auto now = std::chrono::steady_clock::now();
+
+					if (!s_effectiveRangeAutoFireDelayPending
+						|| targetTag != s_effectiveRangeAutoFireTarget
+						|| weaponTag != s_effectiveRangeAutoFireWeapon)
+					{
+						if (s_effectiveRangeAutoFireRandomState == 0)
+						{
+							const uint64_t entropy = static_cast<uint64_t>(now.time_since_epoch().count());
+							s_effectiveRangeAutoFireRandomState =
+								static_cast<uint32_t>(entropy) ^
+								static_cast<uint32_t>(entropy >> 32) ^
+								(static_cast<uint32_t>(cmd->command_number) * 0x9E3779B9u);
+							if (s_effectiveRangeAutoFireRandomState == 0)
+								s_effectiveRangeAutoFireRandomState = 0xA341316Cu;
+						}
+						s_effectiveRangeAutoFireRandomState ^= s_effectiveRangeAutoFireRandomState << 13;
+						s_effectiveRangeAutoFireRandomState ^= s_effectiveRangeAutoFireRandomState >> 17;
+						s_effectiveRangeAutoFireRandomState ^= s_effectiveRangeAutoFireRandomState << 5;
+
+						constexpr int kMinReactionDelayMs = 13;
+						constexpr int kReactionDelayRangeMs = 25; // Inclusive 50..100 ms.
+						const int reactionDelayMs = kMinReactionDelayMs
+							+ static_cast<int>(s_effectiveRangeAutoFireRandomState % kReactionDelayRangeMs);
+						s_effectiveRangeAutoFireAt = now + std::chrono::milliseconds(reactionDelayMs);
+						s_effectiveRangeAutoFireTarget = targetTag;
+						s_effectiveRangeAutoFireWeapon = weaponTag;
+						s_effectiveRangeAutoFireDelayPending = true;
+					}
+
+					if (now >= s_effectiveRangeAutoFireAt)
+					{
+						constexpr int kIN_ATTACK = (1 << 0);
+						if (weaponId != C_WeaponCSBase::WeaponID::MELEE)
+						{
+							cmd->buttons &= ~kIN_ATTACK;
+							cmd->buttons |= kIN_ATTACK;
+						}
+						m_VR->m_EffectiveAttackRangeAutoFireActive = true;
+					}
+				}
+			}
+		}
+		if (!effectiveRangeAutoFireEligible)
+			resetEffectiveRangeAutoFireDelay();
+
+		// Mouse mode: consume raw mouse deltas to drive body yaw and independent aim pitch.
+		// Mouse X -> yaw (m_RotationOffset), Mouse Y -> m_MouseAimPitchOffset.
+		// We zero cmd->mousedx/y so Source doesn't also apply them to viewangles.
+		if (m_VR->m_MouseModeEnabled)
+		{
+			// Mouse mode hotkeys (keyboard). Polled here because CreateMove runs at input tick rate.
+			auto pollKeyPressed = [&](const std::optional<WORD>& vk, bool& prevDown) -> bool
+				{
+					if (!vk.has_value())
+					{
+						prevDown = false;
+						return false;
+					}
+					const SHORT state = GetAsyncKeyState((int)*vk);
+					const bool down = (state & 0x8000) != 0;
+					const bool pressed = down && !prevDown;
+					prevDown = down;
+					return pressed;
+				};
+
+			if (pollKeyPressed(m_VR->m_MouseModeScopeToggleKey, m_VR->m_MouseModeScopeToggleKeyDownPrev))
+				m_VR->ToggleMouseModeScope();
+
+			const float mouseScopeGain = m_VR->GetMouseModeScopeSensitivityScale();
+
+			const int dx = cmd->mousedx;
+			const int dy = cmd->mousedy;
+
+			// Mouse-mode yaw (scheme A): delta-drain smoothing.
+			// - If MouseModeTurnSmoothing <= 0: legacy behavior (apply yaw directly on CreateMove ticks).
+			// - If MouseModeTurnSmoothing  > 0: convert mouse X to a yaw delta and accumulate it.
+			//   VR::UpdateTracking will drain/apply it smoothly per-frame.
+			if (m_VR->m_MouseModeTurnSmoothing <= 0.0f)
+			{
+				if (dx != 0)
+				{
+					m_VR->m_RotationOffset += (-float(dx) * m_VR->m_MouseModeYawSensitivity) * mouseScopeGain;
+					// Wrap to [0, 360)
+					m_VR->m_RotationOffset -= 360.0f * std::floor(m_VR->m_RotationOffset / 360.0f);
+				}
+				m_VR->m_MouseModeYawDeltaRemainingDeg = 0.0f;
+				m_VR->m_MouseModeYawDeltaInitialized = false;
+			}
+			else
+			{
+				if (!m_VR->m_MouseModeYawDeltaInitialized)
+				{
+					m_VR->m_MouseModeYawDeltaRemainingDeg = 0.0f;
+					m_VR->m_MouseModeYawDeltaInitialized = true;
+				}
+				if (dx != 0)
+				{
+					const float yawDeltaDeg = (-float(dx) * m_VR->m_MouseModeYawSensitivity) * mouseScopeGain;
+					m_VR->m_MouseModeYawDeltaRemainingDeg += yawDeltaDeg;
+				}
+			}
+
+			if (!m_VR->m_MouseAimInitialized)
+			{
+				// Initialize current values (used immediately) and targets (smoothed per-frame in VR::UpdateTracking).
+				m_VR->m_MouseAimPitchOffset = m_VR->m_HmdAngAbs.x;
+				m_VR->m_MouseModeViewPitchOffset = 0.0f;
+				m_VR->m_MouseAimInitialized = true;
+
+				m_VR->m_MouseModePitchTarget = m_VR->m_MouseAimPitchOffset;
+				m_VR->m_MouseModePitchTargetInitialized = true;
+				m_VR->m_MouseModeViewPitchTargetOffset = m_VR->m_MouseModeViewPitchOffset;
+				m_VR->m_MouseModeViewPitchTargetOffsetInitialized = true;
+			}
+
+			// Ensure targets are initialized even if MouseAimInitialized was set elsewhere.
+			if (!m_VR->m_MouseModePitchTargetInitialized)
+			{
+				m_VR->m_MouseModePitchTarget = m_VR->m_MouseAimPitchOffset;
+				m_VR->m_MouseModePitchTargetInitialized = true;
+			}
+			if (!m_VR->m_MouseModeViewPitchTargetOffsetInitialized)
+			{
+				m_VR->m_MouseModeViewPitchTargetOffset = m_VR->m_MouseModeViewPitchOffset;
+				m_VR->m_MouseModeViewPitchTargetOffsetInitialized = true;
+			}
+
+			if (dy != 0)
+			{
+				const float deltaPitch = float(dy) * m_VR->m_MouseModePitchSensitivity * mouseScopeGain;
+
+				if (m_VR->m_MouseModePitchAffectsView)
+				{
+					// Update targets only. VR::UpdateTracking will smooth the current values per-frame.
+					const float curViewPitch = m_VR->m_MouseModePitchTarget;
+					float newViewPitch = curViewPitch + deltaPitch;
+					if (newViewPitch > 89.f)  newViewPitch = 89.f;
+					if (newViewPitch < -89.f) newViewPitch = -89.f;
+
+					const float appliedDelta = newViewPitch - curViewPitch;
+					m_VR->m_MouseModeViewPitchTargetOffset += appliedDelta;
+					m_VR->m_MouseModePitchTarget = newViewPitch;
+
+					// If pitch smoothing is disabled, keep legacy immediate behavior.
+					if (m_VR->m_MouseModePitchSmoothing <= 0.0f)
+					{
+						m_VR->m_MouseModeViewPitchOffset = m_VR->m_MouseModeViewPitchTargetOffset;
+						m_VR->m_MouseAimPitchOffset = m_VR->m_MouseModePitchTarget;
+					}
+				}
+				else
+				{
+					// Aim pitch only (camera remains driven purely by HMD).
+					m_VR->m_MouseModePitchTarget += deltaPitch;
+					if (m_VR->m_MouseModePitchTarget > 89.f)  m_VR->m_MouseModePitchTarget = 89.f;
+					if (m_VR->m_MouseModePitchTarget < -89.f) m_VR->m_MouseModePitchTarget = -89.f;
+
+					if (m_VR->m_MouseModePitchSmoothing <= 0.0f)
+					{
+						m_VR->m_MouseAimPitchOffset = m_VR->m_MouseModePitchTarget;
+					}
+				}
+			}
+
+			cmd->mousedx = 0;
+			cmd->mousedy = 0;
+		}
+		const QAngle originalViewAngles = cmd->viewangles;
+		const bool suppressScopeWalk = m_VR->m_ScopeFovAdjustSuppressWalk || m_VR->m_TeleportTargetingActive;
+		const float originalForwardMove = suppressScopeWalk ? 0.0f : cmd->forwardmove;
+		const float originalSideMove = suppressScopeWalk ? 0.0f : cmd->sidemove;
+		if (suppressScopeWalk)
+		{
+			cmd->forwardmove = 0.0f;
+			cmd->sidemove = 0.0f;
+			cmd->buttons &= ~((1 << 3) | (1 << 4) | (1 << 9) | (1 << 10));
+		}
+		bool hadWalkAxis = false;
+		float walkNx = 0.f, walkNy = 0.f; 
+		float walkMaxSpeed = 0.f;
+		float ax = 0.f, ay = 0.f;
+		if (!m_VR->m_AdjustingViewmodel && !m_VR->m_AdjustingScope && !suppressScopeWalk && m_VR->GetWalkAxis(ax, ay)) {
+			// Deadzone + normalization. In viewmodel adjustment mode this axis is reserved for rotation.
+			const float dz = 0.2f;
+			auto norm = [&](float v) {
+				float a = fabsf(v);
+				if (a <= dz) return 0.f;
+				float t = (a - dz) / (1.f - dz);
+				return v < 0 ? -t : t;
+				};
+			const float nx = norm(ax);
+			const float ny = norm(ay);
+			float moveNx = nx;
+			float moveNy = ny;
+
+			// Third-person front-view mode: keep left/right as-is.
+			// Forward/back follows current camera-aligned basis (no extra sign flip).
+
+			// Safe command speed; the server will still apply its own movement limits.
+			const float maxSpeed = 250.f;
+			hadWalkAxis = true;
+			walkNx = moveNx;
+			walkNy = moveNy;
+			walkMaxSpeed = maxSpeed;
+
+			// Track thumbstick locomotion state (used to disable 1:1 roomscale when requested).
+			m_VR->m_PushingThumbstick = (fabsf(moveNx) > 0.0001f) || (fabsf(moveNy) > 0.0001f);
+
+			// Stick locomotion is applied later once the final cmd->viewangles basis is known.
+			// That keeps keyboard movement and stick movement in the same basis.
+
+			// Also set direction button bits for compatibility.
+			// IN_FORWARD=1<<3, IN_BACK=1<<4, IN_MOVELEFT=1<<9, IN_MOVERIGHT=1<<10
+			if (moveNy > 0.5f)      cmd->buttons |= (1 << 3);
+			else if (moveNy < -0.5f)cmd->buttons |= (1 << 4);
+			if (moveNx > 0.5f)      cmd->buttons |= (1 << 10);
+			else if (moveNx < -0.5f)cmd->buttons |= (1 << 9);
+
+		}
+		else
+		{
+			m_VR->m_PushingThumbstick = false;
+		}
+
+		// ② ★ 非 VR 服务器：把“右手手柄朝向”塞给服务器用的视角
+		if (treatServerAsNonVR) {
+			// Freshly solve on the input tick. The server consumes this cmd immediately,
+			// so using an older render/aim-line solution can miss at close range.
+			if (m_Game && m_Game->m_EngineClient)
+			{
+				const int lpIdxForAim = m_Game->m_EngineClient->GetLocalPlayer();
+				C_BasePlayer* lpForAim = (lpIdxForAim > 0) ? (C_BasePlayer*)m_Game->GetClientEntity(lpIdxForAim) : nullptr;
+				if (lpForAim)
+					m_VR->UpdateNonVRAimSolution(lpForAim, true);
+			}
+
+			QAngle aim = m_VR->GetRightControllerAbsAngle();
+			if (m_VR->m_MouseModeEnabled)
+			{
+				if (m_VR->m_HasNonVRAimSolution)
+					aim = m_VR->m_NonVRAimAngles;
+				else
+				{
+					if (m_VR->m_MouseModeAimFromHmd)
+					{
+						Vector v = m_VR->GetViewAngle();
+						aim = QAngle(v.x, v.y, 0.0f);
+					}
+					else
+					{
+						aim = QAngle(m_VR->m_MouseAimPitchOffset, m_VR->m_RotationOffset, 0.0f);
+					}
+				}
+			}
+			// ForceNonVRServerMovement: prefer the eye-based solve (what the server will actually trace).
+			if (m_VR->m_HasNonVRAimSolution)
+				aim = m_VR->m_NonVRAimAngles;
+			const bool attackDownForRealSpread = (cmd->buttons & (1 << 0)) != 0;
+			if (attackDownForRealSpread && localPlayerForAutoActions)
+			{
+				C_WeaponCSBase* activeWeaponForSpread =
+					reinterpret_cast<C_WeaponCSBase*>(localPlayerForAutoActions->GetActiveWeapon());
+				m_VR->ApplyVrHandsRealBulletSpreadServerViewAngles(
+					localPlayerForAutoActions,
+					activeWeaponForSpread,
+					aim);
+			}
+			// 简单夹角，避免异常值
+			if (aim.x > 89.f)  aim.x = 89.f;
+			if (aim.x < -89.f) aim.x = -89.f;
+			// yaw 归一到 [-180,180]
+			while (aim.y > 180.f)  aim.y -= 360.f;
+			while (aim.y < -180.f) aim.y += 360.f;
+
+			cmd->viewangles.x = aim.x;   // pitch
+			cmd->viewangles.y = aim.y;   // yaw
+			cmd->viewangles.z = 0.f;     // roll 一般不用
+
+			// Third-person melee: when holding a melee weapon, steer the server-facing viewangles
+			// toward the rendered reticle convergence point so swings land where the crosshair points.
+			if (m_Game->m_IsMeleeWeaponActive && m_VR->IsThirdPersonCameraActive() && m_VR->m_HasAimConvergePoint && !m_VR->m_AdjustingViewmodel
+				&& !m_VR->m_AdjustingScope)
+			{
+				Vector eyePos = (m_VR->GetViewOriginLeft() + m_VR->GetViewOriginRight()) * 0.5f;
+				Vector dir = m_VR->m_AimConvergePoint - eyePos;
+				if (VectorLength(dir) > 0.001f)
+				{
+					VectorNormalize(dir);
+					QAngle tpAng;
+					QAngle::VectorAngles(dir, tpAng);
+					NormalizeAndClampViewAngles(tpAng);
+					tpAng.z = 0.f;
+					cmd->viewangles = tpAng;
+				}
+			}
+
+			// Non-VR server melee feel: translate a controller swing into a normal melee attack (IN_ATTACK)
+			// This only affects local *input* / presentation. The server still does normal melee resolution.
+			if (m_Game->m_IsMeleeWeaponActive && !m_VR->m_AdjustingViewmodel
+				&& !m_VR->m_AdjustingScope)
+			{
+				using clock = std::chrono::steady_clock;
+				const auto now = clock::now();
+
+				auto lerpAngle = [](float a, float b, float t) -> float {
+					float d = b - a;
+					while (d > 180.f) d -= 360.f;
+					while (d < -180.f) d += 360.f;
+					return a + d * t;
+					};
+
+				// Aim lock: during lock window, keep viewangles stable so the melee direction doesn't jitter.
+				if (now < s_nonvrMeleeLockUntil)
+				{
+					cmd->viewangles = s_nonvrMeleeLockedAngles;
+				}
+
+				// Pending fire: after a short delay, start IN_ATTACK and begin aim lock.
+				// This makes melee feel more like a "wind-up -> hit" instead of an instant click.
+				if (s_nonvrMeleePending && now >= s_nonvrMeleeFireAt)
+				{
+					s_nonvrMeleePending = false;
+
+					s_nonvrMeleeLockedAngles = s_nonvrMeleePendingAngles;
+
+					const float lockT = std::max(0.0f, m_VR->m_NonVRMeleeAimLockTime);
+					s_nonvrMeleeLockUntil = now + std::chrono::duration_cast<clock::duration>(std::chrono::duration<float>(lockT));
+
+					s_nonvrMeleeHoldTicks = std::max(s_nonvrMeleeHoldTicks, s_nonvrMeleePendingHoldTicks);
+
+					cmd->viewangles = s_nonvrMeleeLockedAngles;
+				}
+
+				// Hold/queue: keep IN_ATTACK pressed for a few ticks to reduce "dropped" swings.
+				if (s_nonvrMeleeHoldTicks > 0)
+				{
+					cmd->buttons |= (1 << 0); // IN_ATTACK
+					--s_nonvrMeleeHoldTicks;
+				}
+
+				// Edge trigger + hysteresis: only trigger once per swing, and require speed to fall below a lower
+				// threshold before re-arming.
+				// Controller velocity in tracking space can include whole-body/HMD motion; remove HMD velocity for cleaner gesture.
+				Vector relVel = m_VR->m_RightControllerPose.TrackedDeviceVel - m_VR->m_HmdPose.TrackedDeviceVel;
+
+				// Fallback: derive relative velocity from position delta (some runtimes report near-zero velocity).
+				const float dt = (flInputSampleTime > 0.0001f) ? flInputSampleTime : 0.011111f;
+				if (s_nonvrMeleeHasPrev)
+				{
+					Vector dCtrl = m_VR->m_RightControllerPose.TrackedDevicePos - s_nonvrMeleePrevCtrlPos;
+					Vector dHmd = m_VR->m_HmdPose.TrackedDevicePos - s_nonvrMeleePrevHmdPos;
+					Vector derivedRelVel = (dCtrl - dHmd) * (1.0f / dt);
+
+					if (VectorLength(relVel) < 0.01f && VectorLength(derivedRelVel) > 0.01f)
+						relVel = derivedRelVel;
+				}
+				s_nonvrMeleePrevCtrlPos = m_VR->m_RightControllerPose.TrackedDevicePos;
+				s_nonvrMeleePrevHmdPos = m_VR->m_HmdPose.TrackedDevicePos;
+				s_nonvrMeleeHasPrev = true;
+
+				// Gesture speed: ignore vertical to reduce false triggers from raising/lowering hands.
+				Vector swingVel = relVel;
+				swingVel.z = 0.0f;
+				const float v = (float)VectorLength(swingVel);
+				const QAngle av = m_VR->m_RightControllerPose.TrackedDeviceAngVel;
+				const float angV = sqrtf(av.x * av.x + av.y * av.y + av.z * av.z); // deg/s (tracking space)
+
+				const float thr = std::max(0.0f, m_VR->m_NonVRMeleeSwingThreshold);
+				const float hyst = std::clamp(m_VR->m_NonVRMeleeHysteresis, 0.1f, 0.95f);
+				const float rearmThr = thr * hyst;
+
+				const float angThr = std::max(0.0f, m_VR->m_NonVRMeleeAngVelThreshold);
+
+				const bool above =
+					(thr > 0.0f && v > thr) ||
+					(angThr > 0.0f && angV > angThr);
+
+				const bool below =
+					(thr <= 0.0f || v < rearmThr) &&
+					(angThr <= 0.0f || angV < angThr * hyst);
+
+				if (below)
+					s_nonvrMeleeArmed = true;
+
+				if (above && s_nonvrMeleeArmed && !s_nonvrMeleePending && now >= s_nonvrMeleeCooldownUntil)
+				{
+					s_nonvrMeleeArmed = false;
+
+					// Hold IN_ATTACK for a few ticks so we don't miss the server-side melee window.
+					const float holdTime = std::max(0.0f, m_VR->m_NonVRMeleeHoldTime);
+					int holdTicks = (int)ceilf(holdTime / dt);
+					holdTicks = std::clamp(holdTicks, 1, 8);
+
+					// Capture current aim direction, optionally blend toward swing velocity direction.
+					QAngle lockedAngles = cmd->viewangles;
+
+					const float blend = std::clamp(m_VR->m_NonVRMeleeSwingDirBlend, 0.0f, 1.0f);
+					if (blend > 0.0f)
+					{
+						Vector velDir = swingVel;
+						if (!velDir.IsZero())
+						{
+							VectorNormalize(velDir);
+							QAngle velAng;
+							QAngle::VectorAngles(velDir, velAng);
+							NormalizeAndClampViewAngles(velAng);
+
+							lockedAngles.x = lerpAngle(lockedAngles.x, velAng.x, blend);
+							lockedAngles.y = lerpAngle(lockedAngles.y, velAng.y, blend);
+							lockedAngles.z = 0.f;
+							NormalizeAndClampViewAngles(lockedAngles);
+						}
+					}
+
+					// Apply cooldown window immediately so one gesture maps to one swing.
+					const float cd = std::max(0.05f, m_VR->m_NonVRMeleeSwingCooldown);
+					s_nonvrMeleeCooldownUntil = now + std::chrono::duration_cast<clock::duration>(std::chrono::duration<float>(cd));
+
+					// Delay before attacking, then lock angles during the hit window.
+					const float delayT = std::max(0.0f, m_VR->m_NonVRMeleeAttackDelay);
+					if (delayT > 0.0f)
+					{
+						s_nonvrMeleePending = true;
+						s_nonvrMeleeFireAt = now + std::chrono::duration_cast<clock::duration>(std::chrono::duration<float>(delayT));
+						s_nonvrMeleePendingAngles = lockedAngles;
+						s_nonvrMeleePendingHoldTicks = holdTicks;
+					}
+					else
+					{
+						// Fire immediately (legacy behavior)
+						s_nonvrMeleeLockedAngles = lockedAngles;
+
+						const float lockT = std::max(0.0f, m_VR->m_NonVRMeleeAimLockTime);
+						s_nonvrMeleeLockUntil = now + std::chrono::duration_cast<clock::duration>(std::chrono::duration<float>(lockT));
+
+						s_nonvrMeleeHoldTicks = std::max(s_nonvrMeleeHoldTicks, holdTicks);
+
+						cmd->viewangles = s_nonvrMeleeLockedAngles;
+						cmd->buttons |= (1 << 0); // IN_ATTACK
+					}
+				}
+			}
+			else
+			{
+				// Leaving melee state: clear any queued swings/locks so we don't "ghost swing" later.
+				s_nonvrMeleePending = false;
+				s_nonvrMeleePendingHoldTicks = 0;
+				s_nonvrMeleeHoldTicks = 0;
+				s_nonvrMeleeLockUntil = {};
+				s_nonvrMeleeCooldownUntil = {};
+				s_nonvrMeleeArmed = true;
+				s_nonvrMeleeHasPrev = false;
+			}
+
+			// Re-base movement for non-VR servers:
+			// - The server interprets forwardmove/sidemove in the basis of cmd->viewangles (aim).
+			// - We want movement to follow a separate "movement yaw" (HMD yaw by default; optional controller yaw),
+			//   not necessarily the hand aim yaw.
+			// So we convert existing movement (built under originalViewAngles) into world space,
+			// add VR stick movement in movement-yaw space, then project back into the final cmd basis.
+			{
+				// Existing movement (keyboard etc.) in world space
+				QAngle origYawOnly(0.f, originalViewAngles.y, 0.f);
+				Vector origForward, origRight, origUp;
+				QAngle::AngleVectors(origYawOnly, &origForward, &origRight, &origUp);
+				Vector worldMove = origForward * cmd->forwardmove + origRight * cmd->sidemove;
+
+				// VR stick movement (movement basis = HMD yaw or controller yaw)
+				if (hadWalkAxis)
+				{
+					float moveYaw = m_VR->GetMovementYawDeg();
+					if (m_VR->m_ThirdPersonFrontViewEnabled && m_VR->m_IsThirdPersonCamera && m_VR->ShouldRenderScope())
+					{
+						moveYaw = m_VR->GetScopeCameraAbsAngle().y + 180.0f;
+						moveYaw -= 360.0f * std::floor((moveYaw + 180.0f) / 360.0f);
+					}
+					QAngle bodyYawOnly(0.f, moveYaw, 0.f);
+					Vector bodyForward, bodyRight, bodyUp;
+					QAngle::AngleVectors(bodyYawOnly, &bodyForward, &bodyRight, &bodyUp);
+					worldMove += bodyForward * (walkNy * walkMaxSpeed) + bodyRight * (walkNx * walkMaxSpeed);
+				}
+
+				// Project into the final cmd basis (after aim/melee lock)
+				QAngle cmdYawOnly(0.f, cmd->viewangles.y, 0.f);
+				Vector cmdForward, cmdRight, cmdUp;
+				QAngle::AngleVectors(cmdYawOnly, &cmdForward, &cmdRight, &cmdUp);
+				cmd->forwardmove = DotProduct(worldMove, cmdForward);
+				cmd->sidemove = DotProduct(worldMove, cmdRight);
+			}
+
+		}
+		else {
+			// VR-aware servers: ensure cmd->viewangles matches HMD.
+			// Otherwise forward/sidemove get interpreted in the wrong basis (push forward -> strafe).
+			bool useControllerCmdView = false;
+			bool useNonVRAimCmdView = false;
+			const char* controllerCmdViewReason = nullptr;
+			{
+				const int lpIdx = (m_Game && m_Game->m_EngineClient) ? m_Game->m_EngineClient->GetLocalPlayer() : -1;
+				C_BasePlayer* lp = (lpIdx > 0) ? (C_BasePlayer*)m_Game->GetClientEntity(lpIdx) : nullptr;
+				C_WeaponCSBase* activeWeapon = lp ? reinterpret_cast<C_WeaponCSBase*>(lp->GetActiveWeapon()) : nullptr;
+				const uintptr_t weaponTag = reinterpret_cast<uintptr_t>(activeWeapon);
+				if (weaponTag != s_vrAwareThrowableAimWeapon)
+				{
+					if (s_vrAwareThrowableAimPrevWeaponThrowable && s_vrAwareThrowableAimPrevAttackDown)
+						s_vrAwareThrowableAimTicks = std::max(s_vrAwareThrowableAimTicks, 48);
+					s_vrAwareThrowableAimWeapon = weaponTag;
+					s_vrAwareThrowableAimPrevAttackDown = false;
+					s_vrAwareThrowableAimPrevWeaponThrowable = false;
+				}
+
+				const char* activeWeaponName = activeWeapon ? activeWeapon->GetName() : nullptr;
+				const char* activeWeaponNetClass = activeWeapon ? m_Game->GetNetworkClassName((uintptr_t*)activeWeapon) : nullptr;
+				const bool usingMountedWeapon = lp ? (
+					ReadNetvar<bool>(lp, VR::kUsingMountedGunOffset) ||
+					ReadNetvar<bool>(lp, VR::kUsingMountedWeaponOffset)
+				) : false;
+				const bool activeWeaponIsThrowable = IsVRThrowableWeapon(activeWeapon, activeWeaponName, activeWeaponNetClass);
+				constexpr int kIN_ATTACK = (1 << 0);
+				constexpr int kIN_USE = (1 << 5);
+				const bool attackDown = (cmd->buttons & kIN_ATTACK) != 0;
+				const bool useDown = (cmd->buttons & kIN_USE) != 0;
+				const auto now = std::chrono::steady_clock::now();
+				const bool useCmdAimActive = m_VR &&
+					(m_VR->m_ServerUseControllerAimActive ||
+						(m_VR->m_ServerUseControllerAimUntil.time_since_epoch().count() != 0 &&
+							now <= m_VR->m_ServerUseControllerAimUntil));
+
+				if (activeWeaponIsThrowable)
+				{
+					if (attackDown || (s_vrAwareThrowableAimPrevAttackDown && !attackDown))
+						s_vrAwareThrowableAimTicks = 48;
+					useControllerCmdView = attackDown || (s_vrAwareThrowableAimTicks > 0);
+					if (useControllerCmdView)
+					{
+						controllerCmdViewReason = attackDown ? "throw" : "throw-grace";
+					}
+					if (s_vrAwareThrowableAimTicks > 0)
+						--s_vrAwareThrowableAimTicks;
+				}
+				else
+				{
+					useControllerCmdView = s_vrAwareThrowableAimTicks > 0;
+					if (useControllerCmdView)
+					{
+						controllerCmdViewReason = "throw-switch-grace";
+					}
+					if (s_vrAwareThrowableAimTicks > 0)
+						--s_vrAwareThrowableAimTicks;
+				}
+
+				s_vrAwareThrowableAimPrevAttackDown = activeWeaponIsThrowable && attackDown;
+				s_vrAwareThrowableAimPrevWeaponThrowable = activeWeaponIsThrowable;
+				if (useCmdAimActive || useDown)
+				{
+					useControllerCmdView = true;
+					controllerCmdViewReason = "use";
+				}
+				if (usingMountedWeapon)
+				{
+					useControllerCmdView = true;
+					if (!controllerCmdViewReason)
+						controllerCmdViewReason = "mounted";
+				}
+			}
+
+			QAngle view;
+			if (useControllerCmdView)
+			{
+				view = m_VR->GetRightControllerAbsAngle();
+
+				static std::chrono::steady_clock::time_point s_lastControllerCmdViewLog{};
+				const auto logNow = std::chrono::steady_clock::now();
+				if (s_lastControllerCmdViewLog.time_since_epoch().count() == 0 ||
+					std::chrono::duration<float>(logNow - s_lastControllerCmdViewLog).count() >= 0.50f)
+				{
+					s_lastControllerCmdViewLog = logNow;
+					Game::logMsg(
+						"[VR][UseAim] CreateMove controller cmd view reason=%s nonvrAim=%d hasAim=%d view=(%.1f %.1f %.1f)",
+						controllerCmdViewReason ? controllerCmdViewReason : "unknown",
+						useNonVRAimCmdView ? 1 : 0,
+						m_VR->m_HasNonVRAimSolution ? 1 : 0,
+						view.x, view.y, view.z);
+				}
+			}
+			else
+			{
+				Vector hmdAng = m_VR->GetViewAngle();
+				view = QAngle(hmdAng.x, hmdAng.y, hmdAng.z);
+			}
+			if (m_VR->m_MouseModeEnabled)
+			{
+				float yaw = m_VR->m_RotationOffset;
+				while (yaw > 180.f)  yaw -= 360.f;
+				while (yaw < -180.f) yaw += 360.f;
+				float pitch = m_VR->m_MouseAimInitialized ? m_VR->m_MouseAimPitchOffset : view.x;
+				view = QAngle(pitch, yaw, 0.f);
+			}
+			if (view.x > 89.f)  view.x = 89.f;
+			if (view.x < -89.f) view.x = -89.f;
+			while (view.y > 180.f)  view.y -= 360.f;
+			while (view.y < -180.f) view.y += 360.f;
+			view.z = 0.f;
+			cmd->viewangles = view;
+
+			// Re-base engine-generated locomotion (keyboard WASD, etc.) from the original
+			// cmd basis into the VR-facing basis, then add stick movement in world space.
+			// Without this, keyboard movement gets rotated when cmd->viewangles is replaced.
+			{
+				QAngle origYawOnly(0.f, originalViewAngles.y, 0.f);
+				Vector origForward, origRight, origUp;
+				QAngle::AngleVectors(origYawOnly, &origForward, &origRight, &origUp);
+				Vector worldMove = origForward * originalForwardMove + origRight * originalSideMove;
+
+				if (hadWalkAxis)
+				{
+					float moveYaw = m_VR->GetMovementYawDeg();
+					if (m_VR->m_ThirdPersonFrontViewEnabled && m_VR->m_IsThirdPersonCamera && m_VR->ShouldRenderScope())
+					{
+						moveYaw = m_VR->GetScopeCameraAbsAngle().y + 180.0f;
+						moveYaw -= 360.0f * std::floor((moveYaw + 180.0f) / 360.0f);
+					}
+					QAngle moveYawOnly(0.f, moveYaw, 0.f);
+					Vector moveForward, moveRight, moveUp;
+					QAngle::AngleVectors(moveYawOnly, &moveForward, &moveRight, &moveUp);
+					worldMove += moveForward * (walkNy * walkMaxSpeed) + moveRight * (walkNx * walkMaxSpeed);
+				}
+
+				QAngle cmdYawOnly(0.f, cmd->viewangles.y, 0.f);
+				Vector cmdForward, cmdRight, cmdUp;
+				QAngle::AngleVectors(cmdYawOnly, &cmdForward, &cmdRight, &cmdUp);
+				cmd->forwardmove = DotProduct(worldMove, cmdForward);
+				cmd->sidemove = DotProduct(worldMove, cmdRight);
+			}
+
+			// Third-person melee: on VR-aware servers, melee swing direction is resolved from cmd->viewangles.
+			// In third-person camera, the rendered reticle ray (m_AimConvergePoint) may not match HMD yaw,
+			// causing "crosshair on target but swing misses". We lock viewangles toward the converge point
+			// for a short window when a melee swing starts, and re-base movement so locomotion doesn't snap.
+			{
+				using clock = std::chrono::steady_clock;
+				const auto now = clock::now();
+				const bool tpMeleeEligible = m_Game->m_IsMeleeWeaponActive && m_VR->IsThirdPersonCameraActive() && m_VR->m_HasAimConvergePoint && !m_VR->m_AdjustingViewmodel && !m_VR->m_AdjustingScope;
+				if (!tpMeleeEligible)
+				{
+					s_tpMeleePrevAttackDown = false;
+					s_tpMeleeLockUntil = {};
+				}
+				else
+				{
+					Vector eyePos = (m_VR->GetViewOriginLeft() + m_VR->GetViewOriginRight()) * 0.5f;
+					Vector dir = m_VR->m_AimConvergePoint - eyePos;
+					if (VectorLength(dir) > 0.001f)
+					{
+						VectorNormalize(dir);
+						QAngle tpAng;
+						QAngle::VectorAngles(dir, tpAng);
+						NormalizeAndClampViewAngles(tpAng);
+						tpAng.z = 0.f;
+
+						const bool attackDown = (cmd->buttons & (1 << 0)) != 0; // IN_ATTACK
+						if (attackDown && !s_tpMeleePrevAttackDown)
+						{
+							s_tpMeleeLockedAngles = tpAng;
+							const float lockT = std::max(0.0f, m_VR->m_NonVRMeleeAimLockTime);
+							s_tpMeleeLockUntil = now + std::chrono::duration_cast<clock::duration>(std::chrono::duration<float>(lockT));
+						}
+						s_tpMeleePrevAttackDown = attackDown;
+
+						if (now < s_tpMeleeLockUntil)
+						{
+							// Preserve movement direction: convert current cmd movement into world space (old yaw),
+							// then project back into the locked yaw basis.
+							QAngle oldYawOnly(0.f, cmd->viewangles.y, 0.f);
+							Vector oldForward, oldRight, oldUp;
+							QAngle::AngleVectors(oldYawOnly, &oldForward, &oldRight, &oldUp);
+							Vector worldMove = oldForward * cmd->forwardmove + oldRight * cmd->sidemove;
+
+							cmd->viewangles = s_tpMeleeLockedAngles;
+
+							QAngle newYawOnly(0.f, cmd->viewangles.y, 0.f);
+							Vector newForward, newRight, newUp;
+							QAngle::AngleVectors(newYawOnly, &newForward, &newRight, &newUp);
+							cmd->forwardmove = DotProduct(worldMove, newForward);
+							cmd->sidemove = DotProduct(worldMove, newRight);
+						}
+					}
+				}
+			}
+
+		}
+
+		// SpecialInfectedAutoEvade: the shove must use the same server-facing viewangles as the target lock.
+		// The visual aim-line path already forces m_RightControllerForward while pre-warning is active;
+		// this block locks CUserCmd too, so +attack2 is resolved toward the same infected target.
+		if (m_VR->m_SpecialInfectedWarningActionEnabled
+			&& m_VR->m_SpecialInfectedWarningActionStep != VR::SpecialInfectedWarningActionStep::None
+			&& m_VR->m_SpecialInfectedWarningTargetActive
+			&& !m_VR->m_AdjustingViewmodel
+			&& !m_VR->m_AdjustingScope
+			&& !suppressAutoActionsForUseOrRevive)
+		{
+			Vector aimOrigin = (m_VR->GetViewOriginLeft() + m_VR->GetViewOriginRight()) * 0.5f;
+			if (aimOrigin.IsZero())
+				aimOrigin = m_VR->m_HmdPosAbs;
+
+			Vector dir = m_VR->m_SpecialInfectedWarningTarget - aimOrigin;
+			if (VectorLength(dir) > 0.001f)
+			{
+				VectorNormalize(dir);
+				QAngle lockAngles;
+				QAngle::VectorAngles(dir, lockAngles);
+				NormalizeAndClampViewAngles(lockAngles);
+
+				QAngle oldYawOnly(0.f, cmd->viewangles.y, 0.f);
+				Vector oldForward, oldRight, oldUp;
+				QAngle::AngleVectors(oldYawOnly, &oldForward, &oldRight, &oldUp);
+				Vector worldMove = oldForward * cmd->forwardmove + oldRight * cmd->sidemove;
+
+				cmd->viewangles = lockAngles;
+
+				QAngle newYawOnly(0.f, cmd->viewangles.y, 0.f);
+				Vector newForward, newRight, newUp;
+				QAngle::AngleVectors(newYawOnly, &newForward, &newRight, &newUp);
+				cmd->forwardmove = DotProduct(worldMove, newForward);
+				cmd->sidemove = DotProduct(worldMove, newRight);
+
+				constexpr int kIN_ATTACK = (1 << 0);
+				constexpr int kIN_ATTACK2 = (1 << 11);
+				cmd->buttons &= ~kIN_ATTACK;
+				cmd->buttons |= kIN_ATTACK2;
+			}
+		}
+
+		m_VR->ApplyOptionalCreateMoveFeatures(cmd, 1, inputJumpHeld, hadWalkAxis, walkNx, walkNy, suppressScopeWalk);
+	}
+	else
+	{
+		resetEffectiveRangeAutoFireDelay();
+	}
+
+	// Keep Source's main-thread viewangles aligned with the VR audio listener while
+	// third-person rendering is active. The render thread avoids SetViewAngles in
+	// queued/multicore mode, so this main-thread update prevents stale visual-camera
+	// angles from driving front/back sound spatialization.
+	if (m_Game && m_Game->m_EngineClient && m_VR->m_IsThirdPersonCamera && !m_VR->m_AdjustingViewmodel
+				&& !m_VR->m_AdjustingScope)
+	{
+		Vector currentAudioFallback(cmd->viewangles.x, cmd->viewangles.y, cmd->viewangles.z);
+		QAngle listenerAngles = BuildVRAudioListenerAngles(m_VR, currentAudioFallback);
+		m_Game->m_EngineClient->SetViewAngles(listenerAngles);
+	}
+
+	// Auto-repeat for semi-auto / single-shot guns:
+	// Many L4D2 weapons require a fresh IN_ATTACK edge per shot (press/release).
+	// When enabled, we convert a held IN_ATTACK into short pulses for non-full-auto guns.
+	if ((m_VR->m_AutoRepeatSemiAutoFire || m_VR->m_EffectiveAttackRangeAutoFireActive) && m_Game && m_Game->m_EngineClient)
+	{
+		const int lpIdx2 = m_Game->m_EngineClient->GetLocalPlayer();
+		C_BasePlayer* lp2 = (lpIdx2 > 0) ? (C_BasePlayer*)m_Game->GetClientEntity(lpIdx2) : nullptr;
+		C_BaseCombatWeapon* wpn = lp2 ? (C_BaseCombatWeapon*)lp2->GetActiveWeapon() : nullptr;
+		C_WeaponCSBase* wpnCS = reinterpret_cast<C_WeaponCSBase*>(wpn);
+		const C_WeaponCSBase::WeaponID weaponId = wpnCS ? wpnCS->GetWeaponID() : C_WeaponCSBase::WeaponID::NONE;
+		const char* wpnName = (wpn != nullptr) ? wpn->GetName() : nullptr;
+		const char* wpnNet = (wpn != nullptr) ? m_Game->GetNetworkClassName((uintptr_t*)wpn) : nullptr;
+		// Mounted guns (minigun / .50 cal etc.) require a continuous IN_ATTACK hold.
+		// While mounted, GetActiveWeapon() can still report the carried weapon, so our
+		// semi-auto pulse heuristic would incorrectly pulse IN_ATTACK and "stutter" fire.
+		const bool usingMountedWeapon = lp2 ? (
+			ReadNetvar<bool>(lp2, VR::kUsingMountedGunOffset) ||
+			ReadNetvar<bool>(lp2, VR::kUsingMountedWeaponOffset)
+			) : false;
+		auto startsWith = [](const char* s, const char* prefix) -> bool {
+			if (!s || !prefix) return false;
+			while (*prefix)
+			{
+				if (*s++ != *prefix++) return false;
+			}
+			return true;
+			};
+		auto contains = [](const char* s, const char* sub) -> bool {
+			if (!s || !sub || !*sub) return false;
+			return std::strstr(s, sub) != nullptr;
+			};
+		// If we can't identify the active weapon, be conservative: do NOT pulse.
+		// (Some non-gun items can fail the network-name heuristic; pulsing breaks their hold/release behavior.)
+		const bool unknownWeapon = (!wpnName && !wpnNet);
+		// Heuristic: treat common full-auto weapons as full-auto and do NOT pulse them.
+		// Everything else that uses IN_ATTACK will either be unaffected, or benefit from pulsing.
+		const bool isFullAuto =
+			startsWith(wpnNet, "CWeaponSMG") ||
+			startsWith(wpnNet, "CWeaponRifle") ||
+			startsWith(wpnNet, "CWeaponAutoshotgun") ||
+			startsWith(wpnNet, "CWeaponShotgun_SPAS") ||
+			startsWith(wpnNet, "CWeaponM60") ||
+			startsWith(wpnNet, "CWeaponRifle_M60") ||
+			contains(wpnNet, "Minigun");
+		const bool isMeleeWeapon = (weaponId == C_WeaponCSBase::WeaponID::MELEE);
+		const bool isAutoRepeatSprayPushWeapon =
+			(weaponId == C_WeaponCSBase::WeaponID::PUMPSHOTGUN) ||
+			(weaponId == C_WeaponCSBase::WeaponID::SHOTGUN_CHROME) ||
+			(weaponId == C_WeaponCSBase::WeaponID::AWP) ||
+			(weaponId == C_WeaponCSBase::WeaponID::SCOUT) ||
+			startsWith(wpnNet, "CWeaponPumpShotgun") ||
+			startsWith(wpnNet, "CWeaponShotgun_Chrome") ||
+			startsWith(wpnNet, "CWeaponSniperAWP") ||
+			startsWith(wpnNet, "CWeaponSniperScout") ||
+			(wpnName && (
+				contains(wpnName, "weapon_pumpshotgun") ||
+				contains(wpnName, "weapon_shotgun_chrome") ||
+				contains(wpnName, "weapon_awp") ||
+				contains(wpnName, "weapon_scout")));
+
+		const bool holdingAttack = (cmd->buttons & (1 << 0)) != 0; // IN_ATTACK
+
+		// If the player is currently performing a "use action" (healing, giving ammo/upgrade pack,
+		// reviving, etc.), Source expects IN_ATTACK to be held continuously.
+		// Pulsing IN_ATTACK will interrupt the action.
+		const bool doingUseAction = lp2 ? (ReadNetvar<int>(lp2, 0x1ba8) != 0) : false; // m_iCurrentUseAction
+
+		// Items that require a continuous hold on IN_ATTACK (healing / ammo packs / upgrade packs).
+		// If we pulse IN_ATTACK here, these actions get interrupted and become unusable.
+		const bool isHoldToUseWeaponId =
+			(weaponId == C_WeaponCSBase::WeaponID::FIRST_AID_KIT) ||
+			(weaponId == C_WeaponCSBase::WeaponID::DEFIBRILLATOR) ||
+			(weaponId == C_WeaponCSBase::WeaponID::AMMO_PACK) ||
+			(weaponId == C_WeaponCSBase::WeaponID::INCENDIARY_AMMO) ||
+			(weaponId == C_WeaponCSBase::WeaponID::FRAG_AMMO) ||
+			(weaponId == C_WeaponCSBase::WeaponID::UPGRADE_ITEM);
+		const bool isHoldToUseItem =
+			isHoldToUseWeaponId ||
+			// First-aid kit
+			contains(wpnName, "first_aid") ||
+			contains(wpnName, "firstaid") ||
+			contains(wpnName, "aid_kit") ||
+			contains(wpnName, "aidkit") ||
+			contains(wpnNet, "FirstAid") ||
+			contains(wpnNet, "FirstAidKit") ||
+			contains(wpnNet, "WeaponFirstAidKit") ||
+			contains(wpnNet, "AidKit") ||
+			// Defib
+			contains(wpnName, "defib") ||
+			contains(wpnName, "defibrillator") ||
+			contains(wpnNet, "Defibrillator") ||
+			contains(wpnNet, "WeaponDefibrillator") ||
+			// Ammo/upgrade packs
+			contains(wpnName, "ammo_pack") ||
+			contains(wpnName, "ammopack") ||
+			contains(wpnName, "upgrade_pack") ||
+			contains(wpnName, "upgradepack") ||
+			contains(wpnName, "incendiary_ammo") ||
+			contains(wpnName, "frag_ammo") ||
+			contains(wpnNet, "AmmoPack") ||
+			contains(wpnNet, "DT_AmmoPack") ||
+			contains(wpnNet, "UpgradePack") ||
+			contains(wpnNet, "ItemBaseUpgradePack") ||
+			contains(wpnNet, "UpgradePackExplosive") ||
+			contains(wpnNet, "UpgradePackIncendiary");
+		// Items that are *held* for a moment and released/thrown (or have their own continuous logic).
+		// Pulsing IN_ATTACK here feels bad and can cancel/bug the action (chainsaw, throwables).
+		const bool isChainsaw =
+			(wpnName && (contains(wpnName, "chainsaw") || contains(wpnName, "weapon_chainsaw"))) ||
+			contains(wpnNet, "Chainsaw") ||
+			contains(wpnNet, "WeaponChainsaw") ||
+			startsWith(wpnNet, "CChainsaw");
+		const bool effectiveRangeContinuousAttack =
+			m_VR->m_EffectiveAttackRangeAutoFireActive && (isMeleeWeapon || isChainsaw);
+
+		const bool isThrowable =
+			(wpnName && (
+				// Be loose here: engine strings vary across builds/mods ("weapon_molotov" vs "molotov").
+				contains(wpnName, "molotov") ||
+				(contains(wpnName, "pipe") && contains(wpnName, "bomb")) ||
+				contains(wpnName, "vomit") ||
+				(contains(wpnName, "grenade") && !contains(wpnName, "grenade_launcher"))
+				)) ||
+			contains(wpnNet, "Molotov") ||
+			contains(wpnNet, "PipeBomb") ||
+			contains(wpnNet, "VomitJar") ||
+			contains(wpnNet, "BaseCSGrenade") ||
+			(contains(wpnNet, "Grenade") && !contains(wpnNet, "GrenadeLauncher"));
+
+		// Carryable props use a press-to-drop action. They must never pass through
+		// semi-auto pulse generation because that would fabricate a release while
+		// the physical VR trigger is still held.
+		const bool isManualCarryThrowable =
+			m_VR->m_ManualThrowEnabled &&
+			IsVRManualCarryThrowWeapon(reinterpret_cast<C_WeaponCSBase*>(wpn), wpnName, wpnNet);
+
+		// Only pulse when holding attack and weapon is NOT full-auto, and NOT a hold-to-use item.
+		// NOT a hold-to-use item, and NOT during a continuous use action.
+		if (holdingAttack && !unknownWeapon && !isFullAuto && !isHoldToUseItem && !isChainsaw && !isThrowable && !isManualCarryThrowable && !doingUseAction && !usingMountedWeapon && !effectiveRangeContinuousAttack && (!isMeleeWeapon || !m_VR->m_AutoFastMelee))
+		{
+			using namespace std::chrono;
+			const int kIN_ATTACK = (1 << 0);
+			const int kIN_ATTACK2 = (1 << 11);
+			const float hz = (m_VR->m_AutoRepeatSemiAutoFireHz > 0.0f)
+				? m_VR->m_AutoRepeatSemiAutoFireHz
+				: (m_VR->m_EffectiveAttackRangeAutoFireActive ? 12.0f : 0.0f);
+			const auto now = steady_clock::now();
+			const uintptr_t wpnTag = reinterpret_cast<uintptr_t>(wpn);
+
+			// Track active weapon + clip for spray-push-capable weapons.
+			if (wpnTag != s_autoRepeatSprayPushWeapon)
+			{
+				s_autoRepeatSprayPushWeapon = wpnTag;
+				s_autoRepeatSprayPushPrevClip1 = (wpn != nullptr) ? ReadNetvar<int>(wpn, VR::kClip1Offset) : -1;
+				s_autoRepeatSprayPushDelayTicks = 0;
+				s_autoRepeatSprayPushHoldTicks = 0;
+			}
+			else if (isAutoRepeatSprayPushWeapon && wpn != nullptr)
+			{
+				const int clip1 = ReadNetvar<int>(wpn, VR::kClip1Offset);
+				const bool shellSpent = (clip1 >= 0) && (s_autoRepeatSprayPushPrevClip1 >= 0) && (clip1 < s_autoRepeatSprayPushPrevClip1);
+				s_autoRepeatSprayPushPrevClip1 = clip1;
+				if (shellSpent && m_VR->m_AutoRepeatSprayPushEnabled)
+				{
+					// Queue shove cancel right after a real shell-spend event.
+					s_autoRepeatSprayPushDelayTicks = std::max(0, m_VR->m_AutoRepeatSprayPushDelayTicks);
+					s_autoRepeatSprayPushHoldTicks = std::max(s_autoRepeatSprayPushHoldTicks, std::max(1, m_VR->m_AutoRepeatSprayPushHoldTicks));
+				}
+			}
+
+			if (!m_VR->m_AutoRepeatHoldPrev)
+			{
+				// First tick of hold: fire immediately.
+				m_VR->m_AutoRepeatNextPulse = now;
+			}
+
+			bool pulseThisTick = (hz > 0.0f) && (now >= m_VR->m_AutoRepeatNextPulse);
+			if (pulseThisTick)
+			{
+				cmd->buttons |= kIN_ATTACK;
+				// Single-tick pulse; next tick will be cleared (unless next period elapsed).
+				const float clampedHz = std::max(1.0f, std::min(50.0f, hz));
+				m_VR->m_AutoRepeatNextPulse = now + duration_cast<steady_clock::duration>(duration<float>(1.0f / clampedHz));
+			}
+			else
+			{
+				cmd->buttons &= ~kIN_ATTACK;
+			}
+
+			// Spray-push (fire -> short shove) when auto-repeat is driving semi-auto input.
+			if (isAutoRepeatSprayPushWeapon && m_VR->m_AutoRepeatSprayPushEnabled)
+			{
+				if (s_autoRepeatSprayPushDelayTicks > 0)
+				{
+					--s_autoRepeatSprayPushDelayTicks;
+				}
+				if (s_autoRepeatSprayPushDelayTicks <= 0 && s_autoRepeatSprayPushHoldTicks > 0)
+				{
+					cmd->buttons |= kIN_ATTACK2;
+					--s_autoRepeatSprayPushHoldTicks;
+				}
+			}
+			else
+			{
+				s_autoRepeatSprayPushDelayTicks = 0;
+				s_autoRepeatSprayPushHoldTicks = 0;
+			}
+
+			m_VR->m_AutoRepeatHoldPrev = true;
+		}
+		else
+		{
+			m_VR->m_AutoRepeatHoldPrev = false;
+			s_autoRepeatSprayPushDelayTicks = 0;
+			s_autoRepeatSprayPushHoldTicks = 0;
+			s_autoRepeatSprayPushWeapon = 0;
+			s_autoRepeatSprayPushPrevClip1 = -1;
+		}
+	}
+	else
+	{
+		m_VR->m_AutoRepeatHoldPrev = false;
+		s_autoRepeatSprayPushDelayTicks = 0;
+		s_autoRepeatSprayPushHoldTicks = 0;
+		s_autoRepeatSprayPushWeapon = 0;
+		s_autoRepeatSprayPushPrevClip1 = -1;
+	}
+
+	// Auto fast-melee: fixed cadence weapon-switch cancel.
+	// Sequence: +attack ; wait1(1) ; slot1 ; wait2(1) ; slot2 ; wait3(15).
+	if (m_VR->m_AutoFastMelee && m_Game && m_Game->m_EngineClient)
+	{
+		const int kIN_ATTACK = (1 << 0);
+		constexpr int kWaitOutTicks = 1;
+		constexpr int kWaitBackTicks = 1;
+		constexpr int kWaitPostTicks = 15;
+		constexpr int kIntentGraceTicks = 24;
+
+		const int lpIdx2 = m_Game->m_EngineClient->GetLocalPlayer();
+		C_BasePlayer* lp2 = (lpIdx2 > 0) ? (C_BasePlayer*)m_Game->GetClientEntity(lpIdx2) : nullptr;
+		C_BaseCombatWeapon* wpn = lp2 ? (C_BaseCombatWeapon*)lp2->GetActiveWeapon() : nullptr;
+		C_WeaponCSBase* wpnCS = reinterpret_cast<C_WeaponCSBase*>(wpn);
+		const bool isMeleeWeapon = (wpnCS != nullptr) && (wpnCS->GetWeaponID() == C_WeaponCSBase::WeaponID::MELEE);
+		const bool cmdAttackDown = (cmd->buttons & kIN_ATTACK) != 0;
+		const bool vrAttackDown = m_VR->m_PrimaryAttackDown || m_VR->m_PrimaryAttackCmdOwned;
+		const bool mouseAttackDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+		const bool attackIntentDown = cmdAttackDown || vrAttackDown || mouseAttackDown;
+		const bool doingUseAction = lp2 ? (ReadNetvar<int>(lp2, 0x1ba8) != 0) : false; // m_iCurrentUseAction
+		const bool canSwitchCancel = m_VR->m_AutoFastMeleeUseWeaponSwitch;
+		const int cmdNum = cmd->command_number;
+
+		if (attackIntentDown)
+		{
+			s_autoFastMeleeLastIntentCmd = cmdNum;
+		}
+
+		const bool hasPendingSwitchNow = s_autoFastMeleeSwitchOutPending || s_autoFastMeleeSwitchBackPending;
+		const bool inActiveCycleNow =
+			hasPendingSwitchNow ||
+			((s_autoFastMeleeWeapon != 0) && (s_autoFastMeleeNextSwingCmd > cmdNum));
+		const bool recentIntent =
+			(s_autoFastMeleeLastIntentCmd > 0) &&
+			((cmdNum - s_autoFastMeleeLastIntentCmd) <= kIntentGraceTicks);
+		const bool effectiveAttackIntentDown = attackIntentDown || (inActiveCycleNow && recentIntent);
+
+		// Keep this outside "isMeleeWeapon" so slot1 -> slot2 can finish even while temporarily on slot1.
+		if (s_autoFastMeleeSwitchOutPending && cmdNum >= s_autoFastMeleeSwitchOutCmd)
+		{
+			m_Game->ClientCmd_Unrestricted("slot1");
+			s_autoFastMeleeSwitchOutPending = false;
+			s_autoFastMeleeSwitchOutCmd = -1;
+		}
+		if (s_autoFastMeleeSwitchBackPending && cmdNum >= s_autoFastMeleeSwitchBackCmd)
+		{
+			m_Game->ClientCmd_Unrestricted("slot2");
+			s_autoFastMeleeSwitchBackPending = false;
+			s_autoFastMeleeSwitchBackCmd = -1;
+		}
+		const bool hasPendingSwitch = s_autoFastMeleeSwitchOutPending || s_autoFastMeleeSwitchBackPending;
+
+		if (effectiveAttackIntentDown && !doingUseAction)
+		{
+			if (isMeleeWeapon)
+			{
+				const uintptr_t wpnTag = reinterpret_cast<uintptr_t>(wpn);
+				if (wpnTag != s_autoFastMeleeWeapon)
+				{
+					s_autoFastMeleeWeapon = wpnTag;
+					s_autoFastMeleeSwitchOutPending = false;
+					s_autoFastMeleeSwitchBackPending = false;
+					s_autoFastMeleeSwitchOutCmd = -1;
+					s_autoFastMeleeSwitchBackCmd = -1;
+				}
+
+				if (!s_autoFastMeleeHoldPrev || s_autoFastMeleeNextSwingCmd <= 0)
+				{
+					// First hold tick: start immediately.
+					s_autoFastMeleeNextSwingCmd = cmdNum;
+				}
+
+				const bool swingThisTick = (cmdNum >= s_autoFastMeleeNextSwingCmd);
+				if (swingThisTick)
+				{
+					cmd->buttons |= kIN_ATTACK;
+					const int cycleTicks = std::max(1, kWaitOutTicks + kWaitBackTicks + kWaitPostTicks + 1);
+					s_autoFastMeleeNextSwingCmd = cmdNum + cycleTicks;
+
+					if (canSwitchCancel)
+					{
+						s_autoFastMeleeSwitchOutCmd = cmdNum + kWaitOutTicks;
+						s_autoFastMeleeSwitchBackCmd = s_autoFastMeleeSwitchOutCmd + kWaitBackTicks;
+						s_autoFastMeleeSwitchOutPending = true;
+						s_autoFastMeleeSwitchBackPending = true;
+					}
+					else
+					{
+						s_autoFastMeleeSwitchOutPending = false;
+						s_autoFastMeleeSwitchBackPending = false;
+						s_autoFastMeleeSwitchOutCmd = -1;
+						s_autoFastMeleeSwitchBackCmd = -1;
+					}
+				}
+				else
+				{
+					cmd->buttons &= ~kIN_ATTACK;
+				}
+
+				s_autoFastMeleeHoldPrev = true;
+			}
+			else if (hasPendingSwitch)
+			{
+				// While waiting for slot2 return, suppress held attack to avoid firing slot1 weapon.
+				cmd->buttons &= ~kIN_ATTACK;
+				s_autoFastMeleeHoldPrev = true;
+			}
+			else
+			{
+				// During slot-switch settle frames, active weapon can briefly report non-melee.
+				// Keep cadence timing alive while waiting for the scheduled next swing.
+				const bool waitingNextSwing = (s_autoFastMeleeWeapon != 0) && (s_autoFastMeleeNextSwingCmd > cmdNum);
+				if (waitingNextSwing)
+				{
+					cmd->buttons &= ~kIN_ATTACK;
+					s_autoFastMeleeHoldPrev = true;
+				}
+				else
+				{
+					s_autoFastMeleeHoldPrev = false;
+					s_autoFastMeleeNextSwingCmd = -1;
+					s_autoFastMeleeWeapon = 0;
+				}
+			}
+		}
+		else
+		{
+			// Stop scheduling new swings when attack is released, but let an already queued slot2 return finish.
+			s_autoFastMeleeHoldPrev = false;
+			s_autoFastMeleeNextSwingCmd = -1;
+			s_autoFastMeleeWeapon = 0;
+			s_autoFastMeleeLastIntentCmd = -1;
+			if (hasPendingSwitch)
+			{
+				cmd->buttons &= ~kIN_ATTACK;
+			}
+			else
+			{
+				s_autoFastMeleeSwitchOutPending = false;
+				s_autoFastMeleeSwitchBackPending = false;
+				s_autoFastMeleeSwitchOutCmd = -1;
+				s_autoFastMeleeSwitchBackCmd = -1;
+			}
+		}
+	}
+	else
+	{
+		s_autoFastMeleeHoldPrev = false;
+		s_autoFastMeleeSwitchOutPending = false;
+		s_autoFastMeleeSwitchBackPending = false;
+		s_autoFastMeleeSwitchOutCmd = -1;
+		s_autoFastMeleeSwitchBackCmd = -1;
+		s_autoFastMeleeNextSwingCmd = -1;
+		s_autoFastMeleeWeapon = 0;
+		s_autoFastMeleeLastIntentCmd = -1;
+	}
+
+	// Effective-range melee auto-fire: start one dedicated fast-melee cycle per interval,
+	// isolated from the manual AutoFastMelee hold state machine.
+	if (m_Game && m_Game->m_EngineClient)
+	{
+		const int kIN_ATTACK = (1 << 0);
+		constexpr int kWaitOutTicks = 1;
+		constexpr int kWaitBackTicks = 1;
+		constexpr int kWaitPostTicks = 15;
+
+		const int lpIdx2 = m_Game->m_EngineClient->GetLocalPlayer();
+		C_BasePlayer* lp2 = (lpIdx2 > 0) ? (C_BasePlayer*)m_Game->GetClientEntity(lpIdx2) : nullptr;
+		C_BaseCombatWeapon* wpn = lp2 ? (C_BaseCombatWeapon*)lp2->GetActiveWeapon() : nullptr;
+		C_WeaponCSBase* wpnCS = reinterpret_cast<C_WeaponCSBase*>(wpn);
+		const bool isMeleeWeapon = (wpnCS != nullptr) && (wpnCS->GetWeaponID() == C_WeaponCSBase::WeaponID::MELEE);
+		const bool autoFireMeleeActive = m_VR->m_EffectiveAttackRangeAutoFireActive && isMeleeWeapon;
+		const bool cmdAttackDown = (cmd->buttons & kIN_ATTACK) != 0;
+		const bool vrAttackDown = m_VR->m_PrimaryAttackDown || m_VR->m_PrimaryAttackCmdOwned;
+		const bool mouseAttackDown = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+		const bool manualAttackDown = cmdAttackDown || vrAttackDown || mouseAttackDown;
+		const bool doingUseAction = lp2 ? (ReadNetvar<int>(lp2, 0x1ba8) != 0) : false; // m_iCurrentUseAction
+		const bool canSwitchCancel = m_VR->m_AutoFastMeleeUseWeaponSwitch;
+		const int cmdNum = cmd->command_number;
+		const auto now = std::chrono::steady_clock::now();
+
+		if (s_effectiveRangeMeleeSwitchOutPending && cmdNum >= s_effectiveRangeMeleeSwitchOutCmd)
+		{
+			m_Game->ClientCmd_Unrestricted("slot1");
+			s_effectiveRangeMeleeSwitchOutPending = false;
+			s_effectiveRangeMeleeSwitchOutCmd = -1;
+		}
+		if (s_effectiveRangeMeleeSwitchBackPending && cmdNum >= s_effectiveRangeMeleeSwitchBackCmd)
+		{
+			m_Game->ClientCmd_Unrestricted("slot2");
+			s_effectiveRangeMeleeSwitchBackPending = false;
+			s_effectiveRangeMeleeSwitchBackCmd = -1;
+		}
+
+		const bool hasPendingSwitch = s_effectiveRangeMeleeSwitchOutPending || s_effectiveRangeMeleeSwitchBackPending;
+		const bool waitingCycleEnd =
+			(s_effectiveRangeMeleeWeapon != 0) &&
+			(s_effectiveRangeMeleeCycleEndCmd > cmdNum);
+		const bool cycleInProgress = hasPendingSwitch || waitingCycleEnd;
+
+		if (autoFireMeleeActive && !doingUseAction && !manualAttackDown)
+		{
+			const uintptr_t wpnTag = reinterpret_cast<uintptr_t>(wpn);
+			if (!cycleInProgress && wpnTag != s_effectiveRangeMeleeWeapon)
+			{
+				resetEffectiveRangeMeleeCycle();
+				s_effectiveRangeMeleeWeapon = wpnTag;
+			}
+
+			if (s_effectiveRangeMeleeNextCycleAt.time_since_epoch().count() == 0)
+				s_effectiveRangeMeleeNextCycleAt = now;
+
+			if (!cycleInProgress && now >= s_effectiveRangeMeleeNextCycleAt)
+			{
+				cmd->buttons |= kIN_ATTACK;
+
+				const auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+					std::chrono::duration<float>(std::clamp(m_VR->m_EffectiveAttackRangeMeleeAutoFastMeleeIntervalSeconds, 0.05f, 5.0f)));
+				s_effectiveRangeMeleeNextCycleAt = now + interval;
+				s_effectiveRangeMeleeCycleEndCmd =
+					cmdNum + std::max(1, kWaitOutTicks + kWaitBackTicks + kWaitPostTicks + 1);
+
+				if (canSwitchCancel)
+				{
+					s_effectiveRangeMeleeSwitchOutCmd = cmdNum + kWaitOutTicks;
+					s_effectiveRangeMeleeSwitchBackCmd = s_effectiveRangeMeleeSwitchOutCmd + kWaitBackTicks;
+					s_effectiveRangeMeleeSwitchOutPending = true;
+					s_effectiveRangeMeleeSwitchBackPending = true;
+				}
+				else
+				{
+					s_effectiveRangeMeleeSwitchOutPending = false;
+					s_effectiveRangeMeleeSwitchBackPending = false;
+					s_effectiveRangeMeleeSwitchOutCmd = -1;
+					s_effectiveRangeMeleeSwitchBackCmd = -1;
+				}
+			}
+			else if (cycleInProgress)
+			{
+				cmd->buttons &= ~kIN_ATTACK;
+			}
+		}
+		else if (cycleInProgress)
+		{
+			cmd->buttons &= ~kIN_ATTACK;
+		}
+		else
+		{
+			resetEffectiveRangeMeleeCycle();
+		}
+	}
+	else
+	{
+		resetEffectiveRangeMeleeCycle();
+	}
+
+
+	// Aim-line friendly-fire guard:
+	// Compute teammate hit at input-tick rate (CreateMove) and latch suppression until attack is released.
+	C_BasePlayer* ffLocalPlayer = nullptr;
+	const bool localUsingMountedWeapon = !m_VR->m_ForceNonVRServerMovement && IsLocalClientUsingMountedWeapon();
+	if (m_VR->m_BlockFireOnFriendlyAimEnabled && !localUsingMountedWeapon)
+	{
+		const int ffIdx = m_Game->m_EngineClient->GetLocalPlayer();
+		if (ffIdx > 0)
+			ffLocalPlayer = (C_BasePlayer*)m_Game->GetClientEntity(ffIdx);
+	}
+
+	// Do NOT suppress IN_ATTACK while the player is performing a continuous "use action"
+	// (healing, giving ammo/upgrade pack, reviving, etc.). These actions intentionally target
+	// teammates and require holding IN_ATTACK.
+	const bool ffDoingUseAction = ffLocalPlayer ? (ReadNetvar<int>(ffLocalPlayer, 0x1ba8) != 0) : false; // m_iCurrentUseAction
+	if (!localUsingMountedWeapon && !ffDoingUseAction && m_VR->ShouldSuppressPrimaryFire(cmd, ffLocalPlayer))
+	{
+		cmd->buttons &= ~(1 << 0); // IN_ATTACK
+	}
+
+	constexpr int kMagazineInteractionInAttack = (1 << 0);
+	constexpr int kMagazineInteractionInReload = (1 << 13);
+	const bool magazineInteractionBlocksFire = m_VR->IsMagazineInteractionBlockingFire();
+	if (!localUsingMountedWeapon && magazineInteractionBlocksFire)
+	{
+		if ((cmd->buttons & kMagazineInteractionInAttack) != 0 && (s_lastButtons & kMagazineInteractionInAttack) == 0)
+			m_VR->PlayMagazineInteractionBlockedFireEmptySound();
+		cmd->buttons &= ~kMagazineInteractionInAttack; // IN_ATTACK
+	}
+	if (!localUsingMountedWeapon &&
+		m_VR->IsMagazineInteractionLeftHandActive() &&
+		!m_VR->IsMagazineInteractionReloadCommandActive())
+	{
+		cmd->buttons &= ~kMagazineInteractionInReload; // IN_RELOAD
+	}
+	if (!localUsingMountedWeapon &&
+		m_VR->IsMagazineInteractionNativeReloadSuppressActive() &&
+		!m_VR->IsMagazineInteractionReloadCommandActive())
+	{
+		cmd->buttons &= ~kMagazineInteractionInReload; // IN_RELOAD
+	}
+	const bool suppressMagazineEmptyClipAutoReload =
+		m_VR->ShouldSuppressMagazineInteractionEmptyClipAutoReload(nullptr);
+	if (!localUsingMountedWeapon && suppressMagazineEmptyClipAutoReload)
+	{
+		if ((cmd->buttons & kMagazineInteractionInAttack) != 0 && (s_lastButtons & kMagazineInteractionInAttack) == 0)
+			m_VR->PlayMagazineInteractionBlockedFireEmptySound();
+		cmd->buttons &= ~(kMagazineInteractionInAttack | kMagazineInteractionInReload);
+	}
+
+	{
+		constexpr int kIN_ATTACK = (1 << 0);
+		const bool autoFireAttackDown = m_VR->m_EffectiveAttackRangeAutoFireActive && ((cmd->buttons & kIN_ATTACK) != 0);
+		if (autoFireAttackDown && !m_VR->m_EffectiveAttackRangeAutoFirePrevAttackDown && m_Game && m_Game->m_EngineClient)
+		{
+			const int lpIdx = m_Game->m_EngineClient->GetLocalPlayer();
+			C_BasePlayer* lp = (lpIdx > 0) ? (C_BasePlayer*)m_Game->GetClientEntity(lpIdx) : nullptr;
+			C_WeaponCSBase* activeWeapon = lp ? (C_WeaponCSBase*)lp->GetActiveWeapon() : nullptr;
+			if (activeWeapon)
+			{
+				const C_WeaponCSBase::WeaponID weaponId = activeWeapon->GetWeaponID();
+				if (weaponId == C_WeaponCSBase::WeaponID::CHAINSAW)
+					m_VR->TriggerWeaponFireHaptics((int)weaponId, false);
+			}
+		}
+		m_VR->m_EffectiveAttackRangeAutoFirePrevAttackDown = autoFireAttackDown;
+	}
+
+	if (m_VR)
+	{
+		// Detect control locomotion before adding physical roomscale movement.
+		// Roomscale cmd movement should not disable the 1:1 camera decoupling path.
+		const float fm = cmd ? cmd->forwardmove : 0.0f;
+		const float sm = cmd ? cmd->sidemove : 0.0f;
+		const float um = cmd ? cmd->upmove : 0.0f;
+		const bool controlLocomotionActive =
+			(fabsf(fm) > 0.5f) ||
+			(fabsf(sm) > 0.5f) ||
+			(fabsf(um) > 0.5f) ||
+			m_VR->m_PushingThumbstick;
+		m_VR->m_LocomotionActive = controlLocomotionActive;
+
+		if (m_VR->m_IsVREnabled &&
+			m_VR->m_Roomscale1To1Movement &&
+			m_VR->m_Roomscale1To1DecoupleCamera)
+		{
+			const bool roomscaleMayDriveMovement =
+				!controlLocomotionActive || !m_VR->m_Roomscale1To1DisableWhileThumbstick;
+
+			const int lpIdx = (m_Game && m_Game->m_EngineClient) ? m_Game->m_EngineClient->GetLocalPlayer() : -1;
+			C_BasePlayer* lp = (lpIdx > 0 && m_Game) ? (C_BasePlayer*)m_Game->GetClientEntity(lpIdx) : nullptr;
+			const int lifeState = lp ? (int)ReadNetvar<uint8_t>(lp, VR::kLifeStateOffset) : 1;
+			const int observerMode = lp ? (int)ReadNetvar<int>(lp, VR::kObserverModeOffset) : 1;
+			const bool liveLocalPlayer = lp && lifeState == 0 && observerMode == 0;
+
+			if (roomscaleMayDriveMovement && liveLocalPlayer && !m_VR->ShouldUseRoomscale1To1ServerMove())
+			{
+				Vector engineEye = lp->EyePosition();
+				engineEye.z = 0.0f;
+
+				if (m_VR->m_Roomscale1To1LastEngineEyeValid)
+				{
+					Vector acceptedWorldDelta = engineEye - m_VR->m_Roomscale1To1LastEngineEye;
+					acceptedWorldDelta.z = 0.0f;
+
+					const float acceptedLen = acceptedWorldDelta.Length();
+					if (m_VR->m_Roomscale1To1PendingVisualWorldDeltaValid &&
+						std::isfinite(acceptedLen) && acceptedLen < 96.0f &&
+						m_VR->m_Roomscale1To1PrevValid && std::fabs(m_VR->m_VRScale) > 0.001f)
+					{
+						Vector visualWorldDelta = m_VR->m_Roomscale1To1PendingVisualWorldDelta;
+						visualWorldDelta.z = 0.0f;
+
+						Vector correctionWorld = acceptedWorldDelta - visualWorldDelta;
+						correctionWorld.z = 0.0f;
+
+						const float correctionLen = correctionWorld.Length();
+						if (std::isfinite(correctionLen) && correctionLen > 0.01f && correctionLen < 96.0f)
+						{
+							m_VR->ApplyRoomscale1To1VisualWorldCorrection(correctionWorld);
+						}
+					}
+				}
+
+				m_VR->m_Roomscale1To1LastEngineEye = engineEye;
+				m_VR->m_Roomscale1To1LastEngineEyeValid = true;
+			}
+			else
+			{
+				m_VR->m_Roomscale1To1LastEngineEyeValid = false;
+				m_VR->m_Roomscale1To1PendingVisualWorldDeltaValid = false;
+			}
+		}
+		else
+		{
+			m_VR->m_Roomscale1To1LastEngineEyeValid = false;
+			m_VR->m_Roomscale1To1PendingVisualWorldDeltaValid = false;
+		}
+
+		m_VR->ApplyRoomscale1To1Move(cmd, flInputSampleTime, controlLocomotionActive);
+		m_VR->ApplyMovementLedgeGuard(cmd, m_VR->m_ScopeFovAdjustSuppressWalk || m_VR->m_TeleportTargetingActive);
+
+		// Keep the two input contracts independent:
+		//   * carried props: hold the trigger and release to throw (Use stays native);
+		//   * inventory items: hold Use first, then pull/release the trigger.
+		// Inventory throw mode swallows both inputs and asks the listen server to use
+		// CBaseCombatCharacter::Weapon_Drop. This includes grenade-slot weapons, so
+		// Use+trigger drops the held item instead of arming its native effect.
+		{
+			constexpr uint32_t kManualCarryThrowIN_ATTACK = (1u << 0);
+			constexpr uint32_t kManualInventoryThrowIN_USE = (1u << 5);
+			constexpr uint32_t kManualCarryThrowWeaponShift = 26u;
+			constexpr uint32_t kManualCarryThrowWeaponMask = (0x3Fu << kManualCarryThrowWeaponShift);
+			C_BaseCombatWeapon* activeBaseWeapon = localPlayerForAutoActions
+				? reinterpret_cast<C_BaseCombatWeapon*>(localPlayerForAutoActions->GetActiveWeapon())
+				: nullptr;
+			C_WeaponCSBase* activeWeapon = reinterpret_cast<C_WeaponCSBase*>(activeBaseWeapon);
+			const char* activeWeaponName = activeBaseWeapon ? activeBaseWeapon->GetName() : nullptr;
+			const char* activeWeaponNetClass = activeBaseWeapon
+				? m_Game->GetNetworkClassName(reinterpret_cast<uintptr_t*>(activeBaseWeapon))
+				: nullptr;
+			const uintptr_t activeWeaponTag = reinterpret_cast<uintptr_t>(activeWeapon);
+			const int activeWeaponId = activeWeapon
+				? static_cast<int>(activeWeapon->GetWeaponID())
+				: static_cast<int>(C_WeaponCSBase::WeaponID::NONE);
+			const int carryWeaponId = ResolveVRManualCarryThrowWeaponId(
+				activeWeapon,
+				activeWeaponName,
+				activeWeaponNetClass);
+			const bool carriedProp =
+				carryWeaponId != static_cast<int>(C_WeaponCSBase::WeaponID::NONE);
+			const bool inventoryItem =
+				!carriedProp &&
+				ManualInventoryThrowWeaponIdRequiresCustomDrop(activeWeaponId);
+			const bool emptyHandsPlaceholderActive =
+				m_VR->m_ManualInventoryEmptyHandsActive.load(std::memory_order_acquire);
+			const bool throwBackendReady = carriedProp
+				? ManualCarryThrowBackendIsReady(carryWeaponId)
+				: (inventoryItem && ManualInventoryThrowBackendIsReady(activeWeaponId));
+			const bool manualThrowInputActive =
+				m_VR->m_IsVREnabled &&
+				m_VR->m_ManualThrowEnabled &&
+				s_ServerUnderstandsVR &&
+				throwBackendReady &&
+				!emptyHandsPlaceholderActive;
+
+			const bool physicalAttackDown = m_VR->m_PrimaryAttackDown;
+			const bool physicalUseDown = localUseButtonDownForAutoActions || m_VR->m_UseCmdOwned;
+			if (!manualThrowInputActive)
+			{
+				s_manualCarryThrowWeapon = 0;
+				s_manualCarryThrowPhysicalAttackDown = physicalAttackDown;
+				s_manualInventoryThrowPhysicalUseDown = physicalUseDown;
+				s_manualInventoryThrowArmed = false;
+			}
+			else
+			{
+				if (activeWeaponTag != s_manualCarryThrowWeapon)
+				{
+					s_manualCarryThrowWeapon = activeWeaponTag;
+					s_manualCarryThrowPhysicalAttackDown = physicalAttackDown;
+					s_manualInventoryThrowPhysicalUseDown = physicalUseDown;
+					s_manualInventoryThrowArmed = false;
+				}
+
+				uint32_t carryButtons = static_cast<uint32_t>(cmd->buttons);
+				carryButtons &= ~kManualCarryThrowWeaponMask;
+				if (carriedProp)
+				{
+					s_manualInventoryThrowArmed = false;
+					// Swallow only stock primary attack so physical trigger release
+					// controls the manual throw. IN_USE must remain untouched:
+					// gascans, cola bottles and scripted carry objectives rely on
+					// the game's native Use interaction.
+					carryButtons &= ~kManualCarryThrowIN_ATTACK;
+					if (!physicalAttackDown && s_manualCarryThrowPhysicalAttackDown)
+					{
+						carryButtons |= kManualCarryThrowIN_ATTACK;
+						const uint32_t encodedWeaponId = static_cast<uint32_t>(carryWeaponId + 1);
+						carryButtons |= (encodedWeaponId & 0x3Fu) << kManualCarryThrowWeaponShift;
+						Game::logMsg(
+							"[VR][ManualCarryThrow] client release cmd=%d weaponId=%d weapon=%s netclass=%s",
+							cmd->command_number,
+							carryWeaponId,
+							activeWeaponName ? activeWeaponName : "",
+							activeWeaponNetClass ? activeWeaponNetClass : "");
+					}
+				}
+				else
+				{
+					const bool triggerPressedAfterUse =
+						physicalAttackDown && !s_manualCarryThrowPhysicalAttackDown &&
+						physicalUseDown && s_manualInventoryThrowPhysicalUseDown;
+					if (!s_manualInventoryThrowArmed && triggerPressedAfterUse)
+						s_manualInventoryThrowArmed = true;
+
+					if (s_manualInventoryThrowArmed)
+					{
+						// Suppress the first trigger-down command too. This keeps
+						// molotov/pipe/vomitjar out of their stock attack state.
+						carryButtons &= ~(kManualCarryThrowIN_ATTACK | kManualInventoryThrowIN_USE);
+					}
+					if (s_manualInventoryThrowArmed &&
+						!physicalAttackDown && s_manualCarryThrowPhysicalAttackDown)
+					{
+						const uint32_t encodedWeaponId = static_cast<uint32_t>(activeWeaponId + 1);
+						carryButtons |= (encodedWeaponId & 0x3Fu) << kManualCarryThrowWeaponShift;
+						Game::logMsg(
+							"[VR][ManualInventoryThrow] client release cmd=%d weaponId=%d weapon=%s netclass=%s",
+							cmd->command_number,
+							activeWeaponId,
+							activeWeaponName ? activeWeaponName : "",
+							activeWeaponNetClass ? activeWeaponNetClass : "");
+						s_manualInventoryThrowArmed = false;
+					}
+				}
+				cmd->buttons = static_cast<int>(carryButtons);
+
+				s_manualCarryThrowPhysicalAttackDown = physicalAttackDown;
+				s_manualInventoryThrowPhysicalUseDown = physicalUseDown;
+			}
+		}
+
+		if (m_VR->m_ManualInventoryEmptyHandsActive.load(std::memory_order_acquire))
+		{
+			// The server repeats this filter authoritatively. Keeping the client
+			// command clean also prevents muzzle flash, recoil and reload animation
+			// from being predicted for the hidden placeholder pistol.
+			constexpr int kEmptyHandsIN_ATTACK = (1 << 0);
+			constexpr int kEmptyHandsIN_RELOAD = (1 << 13);
+			cmd->buttons &= ~(kEmptyHandsIN_ATTACK | kEmptyHandsIN_RELOAD);
+			s_manualInventoryThrowArmed = false;
+		}
+
+		// Publish the final command state after every helper has had a chance to
+		// suppress or synthesize IN_ATTACK. The render thread uses one atomic word
+		// so queued draws never observe a throwable/trigger mismatch.
+		constexpr uint32_t kManualThrowViewmodelThrowableActive = 1u << 0;
+		constexpr uint32_t kManualThrowViewmodelTriggerHeld = 1u << 1;
+		uint32_t manualThrowViewmodelInputState = 0u;
+		if (m_VR->m_IsVREnabled && m_VR->m_ManualThrowEnabled && localPlayerForAutoActions)
+		{
+			C_WeaponCSBase* manualThrowWeapon =
+				reinterpret_cast<C_WeaponCSBase*>(localPlayerForAutoActions->GetActiveWeapon());
+			const int manualThrowWeaponId = manualThrowWeapon
+				? static_cast<int>(manualThrowWeapon->GetWeaponID())
+				: static_cast<int>(C_WeaponCSBase::WeaponID::NONE);
+			const bool nativeThrowable = IsVRThrowableWeapon(manualThrowWeapon, nullptr, nullptr);
+			const bool inventoryThrowable = ManualInventoryThrowWeaponIdIsSupported(manualThrowWeaponId);
+			if (nativeThrowable || inventoryThrowable)
+			{
+				manualThrowViewmodelInputState |= kManualThrowViewmodelThrowableActive;
+				if ((nativeThrowable && (cmd->buttons & (1 << 0)) != 0) ||
+					(inventoryThrowable && s_manualInventoryThrowArmed))
+					manualThrowViewmodelInputState |= kManualThrowViewmodelTriggerHeld;
+			}
+		}
+		m_VR->m_ManualThrowViewmodelInputState.store(
+			manualThrowViewmodelInputState,
+			std::memory_order_release);
+	}
+
+	bool manualThrowPoseRelevant = false;
+	if (m_VR && m_VR->m_IsVREnabled && m_VR->m_ManualThrowEnabled &&
+		m_VR->m_EncodeVRUsercmd && !m_VR->m_ForceNonVRServerMovement &&
+		localPlayerForAutoActions)
+	{
+		C_BaseCombatWeapon* poseBaseWeapon = reinterpret_cast<C_BaseCombatWeapon*>(
+			localPlayerForAutoActions->GetActiveWeapon());
+		C_WeaponCSBase* poseWeapon = reinterpret_cast<C_WeaponCSBase*>(poseBaseWeapon);
+		const char* poseWeaponName = poseBaseWeapon ? poseBaseWeapon->GetName() : nullptr;
+		const char* poseWeaponNetClass = poseBaseWeapon
+			? m_Game->GetNetworkClassName(reinterpret_cast<uintptr_t*>(poseBaseWeapon))
+			: nullptr;
+		const int poseWeaponId = poseWeapon
+			? static_cast<int>(poseWeapon->GetWeaponID())
+			: static_cast<int>(C_WeaponCSBase::WeaponID::NONE);
+
+		manualThrowPoseRelevant =
+			IsVRThrowableWeapon(poseWeapon, poseWeaponName, poseWeaponNetClass) ||
+			ResolveVRManualCarryThrowWeaponId(
+				poseWeapon,
+				poseWeaponName,
+				poseWeaponNetClass) != static_cast<int>(C_WeaponCSBase::WeaponID::NONE) ||
+			ManualInventoryThrowWeaponIdIsSupported(poseWeaponId);
+	}
+	CacheManualThrowUsercmdControllerPose(
+		m_VR,
+		m_Game,
+		cmd->command_number,
+		manualThrowPoseRelevant);
+
+	if (m_Game && m_VR)
+		m_Game->PublishLocalVRPose(m_VR, localPlayerForAutoActions);
+
+	s_lastButtons = cmd->buttons;
+
+	return result;
+}
+

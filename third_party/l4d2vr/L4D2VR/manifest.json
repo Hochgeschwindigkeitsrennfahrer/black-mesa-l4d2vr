@@ -1,0 +1,24 @@
+{
+  "version": "1.0.3",
+  "changes": [
+    "Added adjustable multi-core rendering parameters to balance FPS gains against image stability.",
+    "Desktop mirror can now be disabled.",
+    "Added automatic compatibility for other servers without manual toggles.",
+    "Fixed -nohmd startup incorrectly waking SteamVR.",
+    "Fixed shadow and water reflection issues under multi-core rendering."
+  ],
+  "changesZh": [
+    "多核渲染新增可调参数，平衡帧率提升幅度与画面稳定性。",
+    "桌面镜像现在可以关闭。",
+    "加入其他服务器自动兼容，无需手动开关。",
+    "修复 -nohmd 启动时错误唤醒 SteamVR 的问题。",
+    "修复多核渲染下的阴影与水面反射错误。"
+  ],
+  "changesh": [
+    "多核渲染新增可调参数，平衡帧率提升幅度与画面稳定性。",
+    "桌面镜像现在可以关闭。",
+    "加入其他服务器自动兼容，无需手动开关。",
+    "修复 -nohmd 启动时错误唤醒 SteamVR 的问题。",
+    "修复多核渲染下的阴影与水面反射错误。"
+  ]
+}
