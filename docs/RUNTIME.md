@@ -196,6 +196,14 @@ G2: `controller_type` `hpmotioncontroller` (copy of Touch). WMR: `holographic_co
 
 After launch, `bmvr_log.txt` next to `bms.exe` and next to the loaded `d3d9.dll`.
 
+G2 left Y was Pause (`gameui_activate`). Log 2026-08-18: `Pause queued on CreateMove (gameui_activate)` then a new process (`VR config`). Same crash as Present-thread `ClientCmd`. Do not `gameui_activate` from any thread. Left Y/X are `invnext`. SteamVR may cache the old Pause bind until the user resets the layout.
+
+## Near fusion (HMD-aspect blit, 2026-08-18)
+
+Unbind blit is 2384×2160 `fmt=21` (`A8R8G8B8`) into private eye surfaces. Incoming engine fov stays 79.2; copies use 98.5. `GetViewModelFOV` hook (user: weapon size better) does not by itself fix world fusion.
+
+Both eyes share `_rt_FullFrameFB`. `StretchRect` is queued; the right-eye `RenderView` can overwrite that RT before the left copy lands, so both eyes submit the same image and near field cannot fuse. Fix: `D3DQUERYTYPE_EVENT` flush after each eye blit — not `WaitDeviceIdle` (`wait_idle` load crash). User-verified 2026-08-18: near fusion looks correct.
+
 ## Live debugging
 
 Use **x32dbg** (Black Mesa is 32-bit). Attach to `bms.exe` and check the path of loaded `d3d9.dll`. If it is `C:\Windows\System32\d3d9.dll`, our code is not running.

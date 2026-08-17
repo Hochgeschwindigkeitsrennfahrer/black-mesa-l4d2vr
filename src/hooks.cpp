@@ -580,11 +580,13 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         {
             s_hmdFbOnce = 1;
             bmvr::BeginRisky(L"hmd_fb");
-            Game::logMsg("Stereo HMD-fb begin setup=%dx%d unscaled=%dx%d stereoEye=%d eye=%dx%d fov=%.1f->%.1f aspect=%.3f->%.3f zNear=%.1f ipd=%.2f",
+            Game::logMsg("Stereo HMD-fb begin setup=%dx%d unscaled=%dx%d stereoEye=%d eye=%dx%d fov=%.1f->%.1f aspect=%.3f->%.3f zNear=%.1f ipd=%.2f L=(%.1f,%.1f,%.1f) R=(%.1f,%.1f,%.1f)",
                 setup.width, setup.height, setup.m_nUnscaledWidth, setup.m_nUnscaledHeight,
                 setup.m_eStereoEye, eyeW, eyeH,
                 setup.fov, leftEyeView.fov, setup.m_flAspectRatio, leftEyeView.m_flAspectRatio,
-                leftEyeView.zNear, ipd);
+                leftEyeView.zNear, ipd,
+                leftEyeView.origin.x, leftEyeView.origin.y, leftEyeView.origin.z,
+                rightEyeView.origin.x, rightEyeView.origin.y, rightEyeView.origin.z);
         }
 
         m_VR->m_DirectEyeSubmit = true;
@@ -669,8 +671,6 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
         m_Game->ClientCmd_Unrestricted("invnext");
     else if (m_Game && inv < 0)
         m_Game->ClientCmd_Unrestricted("invprev");
-    if (m_Game && m_VR->m_PendingPause.exchange(0, std::memory_order_acq_rel))
-        m_Game->ClientCmd_Unrestricted("gameui_activate");
     return result;
 }
 

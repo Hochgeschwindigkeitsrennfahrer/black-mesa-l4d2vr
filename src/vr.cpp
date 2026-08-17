@@ -648,8 +648,12 @@ void VR::ProcessInput()
         m_PendingInvDelta.store(-1, std::memory_order_release);
     if (pauseHeld && !s_pause)
     {
-        m_PendingPause.store(1, std::memory_order_release);
-        Game::logMsg("Pause queued on CreateMove (gameui_activate)");
+        static int s_pauseIgnore;
+        if (s_pauseIgnore < 4)
+        {
+            Game::logMsg("Ignoring Pause (gameui_activate crashes BM from CreateMove too, 2026-08-18)");
+            ++s_pauseIgnore;
+        }
     }
     if (resetHeld && !s_reset)
     {
@@ -957,6 +961,7 @@ void VR::ReleaseVRRenderTargetsForDeviceReset()
     ReleaseT(m_D9LeftEyeTexture);
     ReleaseT(m_D9RightEyeTexture);
     ReleaseT(m_D9FrameColorSurface);
+    ReleaseT(m_BlitEventQuery);
     m_LeftEyeTexture = nullptr;
     m_RightEyeTexture = nullptr;
     m_UsedNamedRenderTargets = false;
@@ -1201,9 +1206,53 @@ void VR::BeginStereoEyeBlit(IDirect3DSurface9* dst)
 bool VR::EndStereoEyeBlit()
 {
     const bool ok = m_StereoEyeBlitOk;
+    if (ok)
+        FlushStereoBlitGpu();
     m_StereoEyeBlitActive = false;
     m_StereoEyeBlitDest = nullptr;
     return ok;
+}
+
+void VR::FlushStereoBlitGpu()
+{
+    // Both eyes share _rt_FullFrameFB. StretchRect is queued; the right-eye
+    // RenderView overwrites that RT before the left copy lands, so both eyes
+    // submit the same image and near field cannot fuse. Event-query flush is
+    // not WaitDeviceIdle (that crash-skipped during load).
+    if (!g_D3DVR9)
+        return;
+    IDirect3DDevice9* device = nullptr;
+    if (FAILED(g_D3DVR9->GetD3DDevice(&device)) || !device)
+        return;
+    if (!m_BlitEventQuery)
+    {
+        if (FAILED(device->CreateQuery(D3DQUERYTYPE_EVENT, &m_BlitEventQuery)) || !m_BlitEventQuery)
+        {
+            static int s_qfail;
+            if (s_qfail < 3)
+            {
+                Game::logMsg("Stereo blit GPU event-query create failed");
+                ++s_qfail;
+            }
+            device->Release();
+            return;
+        }
+    }
+    m_BlitEventQuery->Issue(D3DISSUE_END);
+    HRESULT hr = S_FALSE;
+    for (int i = 0; i < 256; ++i)
+    {
+        hr = m_BlitEventQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH);
+        if (hr != S_FALSE)
+            break;
+    }
+    static int s_qok;
+    if (s_qok < 2)
+    {
+        Game::logMsg("Stereo blit GPU event-query flush hr=0x%08X", (unsigned)hr);
+        ++s_qok;
+    }
+    device->Release();
 }
 
 void VR::CaptureGameColorOnUnbind(IDirect3DSurface9* oldRt, uint32_t vpX, uint32_t vpY, uint32_t vpW, uint32_t vpH)
@@ -1221,8 +1270,6 @@ void VR::CaptureGameColorOnUnbind(IDirect3DSurface9* oldRt, uint32_t vpX, uint32
         return;
     if (oldRt == m_StereoEyeBlitDest || oldRt == m_D9LeftEyeSurface || oldRt == m_D9RightEyeSurface
         || oldRt == m_D9FrameColorSurface || oldRt == m_D9BlankSurface)
-        return;
-    if (m_StereoEyeBlitOk)
         return;
 
     UINT w = 0, h = 0;
@@ -1257,8 +1304,8 @@ void VR::CaptureGameColorOnUnbind(IDirect3DSurface9* oldRt, uint32_t vpX, uint32
         static int s_unbindBlitLog;
         if (s_unbindBlitLog < 8)
         {
-            Game::logMsg("Stereo unbind blit %ux%u fmt=%u -> eye (HMD-aspect G-buffer)",
-                w, h, (unsigned)desc.Format);
+            Game::logMsg("Stereo unbind blit eye=%d %ux%u fmt=%u src=%p dest=%p",
+                m_StereoEye, w, h, (unsigned)desc.Format, (void*)oldRt, (void*)m_StereoEyeBlitDest);
             ++s_unbindBlitLog;
         }
     }
@@ -1332,6 +1379,8 @@ bool VR::BlitCurrentGameColorTo(IDirect3DSurface9* dst)
                 w, h, cropW, cropH, (unsigned)hr, m_RenderWidth, m_RenderHeight);
             ++s_blitLog;
         }
+        if (ok)
+            FlushStereoBlitGpu();
     }
 
     if (rt0)

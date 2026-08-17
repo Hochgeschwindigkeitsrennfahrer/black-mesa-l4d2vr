@@ -199,7 +199,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/Pause"
+                     "output": "/actions/main/in/NextItem"
                   }
                },
                "mode": "button",

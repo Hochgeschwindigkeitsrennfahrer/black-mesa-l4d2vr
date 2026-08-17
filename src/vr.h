@@ -297,7 +297,6 @@ public:
     std::atomic<float> m_RotationOffsetY{ 0.f };
     std::atomic<uint32_t> m_PendingImpulse{ 0 };
     std::atomic<int> m_PendingInvDelta{ 0 };
-    std::atomic<uint32_t> m_PendingPause{ 0 };
     bool m_PressedTurn = false;
     bool m_StereoEyesDrawnThisFrame = false;
     // 0 = mono, 1 = left, 2 = right. Matches Source StereoEye_t.
@@ -394,6 +393,8 @@ private:
     void ApplyVulkanYFlip(vr::VRTextureBounds_t& bounds);
     void RefreshIpdFromHmd();
     void GetViewBasis(Vector* forward, Vector* right, Vector* up) const;
+    IDirect3DQuery9* m_BlitEventQuery = nullptr;
+    void FlushStereoBlitGpu();
     UINT KnownWindowWidth() const;
     UINT KnownWindowHeight() const;
     static bool ResolveSurfaceSize(IDirect3DSurface9* surf, UINT& w, UINT& h, D3DSURFACE_DESC* outDesc = nullptr);
