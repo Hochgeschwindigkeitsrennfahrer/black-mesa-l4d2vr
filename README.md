@@ -18,10 +18,11 @@ Sources live in `src/`. The `L4D2VR/` folder is only include shims so DXVK can `
 | Installed | Yes — next to `bms.exe`, `bin\`, and the DXVK folder |
 | Launched with this DLL | Yes |
 | Runtime-initialized | Yes |
-| Head tracking | Yes — relative look on a RenderView copy (`-oldgameui`) |
-| Rendering in headset | Yes — 16:9 capture Submit, both eyes the same (`-oldgameui`) |
+| Head tracking | User-verified with fused stereo (L4D2VR/Portal2 HMD on view copies + `SetViewAngles` + CreateMove) |
+| Rendering in headset | Yes — fused stereo Submit (`-oldgameui`) |
 | Load / headset-off freeze | Yes — `WaitGetPoses` on a pose-waiter thread (user-verified 2026-08-16) |
-| Stereo | User-verified fused 1584×1440 double RenderView (`-oldgameui`). Was upside-down from a Vulkan v-flip on that blit; flip removed. **Upright not verified this build.** |
+| Stereo | User-verified fused **1584×1440**. OpenVR recommended (~2544×2480) is **not** the default: first stereo at that size crashed. Raise `VR\config.txt` `RenderScale` (restart) to step up; cap is recommended size. |
+| Motion controllers | Implemented this build (SteamVR action manifest, G2/`hpmotioncontroller` + WMR/Touch/Knuckles copies). **Not user-verified.** |
 | Gameplay in headset | Yes with `-oldgameui`. New game UI is upside-down / black after load. |
 
 Acceptance is **visible fused Black Mesa gameplay in the headset**.
@@ -80,6 +81,14 @@ Proof the new DLL loaded: `Black Mesa\bmvr_log.txt` appears **this session** (an
 4. Launch Black Mesa from Steam. Prefer Vulkan/DXVK in the launcher, or `-enabledxvk`.
 5. Confirm `bmvr_log.txt` starts with `BMVR d3d9.dll loaded`.
 6. Look in the headset. Do not treat compile/load/tracking as success.
+
+## Resolution and controllers
+
+`scripts\install.ps1` copies `VR\SteamVRActionManifest` next to `bms.exe` and creates `VR\config.txt` if it is missing (existing config is kept).
+
+- **RenderScale** (restart required): `1.0` is the verified 1584×1440 HMD-aspect fit. `1.25` / `1.5` scale toward OpenVR recommended. Full native (~2544) crashed on first stereo; do not set that as the default.
+- **HP Reverb G2**: default bindings are `hpmotioncontroller` (and `holographic_controller` if SteamVR reports WMR). Same layout as Touch: left stick walk, right stick turn, right trigger attack, left trigger alt-fire, right B use, right A jump, right grip crouch, left grip reload, left-stick click recenter, right-stick click flashlight (via `CUserCmd` impulse, not Present `ClientCmd`). Left menu / Y is unbound — `gameui_activate` and scoreboard crashed BM.
+- If sticks do nothing, SteamVR Bindings for **Black Mesa** / this app — confirm the G2 layout is the default we installed. Log lines: `SetActionManifestPath … err=0`, `UpdateActionState err=0`, `VR input walk=`.
 
 If the game exits while trying an L4D2VR mechanism, relaunch: crash-sticky `bmvr_in_*.flag` and durable `bmvr_skip.txt` next to `bms.exe` disable only that attempt.
 

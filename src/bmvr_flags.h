@@ -19,6 +19,7 @@ namespace bmvr
 
     bool TryHmdSwapchain();
     bool TryHmdFramebuffer();
+    bool TryHmdNative();
     bool TryNamedRenderTargets();
     bool TryNamedStereoWrap();
     bool TryStereoRenderView();
@@ -37,7 +38,8 @@ namespace bmvr
     void BeginRisky(const wchar_t* name);
     void EndRisky(const wchar_t* name);
 
-    // Fit HMD aspect into the desktop window (16-aligned). ApplyHmdAspectBackbuffer
+    // L4D2VR/Portal2: G-buffer = OpenVR recommended size. Window-fit is only
+    // the fallback if recommended size crash-stickies. ApplyHmdAspectBackbuffer
     // rewrites the windowed D3D backbuffer to that size. GetScreenSize must
     // return the same values or HUD composite uses 16:9 CViewSetup on HMD RTs.
     void ComputeHmdFramebufferSize(uint32_t recW, uint32_t recH, uint32_t winW, uint32_t winH, float projAspect);
@@ -50,4 +52,8 @@ namespace bmvr
     extern uint32_t g_FramebufferWidth;
     extern uint32_t g_FramebufferHeight;
     extern bool g_OpenVRInitedFromCreateDevice;
+    extern float g_RenderScale;
+    extern float g_TurnSpeed;
+    extern bool g_SnapTurning;
+    extern float g_SnapTurnAngle;
 }

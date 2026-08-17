@@ -58,6 +58,7 @@ typedef void(__thiscall* tVgui_Paint)(void* thisptr, int mode);
 typedef void(__thiscall* tGetBackBufferDimensions)(void* thisptr, int& width, int& height);
 typedef void(__thiscall* tGetScreenSize)(void* thisptr, int& width, int& height);
 typedef ITexture*(__thiscall* tCreateNamedRTEx)(void* thisptr, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags);
+typedef float(__thiscall* tGetViewModelFOV)(void* thisptr);
 
 class Hooks
 {
@@ -81,6 +82,7 @@ public:
     static inline Hook<tGetBackBufferDimensions> hkGetBackBufferDimensions;
     static inline Hook<tGetScreenSize> hkGetScreenSize;
     static inline Hook<tCreateNamedRTEx> hkCreateNamedRTEx;
+    static inline Hook<tGetViewModelFOV> hkGetViewModelFOV;
 
     Hooks() = default;
     explicit Hooks(Game* game);
@@ -104,4 +106,5 @@ public:
     static void __fastcall dGetBackBufferDimensions(void* ecx, void* edx, int& width, int& height);
     static void __fastcall dGetScreenSize(void* ecx, void* edx, int& width, int& height);
     static ITexture* __fastcall dCreateNamedRTEx(void* ecx, void* edx, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags);
+    static float __fastcall dGetViewModelFOV(void* ecx, void* edx);
 };

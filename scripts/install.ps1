@@ -60,6 +60,26 @@ Install-One $BinDir
 # 3) Next to bms.exe — L4D2VR-style, and AddDllDirectory(game root)
 Install-One $GameRoot
 
+$VrSrc = Join-Path $Root "VR"
+$VrDst = Join-Path $GameRoot "VR"
+if (-not (Test-Path $VrSrc)) { throw "Missing $VrSrc" }
+New-Item -ItemType Directory -Force -Path $VrDst | Out-Null
+$ManifestSrc = Join-Path $VrSrc "SteamVRActionManifest"
+$ManifestDst = Join-Path $VrDst "SteamVRActionManifest"
+if (Test-Path $ManifestDst) {
+  Remove-Item -Recurse -Force $ManifestDst
+}
+Copy-Item -Recurse -Force $ManifestSrc $ManifestDst
+$CfgSrc = Join-Path $VrSrc "config.txt"
+$CfgDst = Join-Path $VrDst "config.txt"
+if (-not (Test-Path $CfgDst)) {
+  Copy-Item -Force $CfgSrc $CfgDst
+  Write-Host "Installed $CfgDst (edit RenderScale here; restart to apply)"
+} else {
+  Write-Host "Kept existing $CfgDst"
+}
+Write-Host "Installed SteamVR bindings to $ManifestDst"
+
 # Stock dxvk.conf sets deviceLossOnFocusLoss=True and overrides our built-in
 # bms.exe profile (False). Steam verify restores the stock file.
 $DxvkConf = Join-Path $DxvkDir "dxvk.conf"

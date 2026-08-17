@@ -2,6 +2,7 @@
 
 #include <cstdarg>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -14,11 +15,16 @@ namespace bmvr
     uint32_t g_FramebufferWidth = 0;
     uint32_t g_FramebufferHeight = 0;
     bool g_OpenVRInitedFromCreateDevice = false;
+    float g_RenderScale = 1.f;
+    float g_TurnSpeed = 0.25f;
+    bool g_SnapTurning = false;
+    float g_SnapTurnAngle = 45.f;
 
     static HMODULE g_Module = nullptr;
     static std::mutex g_LogMutex;
     static bool g_TryHmdSwapchain = true;
     static bool g_TryHmdFramebuffer = true;
+    static bool g_TryHmdNative = true;
     static bool g_TryNamedRT = true;
     static bool g_TryNamedStereoWrap = false;
     static bool g_TryStereoRV = true;
@@ -60,6 +66,11 @@ namespace bmvr
         return full.substr(0, slash);
     }
 
+    static std::wstring SkipPath()
+    {
+        return ExeDir() + L"\\bmvr_skip.txt";
+    }
+
     static std::vector<std::wstring> FlagDirs()
     {
         std::vector<std::wstring> dirs;
@@ -96,9 +107,61 @@ namespace bmvr
             WriteUtf8File(dir + L"\\" + fileName, text, append);
     }
 
-    static std::wstring SkipPath()
+    static void ReadUserConfig(const std::wstring& path)
     {
-        return ExeDir() + L"\\bmvr_skip.txt";
+        FILE* f = nullptr;
+        _wfopen_s(&f, path.c_str(), L"r");
+        if (!f)
+            return;
+        char line[256];
+        while (fgets(line, sizeof(line), f))
+        {
+            char* n = line;
+            while (*n == ' ' || *n == '\t')
+                ++n;
+            if (*n == '#' || *n == '\r' || *n == '\n' || !*n)
+                continue;
+            char* eq = strchr(n, '=');
+            if (!eq)
+                continue;
+            *eq = 0;
+            char* val = eq + 1;
+            for (char* p = n + strlen(n); p > n && (p[-1] == ' ' || p[-1] == '\t'); --p)
+                p[-1] = 0;
+            while (*val == ' ' || *val == '\t')
+                ++val;
+            for (char* p = val; *p; ++p)
+            {
+                if (*p == '\r' || *p == '\n' || *p == '#')
+                {
+                    *p = 0;
+                    break;
+                }
+            }
+            if (std::strcmp(n, "RenderScale") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= 0.5f && s <= 2.0f)
+                    g_RenderScale = s;
+            }
+            else if (std::strcmp(n, "TurnSpeed") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= 0.01f && s <= 5.f)
+                    g_TurnSpeed = s;
+            }
+            else if (std::strcmp(n, "SnapTurning") == 0)
+                g_SnapTurning = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "SnapTurnAngle") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= 10.f && s <= 180.f)
+                    g_SnapTurnAngle = s;
+            }
+        }
+        fclose(f);
+        Log("VR config %ls RenderScale=%.2f TurnSpeed=%.2f snap=%d",
+            path.c_str(), g_RenderScale, g_TurnSpeed, g_SnapTurning ? 1 : 0);
     }
 
     static void ApplySkipName(const std::string& name, const char* via)
@@ -107,6 +170,8 @@ namespace bmvr
             g_TryHmdSwapchain = false;
         else if (name == "hmd_fb")
             g_TryHmdFramebuffer = false;
+        else if (name == "hmd_native")
+            g_TryHmdNative = false;
         else if (name == "named_rt")
             g_TryNamedRT = false;
         else if (name == "stereo_rv")
@@ -333,9 +398,11 @@ namespace bmvr
             return;
         g_Inited = true;
         StartWatchdog();
+        ReadUserConfig(ExeDir() + L"\\VR\\config.txt");
         ReadSkipFile(SkipPath());
         ReadSkipFile(ModuleDir() + L"\\bmvr_skip.txt");
         ConsumeIfStuck(L"hmd_swap", g_TryHmdSwapchain, "hmd_swap", "HMD-sized swapchain");
+        ConsumeIfStuck(L"hmd_native", g_TryHmdNative, "hmd_native", "L4D2VR recommended G-buffer size");
         // Last launch: 8 pass-through 1584 RenderViews (zNear=7) succeeded,
         // then stereo wrote 1440 into CViewSetup+0x1C (m_eStereoEye on BM).
         // RenderView indexes this+0x744 by that field. Do not disable hmd_fb.
@@ -373,6 +440,7 @@ namespace bmvr
 
     bool TryHmdSwapchain() { return g_TryHmdSwapchain; }
     bool TryHmdFramebuffer() { return g_TryHmdFramebuffer; }
+    bool TryHmdNative() { return g_TryHmdNative; }
     bool TryNamedRenderTargets() { return g_TryNamedRT; }
     bool TryNamedStereoWrap() { return g_TryNamedStereoWrap; }
     bool TryStereoRenderView() { return g_TryStereoRV; }
@@ -426,6 +494,32 @@ namespace bmvr
     {
         if (recW < 640 || recH < 360)
             return;
+
+        // L4D2VR/Portal2: m_RenderWidth/Height = GetRecommendedRenderTargetSize().
+        // Named RTs at that size died on BM (PushRT NULL = backbuffer). Matching
+        // G-buffer + swapchain is the equivalent. HWND stays the desktop window.
+        // Exclusive 3k hmd_swap blacked the desktop; this path stays windowed.
+        // Crash-sticky hmd_native falls back to fitting HMD aspect in the window.
+        if (g_TryHmdNative)
+        {
+            uint32_t eyeW = (recW + 15u) & ~15u;
+            uint32_t eyeH = (recH + 15u) & ~15u;
+            if (eyeW >= 640 && eyeH >= 360)
+            {
+                static bool s_stampedNative;
+                if (!s_stampedNative)
+                {
+                    s_stampedNative = true;
+                    BeginRisky(L"hmd_native");
+                    Log("HMD native G-buffer %ux%u (OpenVR recommended %ux%u, window %ux%u)",
+                        eyeW, eyeH, recW, recH, winW, winH);
+                }
+                g_FramebufferWidth = eyeW;
+                g_FramebufferHeight = eyeH;
+                return;
+            }
+        }
+
         if (winW < 640)
             winW = recW;
         if (winH < 360)
@@ -454,6 +548,26 @@ namespace bmvr
         // rounded even) is 1576%16=8. Menu 2D survived; first 3D/HUD did not.
         eyeW = (eyeW + 15u) & ~15u;
         eyeH = (eyeH + 15u) & ~15u;
+        if (g_RenderScale > 1.001f || g_RenderScale < 0.999f)
+        {
+            uint32_t scaledW = (static_cast<uint32_t>(static_cast<float>(eyeW) * g_RenderScale + 0.5f) + 15u) & ~15u;
+            uint32_t scaledH = (static_cast<uint32_t>(static_cast<float>(eyeH) * g_RenderScale + 0.5f) + 15u) & ~15u;
+            const uint32_t recAlignW = (recW + 15u) & ~15u;
+            const uint32_t recAlignH = (recH + 15u) & ~15u;
+            if (scaledW > recAlignW)
+                scaledW = recAlignW;
+            if (scaledH > recAlignH)
+                scaledH = recAlignH;
+            if (scaledW >= 640 && scaledH >= 360)
+            {
+                Log("RenderScale %.2f G-buffer %ux%u -> %ux%u (OpenVR rec %ux%u)",
+                    g_RenderScale, eyeW, eyeH, scaledW, scaledH, recW, recH);
+                if (scaledW >= 2400 || scaledH >= 2400)
+                    Log("RenderScale size is near the 2544 first-stereo crash. Lower RenderScale if this launch dies.");
+                eyeW = scaledW;
+                eyeH = scaledH;
+            }
+        }
         g_FramebufferWidth = eyeW;
         g_FramebufferHeight = eyeH;
     }

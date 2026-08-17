@@ -1,0 +1,12 @@
+# Black Mesa VR — L4D2VR/Portal 2 style settings.
+# Restart the game after changing RenderScale (swapchain size is picked at CreateDevice).
+
+# Multiplier on the working HMD-aspect fit (1584x1440 on a 1440p window).
+# 1.0 = verified fused gameplay. 1.25 / 1.5 scale toward OpenVR recommended.
+# Capped at the headset recommended size. Full native (hmd_native) crashed on first stereo.
+RenderScale=1.0
+
+# Portal 2 VR / L4D2VR right-stick look. Degrees per ms at full deflection for smooth turn.
+TurnSpeed=0.25
+SnapTurning=false
+SnapTurnAngle=45.0

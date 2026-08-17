@@ -61,6 +61,11 @@ public:
     Offset CalcViewModelView{ "client.dll", 0x29D930,
         "55 8B EC 83 EC 24 53 56 8B 75 08 57 8B F9 85 F6" };
 
+    // IClientMode slot 32. Reads viewmodel_fov_override then weapon GetViewModelFOV
+    // (~54). That is why console fov does not change gun/near scale in VR.
+    Offset GetViewModelFOV{ "client.dll", 0x216510,
+        "55 8B EC 51 8B 0D ? ? ? ? 81 F9 ? ? ? ? 75 16 F3 0F 10 0D" };
+
     Offset AdjustEngineViewport{ "client.dll", 0x1102C0,
         "C2 10 00 CC CC CC CC CC CC CC CC CC CC CC CC CC B0 01 C2 08 00" };
 

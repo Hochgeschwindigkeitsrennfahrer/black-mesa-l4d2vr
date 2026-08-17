@@ -133,6 +133,8 @@ Cause (static + this log, not another named-RT wrap):
 
 **Headset fusion (2026-08-17, user-verified):** after the `m_eStereoEye` fix, stereo at 1584×1440 **fuses**. Image was upside-down. Cause: direct HMD-aspect Submit applied `ApplyVulkanYFlip` on projection UVs. The same `StretchRect`→`TransferSurface` capture path is upright with `{0,0,1,1}` and no v-flip (old UI). Do not Y-flip that blit for Vulkan. Per-frame `Stereo HMD-fb left/right RenderView` logs were flushing twice a frame (~12 FPS); throttled.
 
+**L4D2VR/Portal2 look + recommended size (2026-08-17, crashed):** fused HMD-aspect stereo made relative look cancel against physical head motion. This retry used L4D2VR angles on copies plus `SetViewAngles`/`CreateMove`, and OpenVR recommended G-buffer **2544×2480**. Menu ~90 FPS and **8/8 pass-through** `setup=2544x2480 zNear=7` succeeded. Log stopped there — no `Stereo HMD-fb begin`, no `Applied Portal 2 VR perf cvars`. First stereo frame ran `ClientCmd_Unrestricted("mat_queue_mode 0;…")` *before* that log. Portal 2 sets those as **launch options**, not from `RenderView`. Same first-stereo crash bundle previously included forcing `zNear=6` / viewmodel FOV. Do not ClientCmd cvars from RenderView. Keep engine zNear. Native G-buffer itself survived pass-through.
+
 ## Verified fail: absolute HMD on live CViewSetup (`abs_view`)
 
 2026-08-16: load logo submitted (`eL=0`). After ~90 Submits we wrote HMD yaw/pitch onto the live `CViewSetup`. On `bm_c0a0b` the tram camera was `ang=(4.6, 96.5)` and became HMD `(-0.5, 14.7)` — looking off the train into unlit void. Headset went black; logo had been visible because look/crop only started after load. Durable skip: `abs_view`. L4D2VR applies HMD only on stereo view copies, not the caller’s setup.
@@ -167,9 +169,30 @@ Stock `bin\thirdparty\dxvk-windows-x86\dxvk.conf` still has `d3d9.deviceLossOnFo
 
 Black Mesa's **new** game UI is upside-down in the HMD and the world stays black after the load screen. **`-oldgameui`** shows an upright menu and the actual game in the headset. Do not Y-flip the 2D capture path to chase the new UI — that would invert the working old UI. New UI is a different RT / Y origin; leave it.
 
-## Relative look (`rel_look`)
+## Head look (L4D2VR / Portal 2)
 
-Head tracking cannot move the desktop unless the **rendered** camera changes. Absolute HMD on the live `CViewSetup` (`abs_view`) is still skipped. This retry adds **relative** yaw/pitch (`HMD - latched`) onto a **copy** passed to the single `RenderView` on real maps only. Origin is unchanged (tram camera stays). Desktop and headset both show the offset because they share that one view. CreateMove stays unhooked. Crash-sticky `bmvr_in_rel_look.flag`. User confirmed head tracking works (2026-08-16) with `-oldgameui`.
+Head tracking cannot move the desktop unless the **rendered** camera changes. Absolute HMD on the live `CViewSetup` (`abs_view`) is still skipped — that replaced the tram camera and blacked the headset. L4D2VR/Portal2 write HMD yaw/pitch and eye origin on **stereo copies** plus `IEngineClient::SetViewAngles` and CreateMove `viewangles`. Relative look (`HMD - latched` on the copy) is what fused stereo made feel broken: the world rotated with the headset. Crash-sticky `bmvr_in_rel_look.flag` is cleared after the 8 pass-through frames. CreateMove is hooked but is a no-op on `background*` maps.
+
+## Confirmed fused gameplay (2026-08-17 evening)
+
+User-verified fused stereo on `bm_c1a0a` at **1584×1440**, `zNear=7`, `direct=1`. `hmd_native` (2544×2480) stayed skipped.
+
+Log issues on that session (addressed in the following build, not re-verified):
+
+- `OpenVR submit … eL=108 eR=108` = `VRCompositorError_AlreadySubmitted`. BM issues many main-sized `RenderView`s per Present; each ran a full double eye `RenderView` + Submit. Stereo is now **once per Present**; extra main views pass through.
+- `Stereo HMD-fb enter` was unthrottled (one line per extra `RenderView`). Throttled to the first few.
+- Present ~42 then ~24 FPS, `WaitGetPoses dt=110ms`, `poseAge=62ms` — extra stereo Submit was a large part of that.
+- Analog walk existed in CreateMove but `m_ProcessInputEnabled` stayed false and no SteamVR action manifest was loaded.
+
+## RenderScale (`VR\config.txt`)
+
+L4D2VR/Portal2 use OpenVR recommended size. On BM that size died on first stereo (`hmd_native`). Default `RenderScale=1.0` keeps the verified window-fit. Values above 1.0 multiply that fit, 16-align, and cap at recommended. Restart after edits. `hmd_native` remains skip-file disabled.
+
+## SteamVR controllers (L4D2VR/Portal2 actions)
+
+`SetActionManifestPath` → `Black Mesa\VR\SteamVRActionManifest\action_manifest.json`. `UpdateActionState` after `WaitGetPoses` on the pose-waiter thread. CreateMove applies Walk (`forwardmove`/`sidemove` ×450) and held `IN_USE`/`IN_ATTACK`/etc. Right stick adds `m_RotationOffsetY` to HMD yaw (Portal 2 `TurnSpeed`).
+
+G2: `controller_type` `hpmotioncontroller` (copy of Touch). WMR: `holographic_controller`. Also Touch, Knuckles, Cosmos, Vive.
 
 After launch, `bmvr_log.txt` next to `bms.exe` and next to the loaded `d3d9.dll`.
 

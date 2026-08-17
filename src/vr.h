@@ -56,8 +56,9 @@ public:
     vr::IVROverlay* m_Overlay = nullptr;
     vr::IVRCompositor* m_Compositor = nullptr;
 
-    // Eye / capture size. HMD-sized swapchain is skipped on BM (black desktop).
-    // With hmd_fb this is HMD aspect fitted into the 16:9 window (G-buffer size).
+    // Eye / G-buffer size. L4D2VR uses OpenVR recommended size. Named RTs at
+    // that size died on BM, so the blit path matches G-buffer to recommended
+    // (hmd_native) or fits HMD aspect in the window if that crash-stickies.
     uint32_t m_RenderWidth = 0;
     uint32_t m_RenderHeight = 0;
     uint32_t m_AntiAliasing = 0;
@@ -66,6 +67,7 @@ public:
     float m_VRScale = 39.37f;
     float m_Ipd = 0.063f;
     float m_IpdScale = 1.0f;
+    float m_EyeZ = 0.0f;
 
     Vector m_HmdForward{};
     Vector m_HmdRight{};
@@ -269,6 +271,39 @@ public:
     float m_PrevAppliedHmdPitch = 0.f;
     bool m_SoftPitchLook = false;
     bool m_ProcessInputEnabled = false;
+    std::atomic<bool> m_ActionsReady{ false };
+    vr::VRActionSetHandle_t m_ActionSet = vr::k_ulInvalidActionSetHandle;
+    vr::VRActionSetHandle_t m_BaseActionSet = vr::k_ulInvalidActionSetHandle;
+    vr::VRActiveActionSet_t m_ActiveActionSets[2]{};
+    vr::VRActionHandle_t m_ActionJump = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionPrimaryAttack = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionSecondaryAttack = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionReload = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionUse = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionWalk = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionTurn = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionBooleanTurnLeft = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionBooleanTurnRight = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionNextItem = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionPrevItem = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionResetPosition = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionCrouch = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionFlashlight = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionScoreboard = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionPause = vr::k_ulInvalidActionHandle;
+    std::atomic<float> m_WalkForward{ 0.f };
+    std::atomic<float> m_WalkSide{ 0.f };
+    std::atomic<uint32_t> m_HeldButtons{ 0 };
+    std::atomic<float> m_RotationOffsetY{ 0.f };
+    std::atomic<uint32_t> m_PendingImpulse{ 0 };
+    std::atomic<int> m_PendingInvDelta{ 0 };
+    std::atomic<uint32_t> m_PendingPause{ 0 };
+    bool m_PressedTurn = false;
+    bool m_StereoEyesDrawnThisFrame = false;
+    // 0 = mono, 1 = left, 2 = right. Matches Source StereoEye_t.
+    int m_StereoEye = 0;
+    bool m_HasStereoBodyOrigin = false;
+    Vector m_StereoBodyOrigin{};
     bool m_RoomscaleActive = false;
     bool m_StereoCopyOffset = false;
     bool m_SeenGameplay = false;
@@ -277,6 +312,7 @@ public:
     uint32_t m_PresentTick = 0;
     uint32_t m_EligiblePresents = 0;
     uint32_t m_PassThroughMainViews = 0;
+    bool m_AppliedVrPerfCvars = false;
     std::string m_CurrentMapName;
     bool m_FrameCopyLatched = false;
     uint32_t m_FrameCopyWidth = 0;
@@ -305,11 +341,14 @@ public:
     void SubmitVRTextures();
     void WaitPosesForStereoFrame();
     Vector GetViewAngle() const;
-    Vector GetViewOriginLeft(const Vector& setupOrigin, const Vector& viewRight) const;
-    Vector GetViewOriginRight(const Vector& setupOrigin, const Vector& viewRight) const;
+    Vector GetViewOrigin(const Vector& setupOrigin) const;
+    Vector GetViewOriginLeft(const Vector& setupOrigin) const;
+    Vector GetViewOriginRight(const Vector& setupOrigin) const;
     float HorizontalFovForAspect(float targetAspect) const;
     void CaptureFrameBeforePresent();
     bool BlitCurrentGameColorTo(IDirect3DSurface9* dst);
+    void BeginStereoEyeBlit(IDirect3DSurface9* dst);
+    bool EndStereoEyeBlit();
     void CaptureGameColorOnUnbind(IDirect3DSurface9* oldRt, uint32_t vpX, uint32_t vpY, uint32_t vpW, uint32_t vpH);
     void ReleaseVRRenderTargetsForDeviceReset();
     bool RefreshBackBufferTexture(bool forceRefresh = false);
@@ -333,8 +372,15 @@ public:
     bool NamedStereoReady() const;
     bool EnsureStereoEyeSurfaces();
     bool StereoEyesReady() const;
+    void ProcessInput();
+    uint32_t HeldButtons() const { return m_HeldButtons.load(std::memory_order_acquire); }
 
 private:
+    void SetActionManifest();
+    bool GetDigitalActionData(vr::VRActionHandle_t handle, vr::InputDigitalActionData_t& out) const;
+    bool GetAnalogActionData(vr::VRActionHandle_t handle, vr::InputAnalogActionData_t& out) const;
+    bool PressedDigitalAction(vr::VRActionHandle_t handle, bool onChanged = false) const;
+    void ApplyTurnStick(float stickX, float deltaMs);
     static bool IsGameplayMapName(const char* map);
     void PollMapFromEngine();
     bool InitOpenVR();
@@ -347,7 +393,14 @@ private:
     bool FillSharedTexture(IDirect3DSurface9* surface, SharedTextureHolder& holder);
     void ApplyVulkanYFlip(vr::VRTextureBounds_t& bounds);
     void RefreshIpdFromHmd();
+    void GetViewBasis(Vector* forward, Vector* right, Vector* up) const;
     UINT KnownWindowWidth() const;
     UINT KnownWindowHeight() const;
     static bool ResolveSurfaceSize(IDirect3DSurface9* surf, UINT& w, UINT& h, D3DSURFACE_DESC* outDesc = nullptr);
+
+    IDirect3DSurface9* m_StereoEyeBlitDest = nullptr;
+    bool m_StereoEyeBlitActive = false;
+    bool m_StereoEyeBlitOk = false;
+    uint32_t m_LastStereoBlitWidth = 0;
+    uint32_t m_LastStereoBlitHeight = 0;
 };

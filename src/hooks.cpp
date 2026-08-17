@@ -5,6 +5,7 @@
 #include "offsets.h"
 #include "bmvr_flags.h"
 #include "sigscanner.h"
+#include "in_buttons.h"
 #include <Windows.h>
 #include <cmath>
 #include <cstdint>
@@ -48,6 +49,7 @@ Hooks::Hooks(Game* game)
     enableIfReady(hkLevelInit, "LevelInit");
     enableIfReady(hkLevelShutdown, "LevelShutdown");
     enableIfReady(hkCalcViewModelView, "CalcViewModelView");
+    enableIfReady(hkGetViewModelFOV, "GetViewModelFOV");
 }
 
 Hooks::~Hooks()
@@ -63,9 +65,15 @@ int Hooks::initSourceHooks()
         hkGetRenderTarget.createHook((LPVOID)o.GetRenderTarget.address, &dGetRenderTarget);
     if (o.RenderView.valid)
         hkRenderView.createHook((LPVOID)o.RenderView.address, &dRenderView);
-    // CreateMove trampoline on background01 coincided with a 17s crash after
-    // the first menu Submit. Look is applied in RenderView (CViewSetup).
-    // LevelInit MinHook crashed inside the original on background01.
+    // Portal 2 VR / L4D2VR: CreateMove writes HMD viewangles. Only mutate
+    // cmds on gameplay maps — a previous trampoline on background01 coincided
+    // with a 17s crash after the first menu Submit.
+    if (o.CreateMove.valid)
+        hkCreateMove.createHook((LPVOID)o.CreateMove.address, &dCreateMove);
+    if (o.CalcViewModelView.valid)
+        hkCalcViewModelView.createHook((LPVOID)o.CalcViewModelView.address, &dCalcViewModelView);
+    if (o.GetViewModelFOV.valid)
+        hkGetViewModelFOV.createHook((LPVOID)o.GetViewModelFOV.address, &dGetViewModelFOV);
     if (o.AdjustEngineViewport.valid)
         hkAdjustEngineViewport.createHook((LPVOID)o.AdjustEngineViewport.address, &dAdjustEngineViewport);
     if (o.Viewport.valid)
@@ -297,11 +305,13 @@ namespace
         view.m_nUnscaledHeight = eyeHeight;
         // m_eStereoEye stays MONO (0). It lives at 0x1C on BM; stuffing the
         // eye height there made RenderView index this+0x744+1440 and crash.
-        const float pixelAspect = (eyeHeight > 0) ? (static_cast<float>(eyeWidth) / static_cast<float>(eyeHeight)) : vr->m_Aspect;
-        view.m_flAspectRatio = pixelAspect;
-        view.fov = vr->HorizontalFovForAspect(pixelAspect);
-        // Keep engine viewmodel FOV / zNear. Pass-through used zNear=7;
-        // L4D2's zNear=6 is not required now that the G-buffer is HMD-sized.
+        // Match world FOV on the viewmodel frustum (L4D2VR / Portal 2). BM's
+        // GetViewModelFOV still returns viewmodel_fov_override (~54) unless
+        // hooked — that is the huge doubled gun. Do not force zNear=6; that
+        // bundle died on the first stereo RenderView (2026-08-17).
+        view.m_flAspectRatio = vr->m_Aspect;
+        view.fov = vr->m_Fov;
+        view.fovViewmodel = vr->m_Fov;
     }
 
     void ClampStereoViewport(int& x, int& y, int& width, int& height)
@@ -327,7 +337,9 @@ namespace
             return;
         }
         // HMD-aspect G-buffer: engine may still pass the 16:9 window as the
-        // main view. Do not clamp 8K CSM / flashlight targets.
+        // main view. Do not clamp 8K CSM / flashlight targets. Forcing every
+        // 640x360+ viewport to eye size (Portal 2 dGetViewport) is not safe
+        // on BM — first stereo after that change died before the stereo log.
         if (bmvr::TryHmdFramebuffer() && Hooks::m_VR->IsGameplayEligible()
             && height >= eyeH - 16 && height <= eyeH + 16 && width > eyeW
             && width <= eyeW * 2)
@@ -394,41 +406,42 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
 
     const bool mainView = setup.width >= 640 && setup.height >= 360;
 
-    auto wrap180 = [](float a) {
-        while (a > 180.f) a -= 360.f;
-        while (a < -180.f) a += 360.f;
-        return a;
-    };
+    if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible())
+        m_VR->WaitPosesForStereoFrame();
 
-    auto applyRelativeLook = [&](CViewSetup& view) {
-        if (!m_VR || !bmvr::TryRelativeHmdLook() || !m_VR->m_HmdPoseValid || !m_VR->m_HmdOriginLatched)
+    // L4D2VR/Portal2: HMD angles + origin on a COPY. Writing the same values
+    // onto the live CViewSetup is abs_view (tram camera blacked).
+    // Do not SetViewAngles from RenderView — L4D2VR only does that in
+    // mat_queue_mode 0 and restores. Permanent overwrite + CreateMove HMD
+    // angles fights interpolation (rubberband). CreateMove already writes
+    // cmd->viewangles.
+    auto applyL4d2VrHead = [&](CViewSetup& view, bool stereo, bool leftEye) {
+        if (!m_VR || !m_VR->m_HmdPoseValid)
             return;
-        view.angles.y += wrap180(m_VR->m_HmdAngAbs.y - m_VR->m_HmdAngAbsZero.y);
-        float pitch = view.angles.x + wrap180(m_VR->m_HmdAngAbs.x - m_VR->m_HmdAngAbsZero.x);
-        if (pitch > 89.f) pitch = 89.f;
-        if (pitch < -89.f) pitch = -89.f;
-        view.angles.x = pitch;
+        view.angles = m_VR->GetViewAngle();
+        if (stereo)
+            view.origin = leftEye ? m_VR->GetViewOriginLeft(setup.origin)
+                                  : m_VR->GetViewOriginRight(setup.origin);
+        else
+            view.origin = m_VR->GetViewOrigin(setup.origin);
     };
 
     auto passThrough = [&]() {
-        if (m_VR)
+        if (m_VR && !m_VR->m_StereoEyesDrawnThisFrame)
         {
             m_VR->m_DirectEyeSubmit = false;
             m_VR->m_StereoRenderViewActive = false;
         }
-        // Relative yaw/pitch on a copy. Absolute HMD on the live setup
-        // replaced the tram camera and blacked the headset (abs_view).
-        // Desktop will move: capture submits this same RenderView.
-        if (m_VR && bmvr::TryRelativeHmdLook() && m_VR->IsGameplayEligible()
-            && mainView && m_VR->m_HmdPoseValid && m_VR->m_HmdOriginLatched)
+        if (m_VR && m_VR->IsGameplayEligible()
+            && mainView && m_VR->m_HmdPoseValid)
         {
             CViewSetup vrView = setup;
-            applyRelativeLook(vrView);
+            applyL4d2VrHead(vrView, false, true);
 
             static int s_relLog;
             if (s_relLog < 4)
             {
-                Game::logMsg("Relative look copy engine=(%.1f,%.1f) hmd=(%.1f,%.1f) out=(%.1f,%.1f)",
+                Game::logMsg("L4D2VR look copy engine=(%.1f,%.1f) hmd=(%.1f,%.1f) out=(%.1f,%.1f)",
                     setup.angles.x, setup.angles.y,
                     m_VR->m_HmdAngAbs.x, m_VR->m_HmdAngAbs.y,
                     vrView.angles.x, vrView.angles.y);
@@ -440,7 +453,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 bmvr::BeginRisky(L"rel_look");
             callOriginal(vrView, nClearFlags, whatToDraw);
             ++s_relFrames;
-            if (s_relFrames == 120)
+            if (s_relFrames == 8)
                 bmvr::EndRisky(L"rel_look");
             return;
         }
@@ -522,18 +535,42 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         && fovOk
         && m_VR->StereoEyesReady())
     {
+        if (m_VR->m_StereoEyesDrawnThisFrame)
+        {
+            // L4D2VR replaces the one player view with two eye draws. Extra
+            // same-size RenderViews were full world passes (perf) and
+            // passThrough cleared DirectEyeSubmit. Reflections/CSM stay.
+            const int eyeW = static_cast<int>(m_VR->m_RenderWidth);
+            const int eyeH = static_cast<int>(m_VR->m_RenderHeight);
+            const bool sameFb = abs(setup.width - eyeW) <= 16 && abs(setup.height - eyeH) <= 16;
+            if (sameFb)
+            {
+                static int s_skipDup;
+                if (s_skipDup < 8)
+                {
+                    Game::logMsg("Skip duplicate main RenderView after stereo %dx%d",
+                        setup.width, setup.height);
+                    ++s_skipDup;
+                }
+                return;
+            }
+            callOriginal(setup, nClearFlags, whatToDraw);
+            return;
+        }
+        m_VR->m_StereoEyesDrawnThisFrame = true;
+        static int s_enterLog;
+        if (s_enterLog < 4)
+        {
+            Game::logMsg("Stereo HMD-fb enter setup=%dx%d fov=%.1f zNear=%.1f",
+                setup.width, setup.height, setup.fov, setup.zNear);
+            ++s_enterLog;
+        }
         CViewSetup leftEyeView = setup;
         CViewSetup rightEyeView = setup;
         NormalizeViewSetupForVREye(leftEyeView, m_VR);
         NormalizeViewSetupForVREye(rightEyeView, m_VR);
-        applyRelativeLook(leftEyeView);
-        applyRelativeLook(rightEyeView);
-
-        QAngle lookAng(leftEyeView.angles.x, leftEyeView.angles.y, leftEyeView.angles.z);
-        Vector right{};
-        QAngle::AngleVectors(lookAng, nullptr, &right, nullptr);
-        leftEyeView.origin = m_VR->GetViewOriginLeft(setup.origin, right);
-        rightEyeView.origin = m_VR->GetViewOriginRight(setup.origin, right);
+        applyL4d2VrHead(leftEyeView, true, true);
+        applyL4d2VrHead(rightEyeView, true, false);
         const float ipd = m_VR->m_Ipd * m_VR->m_IpdScale * m_VR->m_VRScale;
         const int eyeW = static_cast<int>(m_VR->m_RenderWidth);
         const int eyeH = static_cast<int>(m_VR->m_RenderHeight);
@@ -560,15 +597,25 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             Game::logMsg("Stereo HMD-fb left RenderView %dx%d", eyeW, eyeH);
             ++s_eyeRvLog;
         }
+        m_VR->m_StereoBodyOrigin = setup.origin;
+        m_VR->m_HasStereoBodyOrigin = true;
+        m_VR->m_StereoEye = 1;
+        m_VR->BeginStereoEyeBlit(m_VR->m_D9LeftEyeSurface);
         callOriginal(leftEyeView, nClearFlags, whatToDraw);
-        m_VR->BlitCurrentGameColorTo(m_VR->m_D9LeftEyeSurface);
+        if (!m_VR->EndStereoEyeBlit())
+            m_VR->BlitCurrentGameColorTo(m_VR->m_D9LeftEyeSurface);
         if (s_eyeRvLog < 8)
         {
             Game::logMsg("Stereo HMD-fb right RenderView %dx%d", eyeW, eyeH);
             ++s_eyeRvLog;
         }
+        m_VR->m_StereoEye = 2;
+        m_VR->BeginStereoEyeBlit(m_VR->m_D9RightEyeSurface);
         callOriginal(rightEyeView, nClearFlags, whatToDraw);
-        m_VR->BlitCurrentGameColorTo(m_VR->m_D9RightEyeSurface);
+        if (!m_VR->EndStereoEyeBlit())
+            m_VR->BlitCurrentGameColorTo(m_VR->m_D9RightEyeSurface);
+        m_VR->m_StereoEye = 0;
+        m_VR->m_HasStereoBodyOrigin = false;
 
         m_VR->m_RenderedNewFrame.store(true, std::memory_order_release);
 
@@ -598,44 +645,32 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
     if (!m_VR || !m_VR->m_IsVREnabled || !cmd->command_number)
         return result;
 
-    if (m_VR->m_SafeLookActive && m_VR->m_HmdPoseValid && m_VR->m_LookApplyEnabled)
+    // Portal 2 VR: cmd->viewangles = HMD + stick yaw. Only on real maps (not background*).
+    if (m_VR->IsGameplayEligible() && m_VR->m_HmdPoseValid)
     {
-        auto wrap180 = [](float a) {
-            while (a > 180.f) a -= 360.f;
-            while (a < -180.f) a += 360.f;
-            return a;
-        };
-        auto clampAbs = [](float v, float lim) {
-            if (v > lim) return lim;
-            if (v < -lim) return -lim;
-            return v;
-        };
-
-        float dyaw = wrap180(m_VR->m_HmdAngAbs.y - m_VR->m_PrevAppliedHmdYaw);
-        if (fabsf(dyaw) > 0.01f)
-            cmd->viewangles.y += dyaw;
-        m_VR->m_PrevAppliedHmdYaw = m_VR->m_HmdAngAbs.y;
-
-        if (m_VR->m_SoftPitchLook)
-        {
-            float dpitch = wrap180(m_VR->m_HmdAngAbs.x - m_VR->m_PrevAppliedHmdPitch);
-            dpitch = clampAbs(dpitch, 2.0f);
-            if (fabsf(dpitch) > 0.01f)
-            {
-                cmd->viewangles.x += dpitch;
-                if (cmd->viewangles.x > 89.f) cmd->viewangles.x = 89.f;
-                if (cmd->viewangles.x < -89.f) cmd->viewangles.x = -89.f;
-            }
-            m_VR->m_PrevAppliedHmdPitch = m_VR->m_HmdAngAbs.x;
-        }
+        const Vector va = m_VR->GetViewAngle();
+        cmd->viewangles.Init(va.x, va.y, va.z);
     }
 
     if (!m_VR->m_ProcessInputEnabled)
         return result;
 
     const float maxSpeed = 450.f;
-    cmd->forwardmove += m_Game->m_AnalogForward * maxSpeed;
-    cmd->sidemove += m_Game->m_AnalogSide * maxSpeed;
+    const float forward = m_VR->m_WalkForward.load(std::memory_order_acquire);
+    const float side = m_VR->m_WalkSide.load(std::memory_order_acquire);
+    cmd->forwardmove += forward * maxSpeed;
+    cmd->sidemove += side * maxSpeed;
+    cmd->buttons |= static_cast<int>(m_VR->HeldButtons());
+    const uint32_t impulse = m_VR->m_PendingImpulse.exchange(0, std::memory_order_acq_rel);
+    if (impulse)
+        cmd->impulse = static_cast<byte>(impulse);
+    const int inv = m_VR->m_PendingInvDelta.exchange(0, std::memory_order_acq_rel);
+    if (m_Game && inv > 0)
+        m_Game->ClientCmd_Unrestricted("invnext");
+    else if (m_Game && inv < 0)
+        m_Game->ClientCmd_Unrestricted("invprev");
+    if (m_Game && m_VR->m_PendingPause.exchange(0, std::memory_order_acq_rel))
+        m_Game->ClientCmd_Unrestricted("gameui_activate");
     return result;
 }
 
@@ -660,8 +695,35 @@ void __fastcall Hooks::dLevelShutdown(void* ecx, void* edx)
 void __fastcall Hooks::dCalcViewModelView(void* ecx, void* edx, void* owner, const Vector& eyePosition, const QAngle& eyeAngles)
 {
     (void)edx;
-    if (hkCalcViewModelView.fOriginal)
-        hkCalcViewModelView.fOriginal(ecx, owner, eyePosition, eyeAngles);
+    if (!hkCalcViewModelView.fOriginal)
+        return;
+    if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible() && m_VR->m_HmdPoseValid)
+    {
+        // Use the original player-eye origin, not CViewSetup.origin after IPD.
+        // Feeding GetViewOriginLeft(already-left-eye) doubled IPD and drew two
+        // huge guns (2026-08-17).
+        const Vector body = m_VR->m_HasStereoBodyOrigin ? m_VR->m_StereoBodyOrigin : eyePosition;
+        Vector origin = m_VR->GetViewOrigin(body);
+        if (m_VR->m_StereoEye == 1)
+            origin = m_VR->GetViewOriginLeft(body);
+        else if (m_VR->m_StereoEye == 2)
+            origin = m_VR->GetViewOriginRight(body);
+        const Vector va = m_VR->GetViewAngle();
+        QAngle ang(va.x, va.y, va.z);
+        hkCalcViewModelView.fOriginal(ecx, owner, origin, ang);
+        return;
+    }
+    hkCalcViewModelView.fOriginal(ecx, owner, eyePosition, eyeAngles);
+}
+
+float __fastcall Hooks::dGetViewModelFOV(void* ecx, void* edx)
+{
+    (void)edx;
+    if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible() && m_VR->m_Fov > 10.f)
+        return m_VR->m_Fov;
+    if (hkGetViewModelFOV.fOriginal)
+        return hkGetViewModelFOV.fOriginal(ecx);
+    return 54.f;
 }
 
 void __fastcall Hooks::dAdjustEngineViewport(void* ecx, void* edx, int& x, int& y, int& width, int& height)
