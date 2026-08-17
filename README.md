@@ -22,7 +22,7 @@ Sources live in `src/`. The `L4D2VR/` folder is only include shims so DXVK can `
 | Rendering in headset | Yes — fused stereo Submit (`-oldgameui`) |
 | Load / headset-off freeze | Yes — `WaitGetPoses` on a pose-waiter thread (user-verified 2026-08-16) |
 | Stereo | User-verified fused **1584×1440**. OpenVR recommended (~2544×2480) is **not** the default: first stereo at that size crashed. Raise `VR\config.txt` `RenderScale` (restart) to step up; cap is recommended size. |
-| Motion controllers | Implemented this build (SteamVR action manifest, G2/`hpmotioncontroller` + WMR/Touch/Knuckles copies). **Not user-verified.** |
+| Motion controllers | User-verified 2026-08-18: uncoupled viewmodel + controller aiming (sd805/Portal 2). No custom hands/reload/dual-wield. |
 | Gameplay in headset | Yes with `-oldgameui`. New game UI is upside-down / black after load. |
 
 Acceptance is **visible fused Black Mesa gameplay in the headset**.
@@ -57,6 +57,14 @@ Win32 only. From a Developer PowerShell or with VS 2022 Build Tools:
 
 Output: `build\Release\d3d9.dll`
 
+Drag-and-drop zip (DLL in all three load paths, `VR\`, SteamVR bindings, resolution notes):
+
+```powershell
+.\scripts\pack_release.ps1
+```
+
+Output: `dist\Black-Mesa-VR-drop-in.zip` — copy the folder contents into `Steam\steamapps\common\Black Mesa` (next to `bms.exe`). Read `BMVR_README.txt` in the zip for launch options and `RenderScale`.
+
 ## Install
 
 **Quit Black Mesa first.** `scripts\install.ps1` will stop `bms.exe` if it is still running, because Windows will not replace a mapped DLL.
@@ -87,7 +95,8 @@ Proof the new DLL loaded: `Black Mesa\bmvr_log.txt` appears **this session** (an
 `scripts\install.ps1` copies `VR\SteamVRActionManifest` next to `bms.exe` and creates `VR\config.txt` if it is missing (existing config is kept).
 
 - **RenderScale** (restart required): `1.0` is the verified 1584×1440 HMD-aspect fit. `1.25` / `1.5` scale toward OpenVR recommended. Full native (~2544) crashed on first stereo; do not set that as the default.
-- **HP Reverb G2**: default bindings are `hpmotioncontroller` (and `holographic_controller` if SteamVR reports WMR). Same layout as Touch: left stick walk, right stick turn, right trigger attack, left trigger alt-fire, right B use, right A jump, right grip crouch, left grip reload, left-stick click recenter, right-stick click flashlight (via `CUserCmd` impulse, not Present `ClientCmd`). Left Y and X are next weapon (`invnext`). Pause is unbound — `gameui_activate` crashed BM from both Present and CreateMove.
+- **HP Reverb G2**: default bindings are `hpmotioncontroller` (and `holographic_controller` if SteamVR reports WMR). Same layout as Touch: left stick walk, right stick turn, right trigger attack, left trigger alt-fire, right B use, right A jump, right grip crouch, left grip reload, left-stick click recenter, right-stick click flashlight (via `CUserCmd` impulse, not Present `ClientCmd`). Left Y next weapon / left X previous weapon via `CUserCmd::weaponselect` — not `invnext`. Pause is unbound — `gameui_activate` and `invnext` both crashed BM from CreateMove.
+- **Uncoupled gun / motion aim** (sd805 L4D2VR + Portal 2 VR, not keyou91 hands): `CalcViewModelView` places the first-person weapon at the right controller. CreateMove aims with the controller; the headset still drives the camera. Stick walk stays look-relative. Bullets still spawn from the eyes until a `Weapon_ShootPosition` hook exists. Tune `ViewmodelPosOffset*` / `ControllerPitchTilt` in `VR\config.txt` (restart after edits; config is read at DLL load). Existing `config.txt` is kept on install — missing keys use the DLL defaults (16, 3, −2 and −35°).
 - If sticks do nothing, SteamVR Bindings for **Black Mesa** / this app — confirm the G2 layout is the default we installed. Log lines: `SetActionManifestPath … err=0`, `UpdateActionState err=0`, `VR input walk=`.
 
 If the game exits while trying an L4D2VR mechanism, relaunch: crash-sticky `bmvr_in_*.flag` and durable `bmvr_skip.txt` next to `bms.exe` disable only that attempt.

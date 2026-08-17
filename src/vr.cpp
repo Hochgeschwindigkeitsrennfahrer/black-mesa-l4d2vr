@@ -65,6 +65,31 @@ namespace
         return ang;
     }
 
+    QAngle HmdMatrixToSourceAnglesWithRoll(const vr::HmdMatrix34_t& mat)
+    {
+        QAngle ang;
+        ang.x = asinf(mat.m[1][2]) * (180.0f / 3.141592654f);
+        ang.y = atan2f(mat.m[0][2], mat.m[2][2]) * (180.0f / 3.141592654f);
+        ang.z = atan2f(-mat.m[1][0], mat.m[1][1]) * (180.0f / 3.141592654f);
+        return ang;
+    }
+
+    float WrapYaw(float yaw)
+    {
+        return yaw - 360.f * floorf((yaw + 180.f) / 360.f);
+    }
+
+    void PivotYaw(Vector& delta, float yawDeg)
+    {
+        const float rad = yawDeg * (3.14159265f / 180.f);
+        const float s = sinf(rad);
+        const float c = cosf(rad);
+        const float nx = delta.x * c - delta.y * s;
+        const float ny = delta.x * s + delta.y * c;
+        delta.x = nx;
+        delta.y = ny;
+    }
+
     Vector HmdMatrixToSourcePos(const vr::HmdMatrix34_t& mat, float scale)
     {
         Vector pos;
@@ -643,9 +668,15 @@ void VR::ProcessInput()
         Game::logMsg("Flashlight queued on CreateMove (impulse 100)");
     }
     if (nextHeld && !s_next)
+    {
         m_PendingInvDelta.store(1, std::memory_order_release);
+        Game::logMsg("NextItem queued on CreateMove (weaponselect, not invnext)");
+    }
     if (prevHeld && !s_prevItem)
+    {
         m_PendingInvDelta.store(-1, std::memory_order_release);
+        Game::logMsg("PrevItem queued on CreateMove (weaponselect, not invprev)");
+    }
     if (pauseHeld && !s_pause)
     {
         static int s_pauseIgnore;
@@ -829,6 +860,100 @@ Vector VR::GetViewOriginRight(const Vector& setupOrigin) const
     Vector fwd, right, up;
     GetViewBasis(&fwd, &right, &up);
     return GetViewOrigin(setupOrigin) + (right * ((m_Ipd * m_IpdScale * m_VRScale) * 0.5f));
+}
+
+Vector VR::GetRightControllerAbsPos(const Vector& eyePosition) const
+{
+    // Portal 2: gun = player eye + (controller - HMD) in tracking space.
+    // With our latched 6DOF camera, that is eye + (controller - hmdZero).
+    Vector delta = m_HmdOriginLatched
+        ? (m_RightControllerPosAbs - m_HmdPosAbsZero)
+        : (m_RightControllerPosAbs - m_HmdPosAbs);
+    PivotYaw(delta, m_RotationOffsetY.load(std::memory_order_acquire));
+    return eyePosition + delta;
+}
+
+QAngle VR::GetRightControllerAbsAngle() const
+{
+    return m_RightControllerAngAbs;
+}
+
+Vector VR::GetRecommendedViewmodelAbsPos(const Vector& eyePosition) const
+{
+    Vector viewmodelPos = GetRightControllerAbsPos(eyePosition);
+    viewmodelPos -= m_ViewmodelForward * bmvr::g_ViewmodelPosOffsetX;
+    viewmodelPos -= m_ViewmodelRight * bmvr::g_ViewmodelPosOffsetY;
+    viewmodelPos -= m_ViewmodelUp * bmvr::g_ViewmodelPosOffsetZ;
+    return viewmodelPos;
+}
+
+QAngle VR::GetRecommendedViewmodelAbsAngle() const
+{
+    QAngle result{};
+    QAngle::VectorAngles(m_ViewmodelForward, m_ViewmodelUp, result);
+    return result;
+}
+
+void VR::UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose)
+{
+    m_ControllerPoseValid = false;
+    if (!m_System)
+        return;
+
+    const vr::TrackedDeviceIndex_t rightIdx =
+        m_System->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+    if (rightIdx == vr::k_unTrackedDeviceIndexInvalid || rightIdx >= vr::k_unMaxTrackedDeviceCount)
+        return;
+
+    vr::TrackedDevicePose_t rightPose{};
+    {
+        std::lock_guard<std::mutex> lock(m_PoseMutex);
+        rightPose = m_WaitedPoses[rightIdx];
+    }
+    if (!rightPose.bPoseIsValid || !rightPose.bDeviceIsConnected)
+        return;
+
+    (void)hmdPose;
+    m_RightControllerPosAbs = HmdMatrixToSourcePos(rightPose.mDeviceToAbsoluteTracking, m_VRScale);
+    QAngle ang = HmdMatrixToSourceAnglesWithRoll(rightPose.mDeviceToAbsoluteTracking);
+    if (!std::isfinite(ang.x) || !std::isfinite(ang.y) || !std::isfinite(ang.z))
+        return;
+    ang.y = WrapYaw(ang.y + m_RotationOffsetY.load(std::memory_order_acquire));
+
+    Vector fwd, right, up;
+    QAngle::AngleVectors(ang, &fwd, &right, &up);
+    const float tilt = bmvr::g_ControllerPitchTilt;
+    if (tilt != 0.f)
+    {
+        fwd = VectorRotate(fwd, right, tilt);
+        up = VectorRotate(up, right, tilt);
+    }
+    QAngle::VectorAngles(fwd, up, m_RightControllerAngAbs);
+    m_RightControllerAngAbs.y = WrapYaw(m_RightControllerAngAbs.y);
+    m_RightControllerForward = fwd;
+    m_RightControllerRight = right;
+    m_RightControllerUp = up;
+
+    m_ViewmodelForward = fwd;
+    m_ViewmodelRight = right;
+    m_ViewmodelUp = up;
+    m_ViewmodelForward = VectorRotate(m_ViewmodelForward, m_ViewmodelUp, bmvr::g_ViewmodelAngOffsetY);
+    m_ViewmodelRight = VectorRotate(m_ViewmodelRight, m_ViewmodelUp, bmvr::g_ViewmodelAngOffsetY);
+    m_ViewmodelForward = VectorRotate(m_ViewmodelForward, m_ViewmodelRight, bmvr::g_ViewmodelAngOffsetX);
+    m_ViewmodelUp = VectorRotate(m_ViewmodelUp, m_ViewmodelRight, bmvr::g_ViewmodelAngOffsetX);
+    m_ViewmodelRight = VectorRotate(m_ViewmodelRight, m_ViewmodelForward, bmvr::g_ViewmodelAngOffsetZ);
+    m_ViewmodelUp = VectorRotate(m_ViewmodelUp, m_ViewmodelForward, bmvr::g_ViewmodelAngOffsetZ);
+
+    m_ControllerPoseValid = true;
+    static int s_ctrlLog;
+    if (s_ctrlLog < 4)
+    {
+        Game::logMsg("Right controller tracking pos=(%.1f,%.1f,%.1f) ang=(%.1f,%.1f,%.1f) tilt=%.1f",
+            m_RightControllerPosAbs.x, m_RightControllerPosAbs.y, m_RightControllerPosAbs.z,
+            m_RightControllerAngAbs.x, m_RightControllerAngAbs.y, m_RightControllerAngAbs.z,
+            tilt);
+        ++s_ctrlLog;
+    }
 }
 
 float VR::HorizontalFovForAspect(float targetAspect) const
@@ -1782,6 +1907,7 @@ void VR::UpdateTracking()
     QAngle::AngleVectors(m_HmdAngAbs, &m_HmdForward, &m_HmdRight, &m_HmdUp);
     m_HmdPoseValid = true;
     RefreshIpdFromHmd();
+    UpdateControllerTracking(hmd);
 
     if (m_GameplayEligible)
     {

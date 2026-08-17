@@ -1,0 +1,54 @@
+# Build a drag-and-drop zip: extract / copy into the Black Mesa folder (next to bms.exe).
+$ErrorActionPreference = "Stop"
+$Root = Split-Path -Parent $PSScriptRoot
+$Dll = Join-Path $Root "build\Release\d3d9.dll"
+if (-not (Test-Path $Dll)) { throw "Build d3d9.dll first (scripts\build.ps1)" }
+
+$OpenVrSrc = Join-Path $Root "third_party\openvr\lib\win32\openvr_api.dll"
+$SteamVrOvr = "C:\Program Files (x86)\Steam\steamapps\common\SteamVR\bin\win32\openvr_api.dll"
+# Prefer SteamVR's 32-bit OpenVR next to the DLL (AGENTS.md). Repo copy is fallback.
+if (Test-Path $SteamVrOvr) { $OpenVrSrc = $SteamVrOvr }
+if (-not (Test-Path $OpenVrSrc)) { throw "openvr_api.dll not found (SteamVR win32 or third_party/openvr)" }
+
+$VrSrc = Join-Path $Root "VR"
+$ReadmeSrc = Join-Path $Root "packaging\BMVR_README.txt"
+if (-not (Test-Path $VrSrc)) { throw "Missing $VrSrc" }
+if (-not (Test-Path $ReadmeSrc)) { throw "Missing $ReadmeSrc" }
+
+$Dist = Join-Path $Root "dist"
+$Stage = Join-Path $Dist "drop-into-Black-Mesa-folder"
+$Zip = Join-Path $Dist "Black-Mesa-VR-drop-in.zip"
+New-Item -ItemType Directory -Force -Path $Dist | Out-Null
+if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
+if (Test-Path $Zip) { Remove-Item -Force $Zip }
+New-Item -ItemType Directory -Force -Path $Stage | Out-Null
+
+Copy-Item -Force $ReadmeSrc (Join-Path $Stage "BMVR_README.txt")
+Copy-Item -Force $Dll (Join-Path $Stage "d3d9.dll")
+Copy-Item -Force $OpenVrSrc (Join-Path $Stage "openvr_api.dll")
+
+$Bin = Join-Path $Stage "bin"
+$Dxvk = Join-Path $Bin "thirdparty\dxvk-windows-x86"
+New-Item -ItemType Directory -Force -Path $Dxvk | Out-Null
+Copy-Item -Force $Dll (Join-Path $Bin "d3d9.dll")
+Copy-Item -Force $OpenVrSrc (Join-Path $Bin "openvr_api.dll")
+Copy-Item -Force $Dll (Join-Path $Dxvk "d3d9.dll")
+Copy-Item -Force $OpenVrSrc (Join-Path $Dxvk "openvr_api.dll")
+@"
+d3d9.deferSurfaceCreation = True
+d3d9.deviceLossOnFocusLoss = False
+"@ | Set-Content -LiteralPath (Join-Path $Dxvk "dxvk.conf") -Encoding ASCII
+
+$VrDst = Join-Path $Stage "VR"
+New-Item -ItemType Directory -Force -Path $VrDst | Out-Null
+Copy-Item -Force (Join-Path $VrSrc "config.txt") (Join-Path $VrDst "config.txt")
+Copy-Item -Recurse -Force (Join-Path $VrSrc "SteamVRActionManifest") (Join-Path $VrDst "SteamVRActionManifest")
+
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[System.IO.Compression.ZipFile]::CreateFromDirectory($Stage, $Zip, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+
+$dllBytes = (Get-Item $Dll).Length
+$zipBytes = (Get-Item $Zip).Length
+Write-Host ("Packed {0} ({1} bytes, d3d9.dll {2} bytes)" -f $Zip, $zipBytes, $dllBytes)
+Write-Host "Copy the contents of drop-into-Black-Mesa-folder into Steam\\steamapps\\common\\Black Mesa"
+Write-Host "Or extract the zip and copy that same folder's contents."

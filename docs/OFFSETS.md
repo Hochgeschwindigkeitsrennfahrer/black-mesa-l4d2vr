@@ -7,6 +7,7 @@ Install: `C:\Program Files (x86)\Steam\steamapps\common\Black Mesa`
 | RenderView | client.dll | `0x20EE40` | MATCH | `IViewRender` slot 6 of `CBlackMesaViewRender` (`ret 0xC`, 3-arg `CViewSetup&`). Old `0x207730` is a float-arg helper, not RenderView. |
 | g_pClientMode | client.dll | `0x16AD56` | MATCH | `0x16AD56` |
 | CreateMove | client.dll | `0x110310` | MATCH | `0x110310` |
+| m_hMyWeapons | client.dll | `0xEE4` | MATCH | `DT_BaseCombatCharacter` RecvTable `FUN_100a3de0`, count `0x30`. `m_hActiveWeapon` at `0xFA4`. |
 | CalcViewModelView | client.dll | `0x29D930` | MATCH | `0x29D930` |
 | AdjustEngineViewport | client.dll | `0x1102C0` | MATCH | `0x1102C0` |
 | LevelInit | client.dll | `0x110A80` | MATCH | `0x110A80` |

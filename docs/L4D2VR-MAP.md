@@ -29,7 +29,7 @@ L4D2VR: two `RenderView` calls with per-eye `CViewSetup` into named eye RTs.
 
 BMVR: **retry that** with BM’s 3-arg `RenderView` (`client.dll+0x207730`). Nested/offscreen calls pass through. If the process dies, `bmvr_in_stereo_rv.flag` falls back to one RenderView + horizontal crop of a captured frame.
 
-Look: relative yaw in `CreateMove` after LevelInit gate (reject `background*`). Absolute HMD into `CViewSetup` is retried on the stereo path only (not `cmd->viewangles`).
+Look: HMD yaw/pitch on stereo `CViewSetup` copies after LevelInit gate (reject `background*`). Absolute HMD on the live setup is skipped (`abs_view`). CreateMove writes controller `viewangles` for aiming when the right hand tracks; analog walk is remapped to stay HMD-relative. Viewmodel is uncoupled via `CalcViewModelView` (sd805 / Portal 2).
 
 ## Getting the game image
 

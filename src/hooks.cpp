@@ -65,9 +65,10 @@ int Hooks::initSourceHooks()
         hkGetRenderTarget.createHook((LPVOID)o.GetRenderTarget.address, &dGetRenderTarget);
     if (o.RenderView.valid)
         hkRenderView.createHook((LPVOID)o.RenderView.address, &dRenderView);
-    // Portal 2 VR / L4D2VR: CreateMove writes HMD viewangles. Only mutate
-    // cmds on gameplay maps — a previous trampoline on background01 coincided
-    // with a 17s crash after the first menu Submit.
+    // Portal 2 VR: CreateMove writes viewangles. Camera stays HMD on the
+    // RenderView copies. Only mutate cmds on gameplay maps — a previous
+    // trampoline on background01 coincided with a 17s crash after the first
+    // menu Submit.
     if (o.CreateMove.valid)
         hkCreateMove.createHook((LPVOID)o.CreateMove.address, &dCreateMove);
     if (o.CalcViewModelView.valid)
@@ -647,30 +648,65 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
     if (!m_VR || !m_VR->m_IsVREnabled || !cmd->command_number)
         return result;
 
-    // Portal 2 VR: cmd->viewangles = HMD + stick yaw. Only on real maps (not background*).
+    // Camera stays HMD on RenderView copies. Shooting uses controller
+    // viewangles (sd805 FireTerrorBullets / Portal 2 EyeAngles-around-fire).
+    // BM has no FireTerror / Weapon_ShootPosition yet, so cmd viewangles is
+    // the aim. Stick walk stays HMD-relative by rotating analog into the
+    // controller yaw frame. Do not hook EyePosition (that would move the camera).
     if (m_VR->IsGameplayEligible() && m_VR->m_HmdPoseValid)
     {
-        const Vector va = m_VR->GetViewAngle();
-        cmd->viewangles.Init(va.x, va.y, va.z);
+        const Vector hmdVa = m_VR->GetViewAngle();
+        if (m_VR->m_ControllerPoseValid)
+        {
+            QAngle aim = m_VR->GetRightControllerAbsAngle();
+            if (aim.x > 180.f) aim.x -= 360.f;
+            if (aim.x < -180.f) aim.x += 360.f;
+            if (aim.x > 89.f) aim.x = 89.f;
+            if (aim.x < -89.f) aim.x = -89.f;
+            cmd->viewangles.Init(aim.x, aim.y, 0.f);
+        }
+        else
+            cmd->viewangles.Init(hmdVa.x, hmdVa.y, 0.f);
     }
 
     if (!m_VR->m_ProcessInputEnabled)
         return result;
 
     const float maxSpeed = 450.f;
-    const float forward = m_VR->m_WalkForward.load(std::memory_order_acquire);
-    const float side = m_VR->m_WalkSide.load(std::memory_order_acquire);
-    cmd->forwardmove += forward * maxSpeed;
-    cmd->sidemove += side * maxSpeed;
+    const float analogF = m_VR->m_WalkForward.load(std::memory_order_acquire) * maxSpeed;
+    const float analogS = m_VR->m_WalkSide.load(std::memory_order_acquire) * maxSpeed;
+    if (m_VR->m_ControllerPoseValid && m_VR->m_HmdPoseValid)
+    {
+        const Vector hmdVa = m_VR->GetViewAngle();
+        const QAngle aim = m_VR->GetRightControllerAbsAngle();
+        Vector hmdF, hmdR, hmdU, cF, cR, cU;
+        QAngle::AngleVectors(QAngle(0.f, hmdVa.y, 0.f), &hmdF, &hmdR, &hmdU);
+        QAngle::AngleVectors(QAngle(0.f, aim.y, 0.f), &cF, &cR, &cU);
+        const Vector wish = hmdF * analogF + hmdR * analogS;
+        cmd->forwardmove += DotProduct2D(wish, cF);
+        cmd->sidemove += DotProduct2D(wish, cR);
+    }
+    else
+    {
+        cmd->forwardmove += analogF;
+        cmd->sidemove += analogS;
+    }
     cmd->buttons |= static_cast<int>(m_VR->HeldButtons());
     const uint32_t impulse = m_VR->m_PendingImpulse.exchange(0, std::memory_order_acq_rel);
     if (impulse)
         cmd->impulse = static_cast<byte>(impulse);
     const int inv = m_VR->m_PendingInvDelta.exchange(0, std::memory_order_acq_rel);
-    if (m_Game && inv > 0)
-        m_Game->ClientCmd_Unrestricted("invnext");
-    else if (m_Game && inv < 0)
-        m_Game->ClientCmd_Unrestricted("invprev");
+    if (inv != 0 && m_Game)
+    {
+        const int weap = m_Game->CycleWeaponSelect(inv > 0 ? 1 : -1);
+        if (weap > 0)
+        {
+            cmd->weaponselect = weap;
+            Game::logMsg("Weapon cycle via CUserCmd weaponselect=%d dir=%d", weap, inv);
+        }
+        else
+            Game::logMsg("Weapon cycle skipped (no other weapon) dir=%d", inv);
+    }
     return result;
 }
 
@@ -699,15 +735,24 @@ void __fastcall Hooks::dCalcViewModelView(void* ecx, void* edx, void* owner, con
         return;
     if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible() && m_VR->m_HmdPoseValid)
     {
-        // Use the original player-eye origin, not CViewSetup.origin after IPD.
-        // Feeding GetViewOriginLeft(already-left-eye) doubled IPD and drew two
-        // huge guns (2026-08-17).
+        // Uncoupled viewmodel: same world pose both eyes (sd805 / Portal 2).
+        // Do not IPD the gun — that drew two weapons (2026-08-17).
         const Vector body = m_VR->m_HasStereoBodyOrigin ? m_VR->m_StereoBodyOrigin : eyePosition;
+        if (m_VR->m_ControllerPoseValid)
+        {
+            Vector origin = m_VR->GetRecommendedViewmodelAbsPos(body);
+            QAngle ang = m_VR->GetRecommendedViewmodelAbsAngle();
+            static int s_vmLog;
+            if (s_vmLog < 4)
+            {
+                Game::logMsg("CalcViewModelView controller origin=(%.1f,%.1f,%.1f) ang=(%.1f,%.1f,%.1f)",
+                    origin.x, origin.y, origin.z, ang.x, ang.y, ang.z);
+                ++s_vmLog;
+            }
+            hkCalcViewModelView.fOriginal(ecx, owner, origin, ang);
+            return;
+        }
         Vector origin = m_VR->GetViewOrigin(body);
-        if (m_VR->m_StereoEye == 1)
-            origin = m_VR->GetViewOriginLeft(body);
-        else if (m_VR->m_StereoEye == 2)
-            origin = m_VR->GetViewOriginRight(body);
         const Vector va = m_VR->GetViewAngle();
         QAngle ang(va.x, va.y, va.z);
         hkCalcViewModelView.fOriginal(ecx, owner, origin, ang);

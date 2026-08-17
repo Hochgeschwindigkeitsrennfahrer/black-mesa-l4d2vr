@@ -77,6 +77,16 @@ public:
     bool m_HmdOriginLatched = false;
     QAngle m_HmdAngAbs{};
     QAngle m_HmdAngAbsZero{};
+    // Right-hand tracking in the same Source space as m_HmdPosAbs (sd805 / Portal 2).
+    bool m_ControllerPoseValid = false;
+    Vector m_RightControllerPosAbs{};
+    QAngle m_RightControllerAngAbs{};
+    Vector m_RightControllerForward{};
+    Vector m_RightControllerRight{};
+    Vector m_RightControllerUp{};
+    Vector m_ViewmodelForward{};
+    Vector m_ViewmodelRight{};
+    Vector m_ViewmodelUp{};
     std::mutex m_PoseMutex;
     vr::TrackedDevicePose_t m_WaitedPoses[vr::k_unMaxTrackedDeviceCount]{};
     std::atomic<DWORD> m_WaitedPoseTick{ 0 };
@@ -343,6 +353,10 @@ public:
     Vector GetViewOrigin(const Vector& setupOrigin) const;
     Vector GetViewOriginLeft(const Vector& setupOrigin) const;
     Vector GetViewOriginRight(const Vector& setupOrigin) const;
+    Vector GetRightControllerAbsPos(const Vector& eyePosition) const;
+    QAngle GetRightControllerAbsAngle() const;
+    Vector GetRecommendedViewmodelAbsPos(const Vector& eyePosition) const;
+    QAngle GetRecommendedViewmodelAbsAngle() const;
     float HorizontalFovForAspect(float targetAspect) const;
     void CaptureFrameBeforePresent();
     bool BlitCurrentGameColorTo(IDirect3DSurface9* dst);
@@ -393,6 +407,7 @@ private:
     void ApplyVulkanYFlip(vr::VRTextureBounds_t& bounds);
     void RefreshIpdFromHmd();
     void GetViewBasis(Vector* forward, Vector* right, Vector* up) const;
+    void UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose);
     IDirect3DQuery9* m_BlitEventQuery = nullptr;
     void FlushStereoBlitGpu();
     UINT KnownWindowWidth() const;

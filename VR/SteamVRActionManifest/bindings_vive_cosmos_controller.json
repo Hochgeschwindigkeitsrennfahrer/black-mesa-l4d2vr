@@ -198,7 +198,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/NextItem"
+                     "output": "/actions/main/in/PrevItem"
                   }
                },
                "mode": "button",

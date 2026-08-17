@@ -56,4 +56,13 @@ namespace bmvr
     extern float g_TurnSpeed;
     extern bool g_SnapTurning;
     extern float g_SnapTurnAngle;
+    // sd805 / Portal 2 uncoupled viewmodel (Source units along controller axes).
+    extern float g_ViewmodelPosOffsetX;
+    extern float g_ViewmodelPosOffsetY;
+    extern float g_ViewmodelPosOffsetZ;
+    extern float g_ViewmodelAngOffsetX;
+    extern float g_ViewmodelAngOffsetY;
+    extern float g_ViewmodelAngOffsetZ;
+    // L4D2VR tilts Vive wands -45°. G2 points more forward; default -35.
+    extern float g_ControllerPitchTilt;
 }

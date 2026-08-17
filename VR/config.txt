@@ -1,12 +1,26 @@
-# Black Mesa VR — L4D2VR/Portal 2 style settings.
-# Restart the game after changing RenderScale (swapchain size is picked at CreateDevice).
+# Black Mesa VR — restart the game after changing RenderScale
+# (eye / swapchain size is picked at CreateDevice).
 
-# Multiplier on the working HMD-aspect fit (1584x1440 on a 1440p window).
-# 1.0 = verified fused gameplay. 1.25 / 1.5 scale toward OpenVR recommended.
-# Capped at the headset recommended size. Full native (hmd_native) crashed on first stereo.
+# Multiplier on the working HMD-aspect fit (~1584x1440 on a 1440p window).
+#   1.0  = verified fused gameplay (start here)
+#   1.25 = sharper
+#   1.50 = ~2384x2160, verified on HP Reverb G2
+#   2.0+ = toward OpenVR recommended; full native crashed on first stereo
+# Capped at the headset recommended size. See BMVR_README.txt in the drop-in zip.
 RenderScale=1.0
 
-# Portal 2 VR / L4D2VR right-stick look. Degrees per ms at full deflection for smooth turn.
+# Portal 2 VR / L4D2VR right-stick look. Degrees per ms at full deflection.
 TurnSpeed=0.25
 SnapTurning=false
 SnapTurnAngle=45.0
+
+# Uncoupled viewmodel (sd805 L4D2VR / Portal 2 VR). Source units along the
+# right-controller axes. L4D2's default "NONE" offset was 20,3,0.
+ViewmodelPosOffsetX=16.0
+ViewmodelPosOffsetY=3.0
+ViewmodelPosOffsetZ=-2.0
+ViewmodelAngOffsetX=0.0
+ViewmodelAngOffsetY=0.0
+ViewmodelAngOffsetZ=0.0
+# sd805 tilts Vive wands -45°. G2 points more forward.
+ControllerPitchTilt=-35.0

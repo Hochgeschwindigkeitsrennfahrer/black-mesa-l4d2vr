@@ -1,4 +1,5 @@
 build/
+dist/
 .vs/
 out/
 *.user

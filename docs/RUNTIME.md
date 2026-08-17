@@ -196,7 +196,18 @@ G2: `controller_type` `hpmotioncontroller` (copy of Touch). WMR: `holographic_co
 
 After launch, `bmvr_log.txt` next to `bms.exe` and next to the loaded `d3d9.dll`.
 
-G2 left Y was Pause (`gameui_activate`). Log 2026-08-18: `Pause queued on CreateMove (gameui_activate)` then a new process (`VR config`). Same crash as Present-thread `ClientCmd`. Do not `gameui_activate` from any thread. Left Y/X are `invnext`. SteamVR may cache the old Pause bind until the user resets the layout.
+G2 left Y was Pause (`gameui_activate`). Log 2026-08-18: `Pause queued on CreateMove (gameui_activate)` then a new process (`VR config`). Same crash as Present-thread `ClientCmd`. Do not `gameui_activate` from any thread.
+
+G2 left X and Y after remapping to NextItem still crashed (fusion session, no `Ignoring Pause` line). Both buttons were `invnext` via `ClientCmd_Unrestricted` from CreateMove. Same ClientCmd bucket. Weapon cycle now sets `CUserCmd::weaponselect` from `DT_BaseCombatCharacter::m_hMyWeapons` (`0xEE4`, 48 handles) / `m_hActiveWeapon` (`0xFA4`). Left Y next, left X previous.
+
+## Uncoupled viewmodel / motion aim (user-verified 2026-08-18)
+
+Copied **sd805/l4d2vr** + **Gistix/portal2vr**, not keyou91 hands/reload/dual-wield models.
+
+- `CalcViewModelView` feeds `GetRecommendedViewmodelAbsPos/Angle` from the right controller. Same world pose both eyes (IPD on the gun drew two weapons). Fallback is still head-locked if the controller pose is invalid.
+- Camera stays HMD on stereo `CViewSetup` copies. CreateMove sets `cmd->viewangles` from the controller so hitscan follows the gun direction. Analog walk is rotated from HMD yaw into controller yaw so the stick stays look-relative.
+- Portal 2 keeps HMD `viewangles` and overrides `Weapon_ShootPosition` / `EyeAngles` only around fire. Those symbols are stripped here; do not hook `EyePosition` (that would move the camera to the gun). Bullets still spawn from the eyes.
+- Config: `ViewmodelPosOffsetX/Y/Z` (default 16, 3, −2), `ViewmodelAngOffsetX/Y/Z`, `ControllerPitchTilt` (default −35; sd805 Vive wands used −45).
 
 ## Near fusion (HMD-aspect blit, 2026-08-18)
 

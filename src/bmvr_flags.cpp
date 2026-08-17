@@ -19,6 +19,13 @@ namespace bmvr
     float g_TurnSpeed = 0.25f;
     bool g_SnapTurning = false;
     float g_SnapTurnAngle = 45.f;
+    float g_ViewmodelPosOffsetX = 16.f;
+    float g_ViewmodelPosOffsetY = 3.f;
+    float g_ViewmodelPosOffsetZ = -2.f;
+    float g_ViewmodelAngOffsetX = 0.f;
+    float g_ViewmodelAngOffsetY = 0.f;
+    float g_ViewmodelAngOffsetZ = 0.f;
+    float g_ControllerPitchTilt = -35.f;
 
     static HMODULE g_Module = nullptr;
     static std::mutex g_LogMutex;
@@ -158,10 +165,26 @@ namespace bmvr
                 if (s >= 10.f && s <= 180.f)
                     g_SnapTurnAngle = s;
             }
+            else if (std::strcmp(n, "ViewmodelPosOffsetX") == 0)
+                g_ViewmodelPosOffsetX = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "ViewmodelPosOffsetY") == 0)
+                g_ViewmodelPosOffsetY = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "ViewmodelPosOffsetZ") == 0)
+                g_ViewmodelPosOffsetZ = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "ViewmodelAngOffsetX") == 0)
+                g_ViewmodelAngOffsetX = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "ViewmodelAngOffsetY") == 0)
+                g_ViewmodelAngOffsetY = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "ViewmodelAngOffsetZ") == 0)
+                g_ViewmodelAngOffsetZ = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "ControllerPitchTilt") == 0)
+                g_ControllerPitchTilt = static_cast<float>(atof(val));
         }
         fclose(f);
-        Log("VR config %ls RenderScale=%.2f TurnSpeed=%.2f snap=%d",
-            path.c_str(), g_RenderScale, g_TurnSpeed, g_SnapTurning ? 1 : 0);
+        Log("VR config %ls RenderScale=%.2f TurnSpeed=%.2f snap=%d vm=(%.1f,%.1f,%.1f) tilt=%.1f",
+            path.c_str(), g_RenderScale, g_TurnSpeed, g_SnapTurning ? 1 : 0,
+            g_ViewmodelPosOffsetX, g_ViewmodelPosOffsetY, g_ViewmodelPosOffsetZ,
+            g_ControllerPitchTilt);
     }
 
     static void ApplySkipName(const std::string& name, const char* via)

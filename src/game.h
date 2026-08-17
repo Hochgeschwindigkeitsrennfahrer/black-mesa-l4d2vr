@@ -57,6 +57,7 @@ public:
 
     void* GetInterface(const char* dllname, const char* interfacename);
     C_BaseEntity* GetClientEntity(int entityIndex);
+    int CycleWeaponSelect(int direction);
     void ClientCmd(const char* szCmdString);
     void ClientCmd_Unrestricted(const char* szCmdString);
     int GetMatQueueMode() const;

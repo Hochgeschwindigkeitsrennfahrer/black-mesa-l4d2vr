@@ -61,3 +61,5 @@ If named RTs or double RenderView are disabled, capture is unbind/pre-Present `S
 ## What we did not copy from L4D2VR
 
 Hands/ozz, Neko post, ReShade takeover, aim-line overlays, workshop, melee weapon tables, queued compositor worker, `ExitProcess` if `VR_Init` fails at device create, L4D2 `isGameRunning` MaterialSystem offset poke.
+
+Uncoupled viewmodel and controller aiming follow **sd805/l4d2vr** and **Gistix/portal2vr** (`CalcViewModelView` + controller `cmd->viewangles`), not the vendored keyou91 hand/reload stack.

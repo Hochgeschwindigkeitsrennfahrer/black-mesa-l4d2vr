@@ -155,6 +155,75 @@ C_BaseEntity* Game::GetClientEntity(int entityIndex)
     return static_cast<C_BaseEntity*>(m_ClientEntityList->GetClientEntity(entityIndex));
 }
 
+int Game::CycleWeaponSelect(int direction)
+{
+    // invnext/invprev via ClientCmd_Unrestricted crash BM from CreateMove
+    // (2026-08-18, same bucket as gameui_activate). Drive CUserCmd::weaponselect
+    // from DT_BaseCombatCharacter::m_hMyWeapons instead.
+    if (!m_EngineClient || !m_ClientEntityList || direction == 0)
+        return 0;
+    const int local = m_EngineClient->GetLocalPlayer();
+    if (local <= 0)
+        return 0;
+    void* player = m_ClientEntityList->GetClientEntity(local);
+    if (!player)
+        return 0;
+
+    // client.dll FUN_100a3de0 RecvTable: m_hMyWeapons 0xEE4 count 0x30,
+    // m_hActiveWeapon 0xFA4. EHANDLE RecvProxy FUN_101d0220 uses 13-bit entry
+    // (mask 0x1FFF) with 12-bit networked index.
+    constexpr int kMyWeapons = 0xEE4;
+    constexpr int kActiveWeapon = 0xFA4;
+    constexpr int kMaxWeapons = 48;
+    constexpr uint32_t kInvalid = 0xFFFFFFFFu;
+    constexpr uint32_t kEntryMask = 0x1FFFu;
+
+    const auto* handles = reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<uintptr_t>(player) + kMyWeapons);
+    const uint32_t active = *reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<uintptr_t>(player) + kActiveWeapon);
+
+    int indices[kMaxWeapons];
+    int n = 0;
+    int current = -1;
+    for (int i = 0; i < kMaxWeapons; ++i)
+    {
+        const uint32_t h = handles[i];
+        if (h == 0 || h == kInvalid)
+            continue;
+        void* weapon = m_ClientEntityList->GetClientEntityFromHandle(static_cast<int>(h));
+        if (!weapon)
+            continue;
+        int idx = static_cast<int>(h & kEntryMask);
+        if (m_ClientEntityList->GetClientEntity(idx) != weapon)
+        {
+            idx = 0;
+            const int hi = m_ClientEntityList->GetHighestEntityIndex();
+            for (int e = 1; e <= hi; ++e)
+            {
+                if (m_ClientEntityList->GetClientEntity(e) == weapon)
+                {
+                    idx = e;
+                    break;
+                }
+            }
+        }
+        if (idx <= 0)
+            continue;
+        if (h == active)
+            current = n;
+        indices[n++] = idx;
+    }
+    if (n <= 1)
+        return 0;
+    int next = 0;
+    if (current >= 0)
+        next = (current + (direction > 0 ? 1 : n - 1)) % n;
+    else
+        next = direction > 0 ? 0 : n - 1;
+    return indices[next];
+}
+
 void Game::ClientCmd(const char* szCmdString)
 {
     if (m_EngineClient)
