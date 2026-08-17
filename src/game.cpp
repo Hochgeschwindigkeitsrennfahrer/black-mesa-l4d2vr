@@ -129,10 +129,13 @@ Game::Game()
 
     m_Initialized = true;
     bmvr::SetStage("game_ready");
-        Game::logMsg("BMVR Game initialized (L4D2VR architecture, Black Mesa offsets). namedRT=%d stereoRV=%d hmdSwap=%d waitIdle=%d absView=%d menuVR=%d relLook=%d",
+        Game::logMsg("BMVR Game initialized (L4D2VR architecture, Black Mesa offsets). namedRT=%d stereoRV=%d stereoCopy=%d stereoFov=%d hmdSwap=%d hmdFb=%d waitIdle=%d absView=%d menuVR=%d relLook=%d",
         bmvr::TryNamedRenderTargets() ? 1 : 0,
         bmvr::TryStereoRenderView() ? 1 : 0,
+        bmvr::TryStereoCopy() ? 1 : 0,
+        bmvr::TryStereoFov() ? 1 : 0,
         bmvr::TryHmdSwapchain() ? 1 : 0,
+        bmvr::TryHmdFramebuffer() ? 1 : 0,
         bmvr::TryWaitDeviceIdle() ? 1 : 0,
         bmvr::TryAbsoluteHmdView() ? 1 : 0,
         bmvr::TryMenuCompositor() ? 1 : 0,

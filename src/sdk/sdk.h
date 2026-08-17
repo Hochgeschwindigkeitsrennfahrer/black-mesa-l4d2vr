@@ -314,9 +314,14 @@ public:
 	int32_t width; //0x0010
 	int32_t m_nUnscaledWidth; //0x0014
 	int32_t height; //0x0018
-	int32_t m_nUnscaledHeight; //0x001C
-	int32_t m_eStereoEye; //0x0020
-	char pad_0024[0x90]; //0x0024 custom matrices / ortho (not L4D2 0x34 fov)
+	// BM is not Source 2013's unscaledHeight-then-stereoEye. RenderView
+	// (`client+0x20EE40`) does `cmp [ebx+0x1c], 2` (STEREO_EYE_RIGHT) and
+	// `cmp byte ptr [eax+this+0x744]` with eax=[ebx+0x1c] — a 3-entry per-eye
+	// flag. Writing eye height 1440 into 0x1C OOB-indexed that table and died
+	// on the first stereo RenderView after 8 good pass-throughs (2026-08-17).
+	int32_t m_eStereoEye; //0x001C
+	int32_t m_nUnscaledHeight; //0x0020
+	char pad_0024[0x90]; //0x0024 m_bOrtho / custom matrices
 	float fov; //0x00B4
 	float fovViewmodel; //0x00B8
 	Vector origin; //0x00BC  CViewSetup copy ctor + RenderView lea [ebx+0xBC]
@@ -332,6 +337,8 @@ public:
 static_assert(sizeof(CViewSetup) == 0x148);
 static_assert(offsetof(CViewSetup, width) == 0x10);
 static_assert(offsetof(CViewSetup, height) == 0x18);
+static_assert(offsetof(CViewSetup, m_eStereoEye) == 0x1C);
+static_assert(offsetof(CViewSetup, m_nUnscaledHeight) == 0x20);
 static_assert(offsetof(CViewSetup, fov) == 0xB4);
 static_assert(offsetof(CViewSetup, origin) == 0xBC);
 static_assert(offsetof(CViewSetup, angles) == 0xC8);
@@ -860,6 +867,9 @@ public:
 	virtual void EndRender();
 	virtual void Flush(bool flushHardware = false);
 	virtual void sub_10016C70();
+	// BM client.dll RenderView: GetRT is context +0x1C, SetRT(ITexture*) is +0x18
+	// (restores the prologue GetRT at 1020f5e4). Adjacent materialsystem+0x68480
+	// is a 6-arg function — not this slot. 6-arg PushRT is +0x23C, Pop +0x24C.
 	virtual void SetRenderTarget(ITexture* pTexture);
 	virtual ITexture* GetRenderTarget();
 	virtual void sub_10025440();

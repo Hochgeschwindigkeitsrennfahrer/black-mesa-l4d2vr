@@ -21,10 +21,10 @@ Sources live in `src/`. The `L4D2VR/` folder is only include shims so DXVK can `
 | Head tracking | Yes — relative look on a RenderView copy (`-oldgameui`) |
 | Rendering in headset | Yes — 16:9 capture Submit, both eyes the same (`-oldgameui`) |
 | Load / headset-off freeze | Yes — `WaitGetPoses` on a pose-waiter thread (user-verified 2026-08-16) |
-| Stereo | **No** — double RenderView into named eyes killed this DLL |
+| Stereo | User-verified fused 1584×1440 double RenderView (`-oldgameui`). Was upside-down from a Vulkan v-flip on that blit; flip removed. **Upright not verified this build.** |
 | Gameplay in headset | Yes with `-oldgameui`. New game UI is upside-down / black after load. |
 
-Acceptance is **visible Black Mesa gameplay in the headset**. True stereo is not there yet.
+Acceptance is **visible fused Black Mesa gameplay in the headset**.
 
 ## Steam launch options
 

@@ -57,7 +57,7 @@ public:
     vr::IVRCompositor* m_Compositor = nullptr;
 
     // Eye / capture size. HMD-sized swapchain is skipped on BM (black desktop).
-    // When hmd_swap is off this follows the desktop window, not recommended RT.
+    // With hmd_fb this is HMD aspect fitted into the 16:9 window (G-buffer size).
     uint32_t m_RenderWidth = 0;
     uint32_t m_RenderHeight = 0;
     uint32_t m_AntiAliasing = 0;
@@ -276,6 +276,7 @@ public:
     int m_GameplayFrames = 0;
     uint32_t m_PresentTick = 0;
     uint32_t m_EligiblePresents = 0;
+    uint32_t m_PassThroughMainViews = 0;
     std::string m_CurrentMapName;
     bool m_FrameCopyLatched = false;
     uint32_t m_FrameCopyWidth = 0;
@@ -293,6 +294,8 @@ public:
     bool m_UsedNamedRenderTargets = false;
     bool m_StereoRenderViewActive = false;
     bool m_PosesWaitedThisFrame = false;
+    bool m_NamedCreateFailed = false;
+    uint32_t m_NamedRtReadyPresent = 0;
 
     VR() = default;
     explicit VR(Game* game);
@@ -302,7 +305,11 @@ public:
     void SubmitVRTextures();
     void WaitPosesForStereoFrame();
     Vector GetViewAngle() const;
+    Vector GetViewOriginLeft(const Vector& setupOrigin, const Vector& viewRight) const;
+    Vector GetViewOriginRight(const Vector& setupOrigin, const Vector& viewRight) const;
+    float HorizontalFovForAspect(float targetAspect) const;
     void CaptureFrameBeforePresent();
+    bool BlitCurrentGameColorTo(IDirect3DSurface9* dst);
     void CaptureGameColorOnUnbind(IDirect3DSurface9* oldRt, uint32_t vpX, uint32_t vpY, uint32_t vpW, uint32_t vpH);
     void ReleaseVRRenderTargetsForDeviceReset();
     bool RefreshBackBufferTexture(bool forceRefresh = false);
@@ -322,6 +329,10 @@ public:
     bool ShouldCompositorSubmit() const;
     void InstallDeviceHooks(IDirect3DDevice9* device);
     bool EnsureNamedEyeTextures();
+    void PrepareNamedStereoFromPresent();
+    bool NamedStereoReady() const;
+    bool EnsureStereoEyeSurfaces();
+    bool StereoEyesReady() const;
 
 private:
     static bool IsGameplayMapName(const char* map);

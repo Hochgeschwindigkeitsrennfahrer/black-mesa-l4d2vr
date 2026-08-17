@@ -32,6 +32,8 @@ struct Hook
     {
         if (!pTarget)
             return 1;
+        if (isEnabled)
+            return 0;
         if (MH_EnableHook(pTarget) != MH_OK)
             return 1;
         isEnabled = true;
@@ -53,6 +55,9 @@ typedef void(__thiscall* tDrawModelExecute)(void* thisptr, void* state, const Mo
 typedef void(__thiscall* tPushRenderTargetAndViewport)(void* thisptr, ITexture* pTexture, ITexture* pDepthTexture, int nViewX, int nViewY, int nViewW, int nViewH);
 typedef void(__thiscall* tPopRenderTargetAndViewport)(void* thisptr);
 typedef void(__thiscall* tVgui_Paint)(void* thisptr, int mode);
+typedef void(__thiscall* tGetBackBufferDimensions)(void* thisptr, int& width, int& height);
+typedef void(__thiscall* tGetScreenSize)(void* thisptr, int& width, int& height);
+typedef ITexture*(__thiscall* tCreateNamedRTEx)(void* thisptr, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags);
 
 class Hooks
 {
@@ -73,6 +78,9 @@ public:
     static inline Hook<tPushRenderTargetAndViewport> hkPushRenderTargetAndViewport;
     static inline Hook<tPopRenderTargetAndViewport> hkPopRenderTargetAndViewport;
     static inline Hook<tVgui_Paint> hkVgui_Paint;
+    static inline Hook<tGetBackBufferDimensions> hkGetBackBufferDimensions;
+    static inline Hook<tGetScreenSize> hkGetScreenSize;
+    static inline Hook<tCreateNamedRTEx> hkCreateNamedRTEx;
 
     Hooks() = default;
     explicit Hooks(Game* game);
@@ -93,4 +101,7 @@ public:
     static void __fastcall dPushRenderTargetAndViewport(void* ecx, void* edx, ITexture* pTexture, ITexture* pDepthTexture, int nViewX, int nViewY, int nViewW, int nViewH);
     static void __fastcall dPopRenderTargetAndViewport(void* ecx, void* edx);
     static void __fastcall dVGui_Paint(void* ecx, void* edx, int mode);
+    static void __fastcall dGetBackBufferDimensions(void* ecx, void* edx, int& width, int& height);
+    static void __fastcall dGetScreenSize(void* ecx, void* edx, int& width, int& height);
+    static ITexture* __fastcall dCreateNamedRTEx(void* ecx, void* edx, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags);
 };

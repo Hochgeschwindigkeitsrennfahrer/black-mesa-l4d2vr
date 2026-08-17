@@ -87,6 +87,22 @@ public:
     Offset PopRenderTargetAndViewport{ "materialsystem.dll", 0x6A250,
         "56 8B F1 83 7E 4C 00 74 15 8B 06 6A 00 FF 50 10 FF 4E 4C" };
 
+    // Ghidra on Steam client.dll CBlackMesaViewRender_RenderView (0x20EE40):
+    // IMaterialSystem +0x19C = GetRenderContext (AddRef'd). Context then:
+    // +0x8 BeginRender, +0xC EndRender, +0x4 Release, +0x1C GetRenderTarget,
+    // +0x18 SetRenderTarget(ITexture*) — RenderView restores the prologue
+    // GetRT with this slot at 1020f5e4. Do not use materialsystem+0x68480
+    // (adjacent 6-arg function) as SetRT. 6-arg PushRT is +0x23C; Pop is
+    // +0x24C (HUD PushRT/Pop pair). Call Push/Pop through the hooked RVAs.
+    static constexpr int kIMaterialSystem_GetRenderContext = 0x19C;
+    static constexpr int kIMatRenderContext_Release = 0x4;
+    static constexpr int kIMatRenderContext_BeginRender = 0x8;
+    static constexpr int kIMatRenderContext_EndRender = 0xC;
+    static constexpr int kIMatRenderContext_SetRenderTarget = 0x18;
+    static constexpr int kIMatRenderContext_GetRenderTarget = 0x1C;
+    static constexpr int kIMatRenderContext_PushRT6 = 0x23C;
+    static constexpr int kIMatRenderContext_PopRT = 0x24C;
+
     // IMaterialSystem vtable is shifted vs L4D2 (GetBackBufferFormat returned a
     // pointer). Call these by RVA. BeginRT no-ops after startup unless
     // isGameRunning at kCMaterialSystem_isGameRunning is cleared (BM, not L4D2's +0x2AB8).
@@ -99,6 +115,16 @@ public:
     // 0x49600 which ends the shared prologue with `mov eax,[ecx]`.
     Offset CreateNamedRTEx{ "materialsystem.dll", 0x49660,
         "55 8B EC 83 B9 A0 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 0D" };
+    // CMaterialSystem vtable slot 30 (+0x78). Thunk: g_pShaderAPI +0x458.
+    // Slot 31 (+0x7C) is NOT GetBackBufferFormat on BM (returns a pointer).
+    Offset GetBackBufferDimensions{ "materialsystem.dll", 0x52d20,
+        "55 8B EC 8B 0D ? ? ? ? 8B 01 8B 80 58 04 00 00 5D FF E0" };
+    // IVEngineClient slot 5. Goes through videomode, not the D3D backbuffer.
+    // After load, Source Reset(2560) while we keep a 1576 swapchain left this
+    // at 2560 and HUD downsample (client FUN_10267420) used CViewSetup
+    // width/height against _rt_Hud created from GetBackBufferDimensions.
+    Offset GetScreenSize{ "engine.dll", 0xA6BD0,
+        "55 8B EC 8B 0D ? ? ? ? 56 8B 01 FF 90 9C 01 00 00" };
 
     Offset ProcessUsercmds{ "server.dll", 0x5320F0,
         "55 8B EC B8 ? ? ? ? E8 ? ? ? ? A1 ? ? ? ? 33 C5 89 45 FC 8B 45 0C 8B 55 08", 0, true };

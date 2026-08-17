@@ -334,7 +334,7 @@ namespace dxvk {
       Logger::info("BMVR CreateDevice: keeping Windowed=TRUE (refusing exclusive fullscreen)");
       pPresentationParameters->Windowed = TRUE;
     }
-    if (!noHmd && bmvr::TryHmdSwapchain())
+    if (!noHmd)
     {
       vr::EVRInitError vrErr = vr::VRInitError_None;
       vr::IVRSystem* vrSys = vr::VR_Init(&vrErr, vr::VRApplication_Scene);
@@ -344,18 +344,49 @@ namespace dxvk {
         vrSys->GetRecommendedRenderTargetSize(&recW, &recH);
         if (recW >= 640 && recH >= 360)
         {
-          bmvr::BeginRisky(L"hmd_swap");
-          stampedHmdSwap = true;
-          Logger::info(str::format(
-            "BMVR CreateDevice: using HMD recommended swapchain ",
-            recW, "x", recH, " (was ",
-            pPresentationParameters->BackBufferWidth, "x",
-            pPresentationParameters->BackBufferHeight, ")"));
-          pPresentationParameters->BackBufferWidth = recW;
-          pPresentationParameters->BackBufferHeight = recH;
           bmvr::g_RecommendedEyeWidth = recW;
           bmvr::g_RecommendedEyeHeight = recH;
           bmvr::g_OpenVRInitedFromCreateDevice = true;
+
+          float lLeft = 0.f, lRight = 0.f, lTop = 0.f, lBottom = 0.f;
+          vrSys->GetProjectionRaw(vr::Eye_Left, &lLeft, &lRight, &lTop, &lBottom);
+          const float tanHalfFovX = (-lLeft > lRight) ? -lLeft : lRight;
+          const float tanHalfFovY = (-lTop > lBottom) ? -lTop : lBottom;
+          const float projAspect = (tanHalfFovY > 0.01f) ? (tanHalfFovX / tanHalfFovY) : 0.f;
+          const uint32_t winW = pPresentationParameters->BackBufferWidth;
+          const uint32_t winH = pPresentationParameters->BackBufferHeight;
+          bmvr::ComputeHmdFramebufferSize(recW, recH, winW, winH, projAspect);
+          bmvr::InstallEarlyFramebufferHook();
+          uint32_t bbW = pPresentationParameters->BackBufferWidth;
+          uint32_t bbH = pPresentationParameters->BackBufferHeight;
+          if (bmvr::TryHmdFramebuffer() && bmvr::ApplyHmdAspectBackbuffer(bbW, bbH))
+          {
+            pPresentationParameters->Windowed = TRUE;
+            pPresentationParameters->BackBufferWidth = bbW;
+            pPresentationParameters->BackBufferHeight = bbH;
+            Logger::info(str::format(
+              "BMVR CreateDevice: windowed backbuffer ",
+              winW, "x", winH, " -> HMD-aspect ",
+              bbW, "x", bbH, " (HWND stays desktop size)"));
+          }
+          Logger::info(str::format(
+            "BMVR CreateDevice: OpenVR ready recommended ", recW, "x", recH,
+            " window ", winW, "x", winH,
+            " G-buffer ", bmvr::g_FramebufferWidth, "x", bmvr::g_FramebufferHeight,
+            " (swapchain force=", bmvr::TryHmdSwapchain() ? 1 : 0, ")"));
+
+          if (bmvr::TryHmdSwapchain())
+          {
+            bmvr::BeginRisky(L"hmd_swap");
+            stampedHmdSwap = true;
+            Logger::info(str::format(
+              "BMVR CreateDevice: using HMD recommended swapchain ",
+              recW, "x", recH, " (was ",
+              pPresentationParameters->BackBufferWidth, "x",
+              pPresentationParameters->BackBufferHeight, ")"));
+            pPresentationParameters->BackBufferWidth = recW;
+            pPresentationParameters->BackBufferHeight = recH;
+          }
         }
       }
       else

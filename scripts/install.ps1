@@ -60,6 +60,16 @@ Install-One $BinDir
 # 3) Next to bms.exe — L4D2VR-style, and AddDllDirectory(game root)
 Install-One $GameRoot
 
+# Stock dxvk.conf sets deviceLossOnFocusLoss=True and overrides our built-in
+# bms.exe profile (False). Steam verify restores the stock file.
+$DxvkConf = Join-Path $DxvkDir "dxvk.conf"
+$ConfText = @"
+d3d9.deferSurfaceCreation = True
+d3d9.deviceLossOnFocusLoss = False
+"@
+Set-Content -LiteralPath $DxvkConf -Value $ConfText -Encoding ASCII
+Write-Host "Set $DxvkConf deviceLossOnFocusLoss=False"
+
 Write-Host ""
 Write-Host "Launch from Steam with the existing L4D2VR options, plus:"
 Write-Host "  -oldgameui"

@@ -11,17 +11,23 @@ namespace bmvr
 {
     uint32_t g_RecommendedEyeWidth = 0;
     uint32_t g_RecommendedEyeHeight = 0;
+    uint32_t g_FramebufferWidth = 0;
+    uint32_t g_FramebufferHeight = 0;
     bool g_OpenVRInitedFromCreateDevice = false;
 
     static HMODULE g_Module = nullptr;
     static std::mutex g_LogMutex;
     static bool g_TryHmdSwapchain = true;
+    static bool g_TryHmdFramebuffer = true;
     static bool g_TryNamedRT = true;
+    static bool g_TryNamedStereoWrap = false;
     static bool g_TryStereoRV = true;
     static bool g_TryWaitIdle = true;
     static bool g_TryAbsView = true;
     static bool g_TryMenuCompositor = true;
     static bool g_TryRelativeHmdLook = true;
+    static bool g_TryStereoCopy = false;
+    static bool g_TryStereoFov = false;
     static bool g_Inited = false;
     static bool g_WatchdogStarted = false;
     static char g_Stage[64] = "dll_attach";
@@ -99,10 +105,14 @@ namespace bmvr
     {
         if (name == "hmd_swap")
             g_TryHmdSwapchain = false;
+        else if (name == "hmd_fb")
+            g_TryHmdFramebuffer = false;
         else if (name == "named_rt")
             g_TryNamedRT = false;
         else if (name == "stereo_rv")
             g_TryStereoRV = false;
+        else if (name == "named_bind" || name == "named_l4d" || name == "named_eye" || name == "named_push")
+            g_TryNamedStereoWrap = false;
         else if (name == "wait_idle")
             g_TryWaitIdle = false;
         else if (name == "abs_view")
@@ -111,6 +121,10 @@ namespace bmvr
             g_TryMenuCompositor = false;
         else if (name == "rel_look")
             g_TryRelativeHmdLook = false;
+        else if (name == "stereo_copy")
+            g_TryStereoCopy = false;
+        else if (name == "stereo_fov")
+            g_TryStereoFov = false;
         else
             return;
         Log("Skip %s (%s)", name.c_str(), via ? via : "skip file");
@@ -141,6 +155,18 @@ namespace bmvr
             // named_rt was persisted because GetBackBufferFormat's vtable slot
             // is wrong on BM, not because CreateNamed crashed. Retry with the
             // verified RVAs. Crash-sticky bmvr_in_named_rt.flag still wins.
+            // Named wrap onto HDR leftEye0 died in CSimpleWorldView after
+            // three rewritten PushRT(NULL) even at 2560x1440. That skip must
+            // not disable double RenderView / HMD-aspect G-buffer.
+            if (std::strcmp(n, "hmd_fb") == 0)
+            {
+                // Matching swapchain still died after LevelInit. 2026-08-17
+                // evening: GetScreenSize fix produced RenderView setup=1584,
+                // then first stereo left RenderView during spawn crashed.
+                // Crash-sticky is cleared without disabling the framebuffer.
+                Log("Ignoring hmd_fb skip-file entry (1584 world RV works; stereo wrote height into m_eStereoEye at 0x1C)");
+                continue;
+            }
             if (std::strcmp(n, "named_rt") == 0)
             {
                 Log("Ignoring named_rt skip-file entry (retry CreateNamedEx by RVA)");
@@ -151,6 +177,37 @@ namespace bmvr
             if (std::strcmp(n, "rel_look") == 0)
             {
                 Log("Ignoring rel_look skip-file entry (WaitGetPoses hang, not look)");
+                continue;
+            }
+            // Named-RT stereo_rv / named_push deaths. Retry named_l4d.
+            if (std::strcmp(n, "stereo_rv") == 0)
+            {
+                Log("Ignoring stereo_rv skip-file entry (retry L4D2 wrap + null rewrite)");
+                continue;
+            }
+            // Outer L4D2 PushRT(eye) then BM PushRT(NULL,0,0,0,0) died.
+            // named_l4d keeps the wrap and rewrites those null PushRTs.
+            if (std::strcmp(n, "named_push") == 0)
+            {
+                Log("Ignoring named_push skip-file entry (retry L4D2 wrap + null rewrite)");
+                continue;
+            }
+            // Rewrite-only (no wrap) was not the L4D2 path. RenderView's
+            // prologue GetRT / SetRT(+0x18) restore needs the eye already
+            // pushed or it puts the backbuffer back.
+            if (std::strcmp(n, "named_bind") == 0)
+            {
+                Log("Ignoring named_bind skip-file entry (retry framebuffer-sized named RT)");
+                continue;
+            }
+            if (std::strcmp(n, "named_l4d") == 0)
+            {
+                Log("Ignoring named_l4d skip-file entry (retry framebuffer-sized named RT)");
+                continue;
+            }
+            if (std::strcmp(n, "named_eye") == 0)
+            {
+                Log("Ignoring named_eye skip-file entry (named PushRT wrap is off; HMD-aspect G-buffer retry)");
                 continue;
             }
             ApplySkipName(n, "bmvr_skip.txt");
@@ -279,12 +336,19 @@ namespace bmvr
         ReadSkipFile(SkipPath());
         ReadSkipFile(ModuleDir() + L"\\bmvr_skip.txt");
         ConsumeIfStuck(L"hmd_swap", g_TryHmdSwapchain, "hmd_swap", "HMD-sized swapchain");
+        // Last launch: 8 pass-through 1584 RenderViews (zNear=7) succeeded,
+        // then stereo wrote 1440 into CViewSetup+0x1C (m_eStereoEye on BM).
+        // RenderView indexes this+0x744 by that field. Do not disable hmd_fb.
+        for (const auto& dir : FlagDirs())
+            DeleteFileW((dir + L"\\bmvr_in_hmd_fb.flag").c_str());
         ConsumeIfStuck(L"named_rt", g_TryNamedRT, "named_rt", "MaterialSystem named eye RTs");
-        ConsumeIfStuck(L"stereo_rv", g_TryStereoRV, "stereo_rv", "double RenderView stereo");
         ConsumeIfStuck(L"wait_idle", g_TryWaitIdle, "wait_idle", "WaitDeviceIdle");
         ConsumeIfStuck(L"abs_view", g_TryAbsView, "abs_view", "absolute HMD CViewSetup");
         ConsumeIfStuck(L"menu_vr", g_TryMenuCompositor, "menu_vr", "menu/background compositor Submit");
         ConsumeIfStuck(L"rel_look", g_TryRelativeHmdLook, "rel_look", "relative HMD look on RenderView copy");
+        ConsumeIfStuck(L"stereo_copy", g_TryStereoCopy, "stereo_copy", "double RenderView blit stereo");
+        ConsumeIfStuck(L"stereo_fov", g_TryStereoFov, "stereo_fov", "same-size HMD-FOV double RenderView");
+        // 16:9 blit stereo is not fused. Do not keep offering it.
         // Verified on this DLL 2026-08-16: CreateDevice + Reset forced 3168x3100,
         // desktop went black, one OpenVR Submit then rt0=null / waiting room.
         if (g_TryHmdSwapchain)
@@ -298,16 +362,26 @@ namespace bmvr
         // black after the load logo. L4D2VR only writes HMD on stereo copies.
         if (g_TryAbsView)
             PersistSkip("abs_view", "absolute HMD on live CViewSetup blacked gameplay after load logo");
+        if (g_TryStereoCopy)
+            PersistSkip("stereo_copy", "16:9 blit stereo is not fused");
+        PersistSkip("stereo_fov", "HMD FOV in 16:9 pixels is magnified and not fused");
+        // Named HDR wrap + rewriting CSimpleWorldView PushRT(NULL) dies after
+        // the third bind even when the named RT is 2560x1440. Do not retry it.
+        g_TryNamedStereoWrap = false;
         SetStage("init");
     }
 
     bool TryHmdSwapchain() { return g_TryHmdSwapchain; }
+    bool TryHmdFramebuffer() { return g_TryHmdFramebuffer; }
     bool TryNamedRenderTargets() { return g_TryNamedRT; }
+    bool TryNamedStereoWrap() { return g_TryNamedStereoWrap; }
     bool TryStereoRenderView() { return g_TryStereoRV; }
     bool TryWaitDeviceIdle() { return g_TryWaitIdle; }
     bool TryAbsoluteHmdView() { return g_TryAbsView; }
     bool TryMenuCompositor() { return g_TryMenuCompositor; }
     bool TryRelativeHmdLook() { return g_TryRelativeHmdLook; }
+    bool TryStereoCopy() { return g_TryStereoCopy; }
+    bool TryStereoFov() { return g_TryStereoFov; }
 
     void DisableNamedRenderTargets(const char* reason)
     {
@@ -317,6 +391,11 @@ namespace bmvr
     void DisableStereoRenderView(const char* reason)
     {
         PersistSkip("stereo_rv", reason);
+    }
+
+    void DisableStereoFov(const char* reason)
+    {
+        PersistSkip("stereo_fov", reason);
     }
 
     void BeginRisky(const wchar_t* name)
@@ -341,5 +420,62 @@ namespace bmvr
         for (const auto& dir : FlagDirs())
             DeleteFileW((dir + L"\\bmvr_in_" + name + L".flag").c_str());
         SetStage("ok");
+    }
+
+    void ComputeHmdFramebufferSize(uint32_t recW, uint32_t recH, uint32_t winW, uint32_t winH, float projAspect)
+    {
+        if (recW < 640 || recH < 360)
+            return;
+        if (winW < 640)
+            winW = recW;
+        if (winH < 360)
+            winH = recH;
+        float aspect = projAspect;
+        if (!(aspect > 0.5f && aspect < 3.f))
+            aspect = static_cast<float>(recW) / static_cast<float>(recH);
+        uint32_t eyeH = winH & ~1u;
+        uint32_t eyeW = (static_cast<uint32_t>(static_cast<float>(eyeH) * aspect + 0.5f) + 1u) & ~1u;
+        if (eyeW > winW)
+        {
+            eyeW = winW & ~1u;
+            eyeH = (static_cast<uint32_t>(static_cast<float>(eyeW) / aspect + 0.5f) + 1u) & ~1u;
+        }
+        if (eyeW > recW || eyeH > recH)
+        {
+            const float sx = static_cast<float>(recW) / static_cast<float>(eyeW);
+            const float sy = static_cast<float>(recH) / static_cast<float>(eyeH);
+            const float s = sx < sy ? sx : sy;
+            eyeW = (static_cast<uint32_t>(static_cast<float>(eyeW) * s) + 1u) & ~1u;
+            eyeH = (static_cast<uint32_t>(static_cast<float>(eyeH) * s) + 1u) & ~1u;
+        }
+        if (eyeW < 640 || eyeH < 360)
+            return;
+        // Deferred MRT / HUD downsample want 16-pixel pitch. 1576 (1440*1.097
+        // rounded even) is 1576%16=8. Menu 2D survived; first 3D/HUD did not.
+        eyeW = (eyeW + 15u) & ~15u;
+        eyeH = (eyeH + 15u) & ~15u;
+        g_FramebufferWidth = eyeW;
+        g_FramebufferHeight = eyeH;
+    }
+
+    bool HaveHmdFramebufferSize(uint32_t& width, uint32_t& height)
+    {
+        if (!g_TryHmdFramebuffer || g_FramebufferWidth < 640 || g_FramebufferHeight < 360)
+            return false;
+        width = g_FramebufferWidth;
+        height = g_FramebufferHeight;
+        return true;
+    }
+
+    bool ApplyHmdAspectBackbuffer(uint32_t& width, uint32_t& height)
+    {
+        uint32_t w = 0, h = 0;
+        if (!HaveHmdFramebufferSize(w, h))
+            return false;
+        if (width == w && height == h)
+            return false;
+        width = w;
+        height = h;
+        return true;
     }
 }

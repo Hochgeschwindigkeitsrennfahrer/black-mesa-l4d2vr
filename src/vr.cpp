@@ -113,8 +113,10 @@ namespace
             return nullptr;
         __try
         {
-            tex = fn(mat, name, w, h, RT_SIZE_LITERAL, IMAGE_FORMAT_BGRA8888,
-                MATERIAL_RT_DEPTH_SEPARATE, TEXTUREFLAGS_NOMIP, 0);
+            tex = fn(mat, name, w, h, RT_SIZE_LITERAL, IMAGE_FORMAT_RGBA16161616F,
+                MATERIAL_RT_DEPTH_SHARED,
+                TEXTUREFLAGS_NOMIP | TEXTUREFLAGS_CLAMPS | TEXTUREFLAGS_CLAMPT,
+                CREATERENDERTARGETFLAGS_HDR);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -232,6 +234,7 @@ void VR::OnLevelInit(const char* newmap)
     m_SafeLookActive = false;
     m_LookApplyEnabled = false;
     m_HmdOriginLatched = false;
+    m_PassThroughMainViews = 0;
     Game::logMsg("LevelInit map=%s eligible=%d", m_CurrentMapName.c_str(), m_GameplayEligible ? 1 : 0);
 }
 
@@ -251,6 +254,9 @@ void VR::OnLevelShutdown()
     m_SeenGameplay = false;
     m_SafeLookActive = false;
     m_LookApplyEnabled = false;
+    m_DirectEyeSubmit = false;
+    m_StereoRenderViewActive = false;
+    m_PassThroughMainViews = 0;
     Game::logMsg("LevelShutdown");
 }
 
@@ -338,6 +344,7 @@ bool VR::InitOpenVR()
 
     m_Aspect = tanHalfFovX / tanHalfFovY;
     m_Fov = 2.0f * atanf(tanHalfFovX) * 180.0f / 3.14159265358979323846f;
+    ChooseEyeRenderSize();
 
     m_IsVREnabled = true;
     m_Compositor->SetExplicitTimingMode(
@@ -408,37 +415,74 @@ UINT VR::KnownWindowHeight() const
 
 void VR::ChooseEyeRenderSize()
 {
-    uint32_t recW = bmvr::g_RecommendedEyeWidth;
-    uint32_t recH = bmvr::g_RecommendedEyeHeight;
-    if ((recW < 640 || recH < 360) && m_System)
-        m_System->GetRecommendedRenderTargetSize(&recW, &recH);
-    if (recW < 640 || recH < 360)
+    uint32_t fbW = 0, fbH = 0;
+    if (bmvr::HaveHmdFramebufferSize(fbW, fbH))
     {
-        recW = KnownWindowWidth();
-        recH = KnownWindowHeight();
+        if (m_RenderWidth != fbW || m_RenderHeight != fbH)
+            Game::logMsg("Eye/G-buffer size %ux%u (CreateDevice HMD-aspect, window %ux%u recommended %ux%u aspect=%.3f)",
+                fbW, fbH, KnownWindowWidth(), KnownWindowHeight(),
+                bmvr::g_RecommendedEyeWidth, bmvr::g_RecommendedEyeHeight, m_Aspect);
+        m_RenderWidth = fbW;
+        m_RenderHeight = fbH;
+        return;
     }
 
-    // Keep HMD aspect (fixes 16:9 stretched into ~square FOV). Cap the long
-    // side so two eye views stay cheaper than a full recommended 2536x2480.
-    const uint32_t longSide = (std::max)(recW, recH);
-    if (longSide > 1920)
+    uint32_t winW = KnownWindowWidth();
+    uint32_t winH = KnownWindowHeight();
+    if (winW < 640)
+        winW = 1280;
+    if (winH < 360)
+        winH = 720;
+    winW = (winW + 1u) & ~1u;
+    winH = (winH + 1u) & ~1u;
+
+    const uint32_t recW = bmvr::g_RecommendedEyeWidth;
+    const uint32_t recH = bmvr::g_RecommendedEyeHeight;
+    if (bmvr::TryHmdFramebuffer() && recW >= 640 && recH >= 360)
     {
-        const float s = 1920.0f / static_cast<float>(longSide);
-        recW = (std::max)(640u, static_cast<uint32_t>(recW * s));
-        recH = (std::max)(360u, static_cast<uint32_t>(recH * s));
+        bmvr::ComputeHmdFramebufferSize(recW, recH, winW, winH, m_Aspect);
+        if (bmvr::HaveHmdFramebufferSize(fbW, fbH))
+        {
+            m_RenderWidth = fbW;
+            m_RenderHeight = fbH;
+            Game::logMsg("Eye/G-buffer size %ux%u (HMD aspect in %ux%u window, recommended %ux%u aspect=%.3f)",
+                fbW, fbH, winW, winH, recW, recH, m_Aspect);
+            return;
+        }
     }
-    recW = (recW + 1u) & ~1u;
-    recH = (recH + 1u) & ~1u;
-    if (m_RenderWidth != recW || m_RenderHeight != recH)
-        Game::logMsg("Eye RT size %ux%u (recommended %ux%u aspect=%.3f)",
-            recW, recH, bmvr::g_RecommendedEyeWidth, bmvr::g_RecommendedEyeHeight, m_Aspect);
-    m_RenderWidth = recW;
-    m_RenderHeight = recH;
+
+    if (m_RenderWidth != winW || m_RenderHeight != winH)
+        Game::logMsg("Eye RT size %ux%u (window, recommended %ux%u hmdAspect=%.3f)",
+            winW, winH, recW, recH, m_Aspect);
+    m_RenderWidth = winW;
+    m_RenderHeight = winH;
 }
 
 Vector VR::GetViewAngle() const
 {
     return Vector(m_HmdAngAbs.x, m_HmdAngAbs.y, m_HmdAngAbs.z);
+}
+
+float VR::HorizontalFovForAspect(float targetAspect) const
+{
+    if (!(m_Fov > 10.f) || !(m_Aspect > 0.1f) || !(targetAspect > 0.1f))
+        return m_Fov;
+    const float halfRad = m_Fov * 0.5f * (3.14159265358979323846f / 180.0f);
+    const float tanHalfY = tanf(halfRad) / m_Aspect;
+    return 2.0f * atanf(tanHalfY * targetAspect) * (180.0f / 3.14159265358979323846f);
+}
+
+Vector VR::GetViewOriginLeft(const Vector& setupOrigin, const Vector& viewRight) const
+{
+    // L4D2VR offsets along HMD right because it also writes HMD angles into
+    // the copy. We keep relative look on the tram camera, so IPD is along
+    // the looked view's right, not absolute HMD right.
+    return setupOrigin - (viewRight * ((m_Ipd * m_IpdScale * m_VRScale) * 0.5f));
+}
+
+Vector VR::GetViewOriginRight(const Vector& setupOrigin, const Vector& viewRight) const
+{
+    return setupOrigin + (viewRight * ((m_Ipd * m_IpdScale * m_VRScale) * 0.5f));
 }
 
 void VR::WaitPosesForStereoFrame()
@@ -633,93 +677,25 @@ bool VR::EnsureFrameCopySurface(IDirect3DDevice9* device, uint32_t width, uint32
 
 bool VR::EnsureNamedEyeTextures()
 {
-    if (m_UsedNamedRenderTargets && m_LeftEyeTexture && m_RightEyeTexture
-        && m_D9LeftEyeSurface && m_D9RightEyeSurface)
-        return true;
-    if (!bmvr::TryNamedRenderTargets() || !bmvr::TryStereoRenderView())
-        return false;
-    if (!m_Game || !m_Game->m_MaterialSystem || !m_Game->m_Offsets)
-        return false;
-    // Present-thread CreateNamed during 1 FPS map load killed the process
-    // (2026-08-16). L4D2VR creates these from RenderView after the game is up.
-    if (m_SubmitCount < 90)
-        return false;
+    return false;
+}
 
-    auto& o = *m_Game->m_Offsets;
-    if (!o.BeginRTAlloc.valid || !o.EndRTAlloc.valid || !o.CreateNamedRTEx.valid)
-        return false;
+bool VR::NamedStereoReady() const
+{
+    return false;
+}
 
-    const uint32_t oldW = m_RenderWidth;
-    const uint32_t oldH = m_RenderHeight;
-    ChooseEyeRenderSize();
-    const int w = static_cast<int>(m_RenderWidth);
-    const int h = static_cast<int>(m_RenderHeight);
-    if (w < 640 || h < 360)
-    {
-        m_RenderWidth = oldW;
-        m_RenderHeight = oldH;
-        return false;
-    }
-
-    void* mat = m_Game->m_MaterialSystem;
-    auto* running = reinterpret_cast<uint8_t*>(mat) + Offsets::kCMaterialSystem_isGameRunning;
-    const uint8_t prevRunning = *running;
-
-    auto beginFn = reinterpret_cast<tBeginRTAlloc>(o.BeginRTAlloc.address);
-    auto endFn = reinterpret_cast<tEndRTAlloc>(o.EndRTAlloc.address);
-    auto createFn = reinterpret_cast<tCreateNamedRTEx>(o.CreateNamedRTEx.address);
-
-    bmvr::BeginRisky(L"named_rt");
-    *running = 0;
-    bool beginOk = false;
-    SehBeginRTAlloc(beginFn, mat, beginOk);
-    *running = 1;
-
-    ReleaseT(m_D9LeftEyeSurface);
-    ReleaseT(m_D9RightEyeSurface);
-
-    m_CreatingTextureID = Texture_LeftEye;
-    ITexture* left = SehCreateNamedEyeRT(createFn, mat, "leftEye0", w, h);
-    m_CreatingTextureID = Texture_RightEye;
-    ITexture* right = SehCreateNamedEyeRT(createFn, mat, "rightEye0", w, h);
-    m_CreatingTextureID = Texture_None;
-
-    SehEndRTAlloc(endFn, mat);
-    *running = prevRunning;
-
-    const bool d3dOk = m_D9LeftEyeSurface && m_D9RightEyeSurface
-        && FillSharedTexture(m_D9LeftEyeSurface, m_VKLeftEye)
-        && FillSharedTexture(m_D9RightEyeSurface, m_VKRightEye);
-    if (!beginOk || !left || !right || !d3dOk)
-    {
-        Game::logMsg("Named eye RTs failed begin=%d L=%p R=%p d3d=%d %dx%d",
-            beginOk ? 1 : 0, (void*)left, (void*)right, d3dOk ? 1 : 0, w, h);
-        m_LeftEyeTexture = nullptr;
-        m_RightEyeTexture = nullptr;
-        m_UsedNamedRenderTargets = false;
-        m_RenderWidth = oldW;
-        m_RenderHeight = oldH;
-        bmvr::EndRisky(L"named_rt");
-        if (g_D3DVR9)
-        {
-            IDirect3DDevice9* device = nullptr;
-            if (SUCCEEDED(g_D3DVR9->GetD3DDevice(&device)) && device)
-            {
-                EnsurePrivateEyeSurfaces(device);
-                device->Release();
-            }
-        }
-        return false;
-    }
-
-    m_LeftEyeTexture = left;
-    m_RightEyeTexture = right;
-    m_UsedNamedRenderTargets = true;
-    m_CreatedVRTextures.store(true, std::memory_order_release);
-    bmvr::EndRisky(L"named_rt");
-    Game::logMsg("Named eye RTs ready leftEye0/rightEye0 %dx%d created=1 L=%p R=%p d3dL=%p d3dR=%p",
-        w, h, (void*)left, (void*)right, (void*)m_D9LeftEyeSurface, (void*)m_D9RightEyeSurface);
-    return true;
+void VR::PrepareNamedStereoFromPresent()
+{
+    if (!bmvr::TryStereoRenderView() || !m_GameplayEligible)
+        return;
+    // Do not ClientCmd cvars from Present during load. The 1576 matching-
+    // swapchain death logged "queued cl_csm_enabled 0" then died before any
+    // RenderView; CSM disable was a named-RT wrap leftover and is not
+    // required for G-buffer-sized blit stereo (stereo_copy survived with CSM).
+    if (!m_Game || !m_Game->m_EngineClient || !m_Game->m_EngineClient->IsInGame())
+        return;
+    EnsureStereoEyeSurfaces();
 }
 
 bool VR::EnsurePrivateEyeSurfaces(IDirect3DDevice9* device)
@@ -727,10 +703,16 @@ bool VR::EnsurePrivateEyeSurfaces(IDirect3DDevice9* device)
     if (!device)
         return false;
 
-    // Private capture path must match the desktop backbuffer. HMD-aspect
-    // 1920x1878 eyes + letterbox Submit crashed during map load (2026-08-16).
-    const UINT w = KnownWindowWidth();
-    const UINT h = KnownWindowHeight();
+    // Match the D3D swapchain. With hmd_fb that is HMD aspect (e.g. 1580x1440)
+    // inside a 16:9 HWND — not recommended 3k, and not the HWND client size.
+    UINT w = KnownWindowWidth();
+    UINT h = KnownWindowHeight();
+    uint32_t fbW = 0, fbH = 0;
+    if (bmvr::HaveHmdFramebufferSize(fbW, fbH))
+    {
+        w = fbW;
+        h = fbH;
+    }
     if (w < 640 || h < 360)
         return false;
 
@@ -775,6 +757,65 @@ bool VR::EnsurePrivateEyeSurfaces(IDirect3DDevice9* device)
     return m_CreatedVRTextures.load();
 }
 
+bool VR::EnsureStereoEyeSurfaces()
+{
+    ChooseEyeRenderSize();
+    const UINT w = m_RenderWidth;
+    const UINT h = m_RenderHeight;
+    if (w < 640 || h < 360 || !g_D3DVR9)
+        return false;
+    if (m_D9LeftEyeSurface && m_D9RightEyeSurface
+        && m_VKLeftEye.m_VulkanData.m_nWidth == w && m_VKLeftEye.m_VulkanData.m_nHeight == h)
+        return true;
+
+    IDirect3DDevice9* device = nullptr;
+    if (FAILED(g_D3DVR9->GetD3DDevice(&device)) || !device)
+        return false;
+
+    std::lock_guard<TextureStateMutex> lock(m_TextureMutex);
+    // Do not Release capture-sized eyes the compositor may still hold.
+    m_D9LeftEyeSurface = nullptr;
+    m_D9RightEyeSurface = nullptr;
+    m_D9LeftEyeTexture = nullptr;
+    m_D9RightEyeTexture = nullptr;
+
+    auto createEye = [&](TextureID id, IDirect3DTexture9** tex, IDirect3DSurface9** surf, SharedTextureHolder& vk) -> bool {
+        m_CreatingTextureID = id;
+        const HRESULT hr = device->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, tex, nullptr);
+        m_CreatingTextureID = Texture_None;
+        if (FAILED(hr) || !*tex)
+        {
+            Game::logMsg("Stereo eye CreateTexture id=%d hr=0x%08X %ux%u", (int)id, (unsigned)hr, w, h);
+            return false;
+        }
+        (*tex)->GetSurfaceLevel(0, surf);
+        if (!*surf || !FillSharedTexture(*surf, vk))
+        {
+            Game::logMsg("Stereo eye GetVRDesc failed id=%d", (int)id);
+            return false;
+        }
+        return true;
+    };
+
+    const bool leftOk = createEye(Texture_LeftEye, &m_D9LeftEyeTexture, &m_D9LeftEyeSurface, m_VKLeftEye);
+    const bool rightOk = createEye(Texture_RightEye, &m_D9RightEyeTexture, &m_D9RightEyeSurface, m_VKRightEye);
+    m_CreatedVRTextures.store(leftOk && rightOk && m_VKLeftEye.m_VulkanData.m_nImage && m_VKRightEye.m_VulkanData.m_nImage,
+        std::memory_order_release);
+    Game::logMsg("Stereo HMD-aspect D3D eyes ready=%d %ux%u L=%p R=%p",
+        m_CreatedVRTextures.load() ? 1 : 0, w, h,
+        (void*)m_D9LeftEyeSurface, (void*)m_D9RightEyeSurface);
+    device->Release();
+    return m_CreatedVRTextures.load();
+}
+
+bool VR::StereoEyesReady() const
+{
+    return m_D9LeftEyeSurface && m_D9RightEyeSurface
+        && m_RenderWidth >= 640 && m_RenderHeight >= 360
+        && m_VKLeftEye.m_VulkanData.m_nWidth == m_RenderWidth
+        && m_VKLeftEye.m_VulkanData.m_nHeight == m_RenderHeight;
+}
+
 void VR::CreateVRTextures()
 {
     Game::logMsg("CreateVRTextures begin presents=%u", m_EligiblePresents);
@@ -797,6 +838,77 @@ void VR::CaptureGameColorOnUnbind(IDirect3DSurface9* oldRt, uint32_t vpX, uint32
     (void)vpH;
     // FullFrameFB unbind StretchRect after Present raced and crashed on this
     // DLL (2026-08-16). PrePresent capture is enough for the loading/menu path.
+}
+
+bool VR::BlitCurrentGameColorTo(IDirect3DSurface9* dst)
+{
+    if (!dst || !g_D3DVR9)
+        return false;
+    IDirect3DDevice9* device = nullptr;
+    if (FAILED(g_D3DVR9->GetD3DDevice(&device)) || !device)
+        return false;
+
+    IDirect3DSurface9* rt0 = nullptr;
+    device->GetRenderTarget(0, &rt0);
+    IDirect3DSurface9* bb = nullptr;
+    UINT w = 0, h = 0;
+    IDirect3DSurface9* src = rt0;
+    if (!ResolveSurfaceSize(rt0, w, h) || w < 640 || h < 360)
+    {
+        device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
+        src = bb;
+        ResolveSurfaceSize(src, w, h);
+    }
+
+    bool ok = false;
+    if (src && w >= 640 && h >= 360)
+    {
+        RECT srcRect{};
+        const RECT* srcPtr = nullptr;
+        D3DVIEWPORT9 vp{};
+        UINT cropW = w, cropH = h;
+        LONG x0 = 0, y0 = 0;
+        if (SUCCEEDED(device->GetViewport(&vp)) && vp.Width >= 640 && vp.Height >= 360
+            && vp.Width <= w && vp.Height <= h)
+        {
+            x0 = static_cast<LONG>(vp.X);
+            y0 = static_cast<LONG>(vp.Y);
+            cropW = vp.Width;
+            cropH = vp.Height;
+        }
+        else if (m_RenderWidth >= 640 && m_RenderHeight >= 360
+            && w >= m_RenderWidth && h >= m_RenderHeight)
+        {
+            cropW = m_RenderWidth;
+            cropH = m_RenderHeight;
+        }
+        if (cropW != w || cropH != h || x0 != 0 || y0 != 0)
+        {
+            srcRect = { x0, y0, x0 + static_cast<LONG>(cropW), y0 + static_cast<LONG>(cropH) };
+            srcPtr = &srcRect;
+        }
+        m_CaptureReentry = true;
+        const HRESULT hr = device->StretchRect(src, srcPtr, dst, nullptr, D3DTEXF_NONE);
+        m_CaptureReentry = false;
+        ok = SUCCEEDED(hr);
+        if (!ok)
+        {
+            static int s_blitLog;
+            if (s_blitLog < 6)
+            {
+                Game::logMsg("Stereo blit StretchRect failed hr=0x%08X src=%ux%u crop=%ux%u dst=%p",
+                    (unsigned)hr, w, h, cropW, cropH, (void*)dst);
+                ++s_blitLog;
+            }
+        }
+    }
+
+    if (rt0)
+        rt0->Release();
+    if (bb)
+        bb->Release();
+    device->Release();
+    return ok;
 }
 
 void VR::CaptureFrameBeforePresent()
@@ -1043,10 +1155,50 @@ void VR::SubmitVRTextures()
 
     vr::VRTextureBounds_t leftBounds{};
     vr::VRTextureBounds_t rightBounds{};
-    if (directEyes)
+    const float imgW = srcDesc.Width > 0 ? (float)srcDesc.Width : (float)dstDesc.Width;
+    const float imgH = srcDesc.Height > 0 ? (float)srcDesc.Height : (float)dstDesc.Height;
+    const float imgAspect = (imgW >= 64.f && imgH >= 64.f) ? (imgW / imgH) : 0.f;
+    const bool hmdAspectRt = imgAspect > 0.1f && imgAspect <= m_Aspect * 1.02f;
+
+    if (directEyes && hmdAspectRt)
     {
         leftBounds = m_TextureBounds[0];
         rightBounds = m_TextureBounds[1];
+        // Do not ApplyVulkanYFlip. Capture Submit {0,0,1,1} with the same
+        // StretchRect→TransferSurface path is upright (old UI). That flip on
+        // HMD-aspect stereo inverted a fused image (2026-08-17).
+        static int s_directBoundsLog;
+        if (s_directBoundsLog < 3)
+        {
+            Game::logMsg("Direct HMD-aspect Submit UV L u=%.3f..%.3f v=%.3f..%.3f (no Vulkan v-flip)",
+                leftBounds.uMin, leftBounds.uMax, leftBounds.vMin, leftBounds.vMax);
+            ++s_directBoundsLog;
+        }
+    }
+    else if (directEyes && m_UsedNamedRenderTargets && imgAspect > m_Aspect * 1.02f)
+    {
+        // Named RT matches the 16:9 G-buffer. Crop to HMD aspect, then apply
+        // OpenVR projection UVs inside that crop so the center is the real
+        // HMD frustum (same math as L4D2VR on an HMD-aspect eye).
+        const float vis = m_Aspect / imgAspect;
+        const float du = (1.f - vis) * 0.5f;
+        auto mapU = [du](const vr::VRTextureBounds_t& proj) {
+            vr::VRTextureBounds_t out = proj;
+            const float span = 1.f - 2.f * du;
+            out.uMin = du + span * proj.uMin;
+            out.uMax = du + span * proj.uMax;
+            return out;
+        };
+        leftBounds = mapU(m_TextureBounds[0]);
+        rightBounds = mapU(m_TextureBounds[1]);
+        static int s_namedBoundsLog;
+        if (s_namedBoundsLog < 3)
+        {
+            Game::logMsg("Named 16:9 Submit UV L u=%.3f..%.3f v=%.3f..%.3f img=%gx%g hmdAspect=%.3f",
+                leftBounds.uMin, leftBounds.uMax, leftBounds.vMin, leftBounds.vMax,
+                imgW, imgH, m_Aspect);
+            ++s_namedBoundsLog;
+        }
     }
     else
     {
@@ -1055,18 +1207,12 @@ void VR::SubmitVRTextures()
         // (WMR portal 2026-08-16). Keep v unflipped. Crop U so 16:9 matches
         // HMD aspect (~1.1) instead of stretching vertically into the FOV.
         leftBounds = { 0.f, 0.f, 1.f, 1.f };
-        const float imgW = srcDesc.Width > 0 ? (float)srcDesc.Width : (float)dstDesc.Width;
-        const float imgH = srcDesc.Height > 0 ? (float)srcDesc.Height : (float)dstDesc.Height;
-        if (imgW >= 64.f && imgH >= 64.f && m_Aspect > 0.1f)
+        if (imgAspect > m_Aspect * 1.02f && m_Aspect > 0.1f)
         {
-            const float imgAspect = imgW / imgH;
-            if (imgAspect > m_Aspect * 1.02f)
-            {
-                const float vis = m_Aspect / imgAspect;
-                const float du = (1.f - vis) * 0.5f;
-                leftBounds.uMin = du;
-                leftBounds.uMax = 1.f - du;
-            }
+            const float vis = m_Aspect / imgAspect;
+            const float du = (1.f - vis) * 0.5f;
+            leftBounds.uMin = du;
+            leftBounds.uMax = 1.f - du;
         }
         rightBounds = leftBounds;
         static int s_boundsLog;
@@ -1210,6 +1356,10 @@ void VR::Update()
         s_fpsLogMs = nowMs;
         s_fpsLogTick = m_PresentTick;
     }
+    if (m_GameplayEligible && inGame && m_EligiblePresents < 100000)
+        ++m_EligiblePresents;
+    if (m_GameplayEligible && inGame && m_EligiblePresents == 120 && bmvr::TryHmdFramebuffer())
+        bmvr::EndRisky(L"hmd_fb");
 
     const DWORD poseTickEarly = m_WaitedPoseTick.load(std::memory_order_acquire);
     const DWORD poseAgeEarly = poseTickEarly ? (nowMs - poseTickEarly) : 0xffffffffu;
@@ -1234,6 +1384,8 @@ void VR::Update()
 
     if (g_D3DVR9 && !m_CreatedVRTextures.load(std::memory_order_acquire))
         CreateVRTextures();
+
+    PrepareNamedStereoFromPresent();
 
     if (!m_PosesWaitedThisFrame)
         UpdateTracking();

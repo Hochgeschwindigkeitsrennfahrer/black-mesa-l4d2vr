@@ -36,6 +36,8 @@ A thirdparty-only install is invisible on native D3D9. Install to `bin\` and nex
 
 **Keep L4D2VR’s combined DXVK+OpenVR `d3d9.dll`.** Do not hook stock Steam DXVK at the Vulkan ICD. Do not switch the VR runtime to OpenXR because DXVK is on.
 
+Stock `dxvk.conf` ships `d3d9.deviceLossOnFocusLoss = True`. That **overrides** the built-in `bms.exe` profile (`False`). Effective log on 2026-08-17: built-in False, file True, result True. Set the file to False (install.ps1 rewrites it). Do not leave True and try to out-code it in `NotifyWindowActivated`.
+
 ## CreateDevice patch
 
 L4D2VR’s `CreateDevice` calls `VR_Init` and overwrites `BackBufferWidth/Height` with the HMD recommended size. This build **retried that** and it **failed** on Black Mesa (2026-08-16): 3168×3100 swapchain → black desktop, one Submit, then Reset + SteamVR waiting room. `hmd_swap` is persisted in `bmvr_skip.txt`. `Reset`/`ResetEx` do not force the backbuffer to eye size while that skip is set. `VR_Init` still runs later from `VR::InitOpenVR`. No `ExitProcess` if SteamVR is off.
