@@ -41,6 +41,22 @@ BMVR: retry that **without** poking L4D2’s `isGameRunning` offset (wrong on BM
 
 Retry `WaitDeviceIdle` after `TransferSurface`. Crash-sticky disable if the process dies.
 
+## Multicore / queued rendering (L4D2VR `main2`, BM-safe subset)
+
+L4D2VR AutoMatQueueMode issues `ClientCmd_Unrestricted("mat_queue_mode N")` from `VR::Update`. That is **not** copied — Present/CreateMove/RenderView `ClientCmd` crashed BM.
+
+Ported instead:
+
+- Real `GetMatQueueMode` = vfunc **11** `GetThreadMode` **only after a gameplay map is in-game**. Load/menu/`!IsInGame` return 0 without calling into `IMaterialSystem`. Present may call it; **DXVK `SetViewport` / `SetRenderTarget` must not**.
+- `SetThreadMode` vfunc **10**, then ICvar `mat_queue_mode` if the probe works.
+- Menu/load/pause/first 8 in-game pass-through RenderViews → 0, then gameplay → 2. Crash-sticky `mat_queue`. Do not `SetThreadMode(2)` on the first spawn Present (that hung after pass-through 2/8, 2026-08-18). Windowed swapchain stays at the HWND size while `hmd_swap` is skipped.
+- DXVK `SetViewport` only rewrites when RT0 is a private eye/HUD surface. No `IsInGame` / `GetMatQueueMode` from that call (those nested stdshader until Present died, 2026-08-18).
+- `GetScreenSize` / `GetBackBufferDimensions` / `CreateNamedRT` keep the HMD size lie whenever the G-buffer exists, including map load. Skipping the lie during `eligible && !IsInGame` made shaders query 2560 while `SetRT` reset the viewport to 2384.
+- `SourceRenderQueueBuildScope` around outer `RenderView` when queued (`m_SourceRenderQueueBuildCount`).
+- `IMaterialSystem::EndFrame` vfunc **37** only if `vtbl[30] == GetBackBufferDimensions`. Completes queue markers after the original (queued/completed stay 0 unless a later path fills them).
+
+Not ported: ICallQueue ownership markers, queued compositor worker, Neko EndFrame gate, thousands of lines of present-spike / ReShade.
+
 ## L4D2-only (not ported)
 
 Melee/terror weapons, workshop, ozz hands, pose relay, Neko HDR post, ReShade VR compat, desktop HUD overlays, queued compositor worker, index-buffer / datacache forcing in `dllmain.cpp`, `ExitProcess` on `VR_Init` failure.

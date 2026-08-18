@@ -24,15 +24,37 @@ static void RestoreDesktopDisplayModes()
     EnumDisplayMonitors(nullptr, nullptr, RestoreMonitorMode, 0);
 }
 
-static DWORD WINAPI InitBMVR(LPVOID)
+static DWORD WINAPI InitBMVR(LPVOID param)
 {
 #ifdef _DEBUG
     AllocConsole();
     FILE* fp = nullptr;
     freopen_s(&fp, "CONOUT$", "w", stdout);
 #endif
+    // Three install copies (game root, bin\, DXVK folder) can map as distinct
+    // modules. A second Game()/pose waiter calling WaitGetPoses wedged the
+    // load-to-menu (2026-08-18, two "BMVR d3d9.dll loaded" then no LevelInit).
+    HANDLE initGate = CreateMutexW(nullptr, TRUE, L"Local\\BlackMesaVR-InitBMVR");
+    if (!initGate)
+    {
+        bmvr::Log("InitBMVR CreateMutex failed err=%lu", GetLastError());
+        return 0;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        char path[MAX_PATH]{};
+        GetModuleFileNameA(static_cast<HMODULE>(param), path, MAX_PATH);
+        bmvr::Log("InitBMVR skipped duplicate d3d9.dll %s", path[0] ? path : "?");
+        ReleaseMutex(initGate);
+        CloseHandle(initGate);
+        return 0;
+    }
+
     bmvr::InitFromDisk();
-    bmvr::Log("BMVR d3d9.dll loaded (L4D2VR architecture, Black Mesa offsets)");
+    char path[MAX_PATH]{};
+    GetModuleFileNameA(static_cast<HMODULE>(param), path, MAX_PATH);
+    bmvr::Log("BMVR d3d9.dll loaded (L4D2VR architecture, Black Mesa offsets) from %s",
+        path[0] ? path : "?");
     g_Game = new Game();
     return 0;
 }

@@ -10,6 +10,32 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
+
+namespace
+{
+    void** SehMaterialSystemVTable(IMaterialSystem* mat)
+    {
+        void** vt = nullptr;
+        if (!mat)
+            return nullptr;
+        __try
+        {
+            vt = *reinterpret_cast<void***>(mat);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            vt = nullptr;
+        }
+        return vt;
+    }
+
+    bool EngineInGame()
+    {
+        return Hooks::m_Game && Hooks::m_Game->m_EngineClient
+            && Hooks::m_Game->m_EngineClient->IsInGame();
+    }
+}
 
 Hooks::Hooks(Game* game)
 {
@@ -50,6 +76,7 @@ Hooks::Hooks(Game* game)
     enableIfReady(hkLevelShutdown, "LevelShutdown");
     enableIfReady(hkCalcViewModelView, "CalcViewModelView");
     enableIfReady(hkGetViewModelFOV, "GetViewModelFOV");
+    enableIfReady(hkEndFrame, "EndFrame");
 }
 
 Hooks::~Hooks()
@@ -91,6 +118,21 @@ int Hooks::initSourceHooks()
         hkGetScreenSize.createHook((LPVOID)o.GetScreenSize.address, &dGetScreenSize);
     if (o.CreateNamedRTEx.valid)
         hkCreateNamedRTEx.createHook((LPVOID)o.CreateNamedRTEx.address, &dCreateNamedRTEx);
+    // DrawModelExecute stays unhooked: it was never installed before 2026-08-18,
+    // and enabling it coincided with load-to-menu never reaching LevelInit.
+    // Confirm IModelRender ABI (3-arg vs IMatRenderContext first) before retry.
+    // LevelInit stays unhooked: MinHook on it crashed inside the original on
+    // background01 (docs/RUNTIME.md). Map names come from GetLevelNameShort.
+    if (m_Game->MaterialVTableMatchesDump() && m_Game->m_MaterialSystem)
+    {
+        void** vt = SehMaterialSystemVTable(m_Game->m_MaterialSystem);
+        if (vt && vt[37])
+            hkEndFrame.createHook(vt[37], &dEndFrame);
+        else
+            Game::logMsg("EndFrame hook skipped (no vtbl[37])");
+    }
+    else
+        Game::logMsg("EndFrame hook skipped (IMaterialSystem vtable does not match dump)");
 
     return 1;
 }
@@ -121,6 +163,73 @@ namespace
         }
         return name ? name : "?";
     }
+
+    const char* SafeModelName(IModelInfo* info, void* model)
+    {
+        if (!info || !model)
+            return nullptr;
+        const char* name = nullptr;
+        __try
+        {
+            name = info->GetModelName(model);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            name = nullptr;
+        }
+        return name;
+    }
+
+    int SafeLocalPlayerIndex()
+    {
+        if (!Hooks::m_Game || !Hooks::m_Game->m_EngineClient)
+            return 0;
+        int local = 0;
+        __try
+        {
+            local = Hooks::m_Game->m_EngineClient->GetLocalPlayer();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            local = 0;
+        }
+        return local;
+    }
+
+    bool ModelNameIsViewmodel(const char* name)
+    {
+        if (!name || !name[0])
+            return false;
+        return std::strstr(name, "/v_") != nullptr
+            || std::strstr(name, "\\v_") != nullptr
+            || std::strstr(name, "/V_") != nullptr
+            || std::strstr(name, "\\V_") != nullptr;
+    }
+
+    struct SourceRenderQueueBuildScope
+    {
+        VR* vr = nullptr;
+        bool active = false;
+        SourceRenderQueueBuildScope(VR* owner, bool enabled)
+            : vr(owner), active(enabled && owner != nullptr)
+        {
+            if (active)
+            {
+                std::lock_guard<std::recursive_mutex> consumerGate(vr->m_SourceRenderConsumerGate);
+                vr->m_SourceRenderQueueBuildCount.fetch_add(1, std::memory_order_acq_rel);
+            }
+        }
+        ~SourceRenderQueueBuildScope()
+        {
+            if (active)
+            {
+                std::lock_guard<std::recursive_mutex> consumerGate(vr->m_SourceRenderConsumerGate);
+                vr->m_SourceRenderQueueBuildCount.fetch_sub(1, std::memory_order_acq_rel);
+            }
+        }
+        SourceRenderQueueBuildScope(const SourceRenderQueueBuildScope&) = delete;
+        SourceRenderQueueBuildScope& operator=(const SourceRenderQueueBuildScope&) = delete;
+    };
 
     // Only the HDR scene color buffer. Redirecting 8192 CSM/flashlight
     // targets into the eye RT (and keeping their 8K depth) died on the first
@@ -294,8 +403,15 @@ namespace
 
     void NormalizeViewSetupForVREye(CViewSetup& view, const VR* vr)
     {
+        // L4D2VR hooks_render.inl: eye copies are HMD size + HMD FOV + HMD
+        // aspect. 16:9 engine FOV + center-crop (2026-08-18) zoomed the world
+        // (objects huge), broke distance fusion (IPD still ~2.5in), and sat
+        // the camera above NPC eye level. Do not write height into 0x1C
+        // (that is m_eStereoEye on BM). Do not force zNear=6.
         const int eyeWidth = static_cast<int>(vr->m_RenderWidth);
         const int eyeHeight = static_cast<int>(vr->m_RenderHeight);
+        if (eyeWidth < 640 || eyeHeight < 360)
+            return;
         view.x = 0;
         view.y = 0;
         view.m_nUnscaledX = 0;
@@ -304,12 +420,6 @@ namespace
         view.height = eyeHeight;
         view.m_nUnscaledWidth = eyeWidth;
         view.m_nUnscaledHeight = eyeHeight;
-        // m_eStereoEye stays MONO (0). It lives at 0x1C on BM; stuffing the
-        // eye height there made RenderView index this+0x744+1440 and crash.
-        // Match world FOV on the viewmodel frustum (L4D2VR / Portal 2). BM's
-        // GetViewModelFOV still returns viewmodel_fov_override (~54) unless
-        // hooked — that is the huge doubled gun. Do not force zNear=6; that
-        // bundle died on the first stereo RenderView (2026-08-17).
         view.m_flAspectRatio = vr->m_Aspect;
         view.fov = vr->m_Fov;
         view.fovViewmodel = vr->m_Fov;
@@ -319,37 +429,22 @@ namespace
     {
         if (!Hooks::m_VR)
             return;
+        if (!g_StereoRedirect && !Hooks::m_VR->StereoEyeBlitActive())
+            return;
         const int eyeW = static_cast<int>(Hooks::m_VR->m_RenderWidth);
         const int eyeH = static_cast<int>(Hooks::m_VR->m_RenderHeight);
         if (eyeW < 640 || eyeH < 360)
             return;
-        if (g_StereoRedirect)
-        {
-            x = 0;
-            y = 0;
-            if (width > eyeW)
-                width = eyeW;
-            if (height > eyeH)
-                height = eyeH;
-            if (width < 1)
-                width = eyeW;
-            if (height < 1)
-                height = eyeH;
-            return;
-        }
-        // HMD-aspect G-buffer: engine may still pass the 16:9 window as the
-        // main view. Do not clamp 8K CSM / flashlight targets. Forcing every
-        // 640x360+ viewport to eye size (Portal 2 dGetViewport) is not safe
-        // on BM — first stereo after that change died before the stereo log.
-        if (bmvr::TryHmdFramebuffer() && Hooks::m_VR->IsGameplayEligible()
-            && height >= eyeH - 16 && height <= eyeH + 16 && width > eyeW
-            && width <= eyeW * 2)
-        {
-            x = 0;
-            y = 0;
+        x = 0;
+        y = 0;
+        if (width > eyeW)
             width = eyeW;
+        if (height > eyeH)
             height = eyeH;
-        }
+        if (width < 1)
+            width = eyeW;
+        if (height < 1)
+            height = eyeH;
     }
 
     void BindStereoPushToEye(ITexture*& pTexture, ITexture*& pDepthTexture, int& nViewX, int& nViewY, int& nViewW, int& nViewH, bool& redirected)
@@ -405,10 +500,22 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         return;
     }
 
-    const bool mainView = setup.width >= 640 && setup.height >= 360;
+    const bool queued = m_Game && m_Game->GetMatQueueMode() != 0;
+    SourceRenderQueueBuildScope sourceRenderQueueBuildScope(m_VR, queued);
 
-    if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible())
+    const bool mainView = setup.width >= 640 && setup.height >= 360;
+    const bool inGame = m_Game && m_Game->m_EngineClient && m_Game->m_EngineClient->IsInGame();
+
+    if (m_VR && mainView)
+        m_VR->m_SetupOrigin = setup.origin;
+
+    if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible() && inGame)
         m_VR->WaitPosesForStereoFrame();
+
+    if (m_VR && m_Game && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible()
+        && inGame && mainView && m_VR->PassThroughWarmupDone()
+        && !m_VR->m_StereoEyesDrawnThisFrame)
+        m_VR->TickMatQueueFromRenderView();
 
     // L4D2VR/Portal2: HMD angles + origin on a COPY. Writing the same values
     // onto the live CViewSetup is abs_view (tram camera blacked).
@@ -433,7 +540,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             m_VR->m_DirectEyeSubmit = false;
             m_VR->m_StereoRenderViewActive = false;
         }
-        if (m_VR && m_VR->IsGameplayEligible()
+        if (m_VR && m_VR->IsGameplayEligible() && inGame
             && mainView && m_VR->m_HmdPoseValid)
         {
             CViewSetup vrView = setup;
@@ -466,7 +573,6 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         callOriginal(setup, nClearFlags, whatToDraw);
         return;
     }
-    const bool inGame = m_Game && m_Game->m_EngineClient && m_Game->m_EngineClient->IsInGame();
     if (mainView && m_VR->IsGameplayEligible())
     {
         static int s_setupLog;
@@ -499,9 +605,10 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
     // this hook immediately ran two RenderViews with HMD FOV/zNear/IPD during
     // spawn. Died inside the left callOriginal. Menu 1584 and that first
     // setup= line both succeeded. Wait for pass-through world frames first.
-    constexpr uint32_t kStereoAfterPassThrough = 8;
+    constexpr uint32_t kStereoAfterPassThrough = VR::kPassThroughViewsBeforeQueued;
     if (bmvr::TryStereoRenderView()
         && m_VR->IsGameplayEligible()
+        && inGame
         && mainView
         && originOk
         && fovOk
@@ -531,6 +638,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
     // that survived as stereo_copy) instead of a second HDR RT.
     if (bmvr::TryStereoRenderView()
         && m_VR->IsGameplayEligible()
+        && inGame
         && mainView
         && originOk
         && fovOk
@@ -539,17 +647,16 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         if (m_VR->m_StereoEyesDrawnThisFrame)
         {
             // L4D2VR replaces the one player view with two eye draws. Extra
-            // same-size RenderViews were full world passes (perf) and
-            // passThrough cleared DirectEyeSubmit. Reflections/CSM stay.
-            const int eyeW = static_cast<int>(m_VR->m_RenderWidth);
-            const int eyeH = static_cast<int>(m_VR->m_RenderHeight);
-            const bool sameFb = abs(setup.width - eyeW) <= 16 && abs(setup.height - eyeH) <= 16;
-            if (sameFb)
+            // same-size RenderViews were full world passes. After spawn the
+            // engine also issues 1920x1080 while G-buffers are 1584x1440
+            // (2026-08-18); callOriginal of that leftover hung Present.
+            // Shadows/CSM/reflections stay (those are < 640).
+            if (mainView)
             {
                 static int s_skipDup;
                 if (s_skipDup < 8)
                 {
-                    Game::logMsg("Skip duplicate main RenderView after stereo %dx%d",
+                    Game::logMsg("Skip leftover main RenderView after stereo %dx%d",
                         setup.width, setup.height);
                     ++s_skipDup;
                 }
@@ -581,13 +688,16 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         {
             s_hmdFbOnce = 1;
             bmvr::BeginRisky(L"hmd_fb");
-            Game::logMsg("Stereo HMD-fb begin setup=%dx%d unscaled=%dx%d stereoEye=%d eye=%dx%d fov=%.1f->%.1f aspect=%.3f->%.3f zNear=%.1f ipd=%.2f L=(%.1f,%.1f,%.1f) R=(%.1f,%.1f,%.1f)",
+            if (bmvr::TrySteamVrEyeRt())
+                bmvr::BeginRisky(L"steamvr_rt");
+            Game::logMsg("Stereo HMD-fb begin setup=%dx%d unscaled=%dx%d stereoEye=%d eye=%dx%d fov=%.1f->%.1f aspect=%.3f->%.3f zNear=%.1f ipd=%.2f L=(%.1f,%.1f,%.1f) R=(%.1f,%.1f,%.1f) steamvr_rt=%d",
                 setup.width, setup.height, setup.m_nUnscaledWidth, setup.m_nUnscaledHeight,
                 setup.m_eStereoEye, eyeW, eyeH,
                 setup.fov, leftEyeView.fov, setup.m_flAspectRatio, leftEyeView.m_flAspectRatio,
                 leftEyeView.zNear, ipd,
                 leftEyeView.origin.x, leftEyeView.origin.y, leftEyeView.origin.z,
-                rightEyeView.origin.x, rightEyeView.origin.y, rightEyeView.origin.z);
+                rightEyeView.origin.x, rightEyeView.origin.y, rightEyeView.origin.z,
+                bmvr::TrySteamVrEyeRt() ? 1 : 0);
         }
 
         m_VR->m_DirectEyeSubmit = true;
@@ -605,8 +715,12 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         m_VR->m_StereoEye = 1;
         m_VR->BeginStereoEyeBlit(m_VR->m_D9LeftEyeSurface);
         callOriginal(leftEyeView, nClearFlags, whatToDraw);
-        if (!m_VR->EndStereoEyeBlit())
-            m_VR->BlitCurrentGameColorTo(m_VR->m_D9LeftEyeSurface);
+        m_VR->EndStereoEyeBlit();
+        {
+            const bool leftBb = m_VR->BlitHmdViewFromBackbuffer(m_VR->m_D9LeftEyeSurface);
+            if (!leftBb)
+                m_VR->BlitCurrentGameColorTo(m_VR->m_D9LeftEyeSurface);
+        }
         if (s_eyeRvLog < 8)
         {
             Game::logMsg("Stereo HMD-fb right RenderView %dx%d", eyeW, eyeH);
@@ -615,17 +729,37 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         m_VR->m_StereoEye = 2;
         m_VR->BeginStereoEyeBlit(m_VR->m_D9RightEyeSurface);
         callOriginal(rightEyeView, nClearFlags, whatToDraw);
-        if (!m_VR->EndStereoEyeBlit())
-            m_VR->BlitCurrentGameColorTo(m_VR->m_D9RightEyeSurface);
+        m_VR->EndStereoEyeBlit();
+        {
+            const bool rightBb = m_VR->BlitHmdViewFromBackbuffer(m_VR->m_D9RightEyeSurface);
+            if (!rightBb)
+                m_VR->BlitCurrentGameColorTo(m_VR->m_D9RightEyeSurface);
+        }
         m_VR->m_StereoEye = 0;
         m_VR->m_HasStereoBodyOrigin = false;
+        if (m_VR->m_IsVREnabled)
+            m_VR->ClearUnusedDesktopBackbuffer();
+        // Do not stretch eyes onto the backbuffer. That overwrote the
+        // engine's 1584 tram strip with a black A2R10 copy (2026-08-18).
 
         m_VR->m_RenderedNewFrame.store(true, std::memory_order_release);
+
+        static int s_hmdFbDone;
+        if (s_hmdFbDone < 4)
+        {
+            Game::logMsg("Stereo HMD-fb pair done %dx%d redirected=%d",
+                eyeW, eyeH, m_VR->StereoRedirectedToEye() ? 1 : 0);
+            ++s_hmdFbDone;
+        }
 
         static int s_hmdFbFrames;
         ++s_hmdFbFrames;
         if (s_hmdFbFrames == 120)
+        {
             bmvr::EndRisky(L"hmd_fb");
+            if (bmvr::TrySteamVrEyeRt())
+                bmvr::EndRisky(L"steamvr_rt");
+        }
         return;
     }
 
@@ -653,7 +787,7 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
     // BM has no FireTerror / Weapon_ShootPosition yet, so cmd viewangles is
     // the aim. Stick walk stays HMD-relative by rotating analog into the
     // controller yaw frame. Do not hook EyePosition (that would move the camera).
-    if (m_VR->IsGameplayEligible() && m_VR->m_HmdPoseValid)
+    if (m_VR->IsGameplayEligible() && EngineInGame() && m_VR->m_HmdPoseValid)
     {
         const Vector hmdVa = m_VR->GetViewAngle();
         if (m_VR->m_ControllerPoseValid)
@@ -733,26 +867,28 @@ void __fastcall Hooks::dCalcViewModelView(void* ecx, void* edx, void* owner, con
     (void)edx;
     if (!hkCalcViewModelView.fOriginal)
         return;
-    if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible() && m_VR->m_HmdPoseValid)
+    if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible() && EngineInGame() && m_VR->m_HmdPoseValid)
     {
         // Uncoupled viewmodel: same world pose both eyes (sd805 / Portal 2).
         // Do not IPD the gun — that drew two weapons (2026-08-17).
-        const Vector body = m_VR->m_HasStereoBodyOrigin ? m_VR->m_StereoBodyOrigin : eyePosition;
         if (m_VR->m_ControllerPoseValid)
         {
-            Vector origin = m_VR->GetRecommendedViewmodelAbsPos(body);
+            Vector origin = m_VR->GetRecommendedViewmodelAbsPos(eyePosition);
             QAngle ang = m_VR->GetRecommendedViewmodelAbsAngle();
             static int s_vmLog;
-            if (s_vmLog < 4)
+            if (s_vmLog < 8)
             {
-                Game::logMsg("CalcViewModelView controller origin=(%.1f,%.1f,%.1f) ang=(%.1f,%.1f,%.1f)",
-                    origin.x, origin.y, origin.z, ang.x, ang.y, ang.z);
+                Game::logMsg("CalcViewModelView controller origin=(%.1f,%.1f,%.1f) ang=(%.1f,%.1f,%.1f) eye=(%.1f,%.1f,%.1f) setup=(%.1f,%.1f,%.1f)",
+                    origin.x, origin.y, origin.z, ang.x, ang.y, ang.z,
+                    eyePosition.x, eyePosition.y, eyePosition.z,
+                    m_VR->m_SetupOrigin.x, m_VR->m_SetupOrigin.y, m_VR->m_SetupOrigin.z);
                 ++s_vmLog;
             }
             hkCalcViewModelView.fOriginal(ecx, owner, origin, ang);
             return;
         }
-        Vector origin = m_VR->GetViewOrigin(body);
+        Vector origin = m_VR->GetViewOrigin(
+            m_VR->m_HasStereoBodyOrigin ? m_VR->m_StereoBodyOrigin : eyePosition);
         const Vector va = m_VR->GetViewAngle();
         QAngle ang(va.x, va.y, va.z);
         hkCalcViewModelView.fOriginal(ecx, owner, origin, ang);
@@ -764,7 +900,7 @@ void __fastcall Hooks::dCalcViewModelView(void* ecx, void* edx, void* owner, con
 float __fastcall Hooks::dGetViewModelFOV(void* ecx, void* edx)
 {
     (void)edx;
-    if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible() && m_VR->m_Fov > 10.f)
+    if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible() && EngineInGame() && m_VR->m_Fov > 10.f)
         return m_VR->m_Fov;
     if (hkGetViewModelFOV.fOriginal)
         return hkGetViewModelFOV.fOriginal(ecx);
@@ -796,8 +932,50 @@ void __fastcall Hooks::dGetViewport(void* ecx, void* edx, int& x, int& y, int& w
 
 void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, const ModelRenderInfo_t& info, void* pCustomBoneToWorld)
 {
+    (void)edx;
+    const char* modelName = nullptr;
+    if (m_Game && m_Game->m_ModelInfo)
+        modelName = SafeModelName(m_Game->m_ModelInfo, info.pModel);
+    const bool isViewmodel = ModelNameIsViewmodel(modelName);
+    if (isViewmodel && m_VR)
+        m_VR->NoteViewmodelModel(modelName);
+
+    if (bmvr::g_HideLocalPlayerModel
+        && m_VR
+        && m_VR->IsGameplayEligible()
+        && !isViewmodel)
+    {
+        const int local = SafeLocalPlayerIndex();
+        if (local > 0 && info.entity_index == local)
+        {
+            static int s_hideLog;
+            if (s_hideLog < 4)
+            {
+                Game::logMsg("HideLocalPlayerModel skip entity=%d %s",
+                    info.entity_index, modelName ? modelName : "?");
+                ++s_hideLog;
+            }
+            return;
+        }
+    }
+
     if (hkDrawModelExecute.fOriginal)
         hkDrawModelExecute.fOriginal(ecx, state, info, pCustomBoneToWorld);
+}
+
+void __fastcall Hooks::dEndFrame(void* ecx, void* edx)
+{
+    (void)edx;
+    if (hkEndFrame.fOriginal)
+        hkEndFrame.fOriginal(ecx);
+    if (!m_VR)
+        return;
+    m_VR->m_PresentSpikeEndFrameThreadId.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    if (m_Game && m_Game->GetMatQueueMode() != 0)
+    {
+        const uint32_t queued = m_VR->m_SourceRenderQueueMarkerQueuedId.load(std::memory_order_acquire);
+        m_VR->m_SourceRenderQueueMarkerCompletedId.store(queued, std::memory_order_release);
+    }
 }
 
 void __fastcall Hooks::dPushRenderTargetAndViewport(void* ecx, void* edx, ITexture* pTexture, ITexture* pDepthTexture, int nViewX, int nViewY, int nViewW, int nViewH)
@@ -840,17 +1018,27 @@ void __fastcall Hooks::dGetBackBufferDimensions(void* ecx, void* edx, int& width
     (void)edx;
     if (hkGetBackBufferDimensions.fOriginal)
         hkGetBackBufferDimensions.fOriginal(ecx, width, height);
+    // Menu / G-buffer creation keep the 16:9 window. During an eye RenderView,
+    // L4D2VR reports HMD size so projection/HUD in that pass match the eye RT.
+    if (m_VR && m_VR->StereoEyeBlitActive()
+        && m_VR->m_RenderWidth >= 640 && m_VR->m_RenderHeight >= 360
+        && m_VR->m_RenderWidth <= static_cast<UINT>(width)
+        && m_VR->m_RenderHeight <= static_cast<UINT>(height))
+    {
+        width = static_cast<int>(m_VR->m_RenderWidth);
+        height = static_cast<int>(m_VR->m_RenderHeight);
+        return;
+    }
     uint32_t fbW = 0, fbH = 0;
     if (!bmvr::HaveHmdFramebufferSize(fbW, fbH))
         return;
     static int s_log;
     if (s_log < 8)
     {
-        Game::logMsg("GetBackBufferDimensions %dx%d -> %ux%u", width, height, fbW, fbH);
+        Game::logMsg("GetBackBufferDimensions %dx%d (HMD-fb %ux%u unused; keep window size)",
+            width, height, fbW, fbH);
         ++s_log;
     }
-    width = static_cast<int>(fbW);
-    height = static_cast<int>(fbH);
 }
 
 void __fastcall Hooks::dGetScreenSize(void* ecx, void* edx, int& width, int& height)
@@ -858,17 +1046,28 @@ void __fastcall Hooks::dGetScreenSize(void* ecx, void* edx, int& width, int& hei
     (void)edx;
     if (hkGetScreenSize.fOriginal)
         hkGetScreenSize.fOriginal(ecx, width, height);
+    if (m_VR && m_VR->StereoEyeBlitActive()
+        && m_VR->m_RenderWidth >= 640 && m_VR->m_RenderHeight >= 360
+        && m_VR->m_RenderWidth <= static_cast<UINT>(width)
+        && m_VR->m_RenderHeight <= static_cast<UINT>(height))
+    {
+        width = static_cast<int>(m_VR->m_RenderWidth);
+        height = static_cast<int>(m_VR->m_RenderHeight);
+        return;
+    }
     uint32_t fbW = 0, fbH = 0;
     if (!bmvr::HaveHmdFramebufferSize(fbW, fbH))
         return;
+    // Permanent 1584x1440 videomode inside a 2560x1440 HWND pillarboxed the
+    // desktop and offset VGUI mouse (2026-08-18). Only the stereo eye pass
+    // sees HMD size (above).
     static int s_log;
-    if (s_log < 12 && (width != static_cast<int>(fbW) || height != static_cast<int>(fbH)))
+    if (s_log < 8 && (width != static_cast<int>(fbW) || height != static_cast<int>(fbH)))
     {
-        Game::logMsg("GetScreenSize %dx%d -> %ux%u", width, height, fbW, fbH);
+        Game::logMsg("GetScreenSize %dx%d (HMD-fb %ux%u unused; keep window size)",
+            width, height, fbW, fbH);
         ++s_log;
     }
-    width = static_cast<int>(fbW);
-    height = static_cast<int>(fbH);
 }
 
 ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags)
@@ -886,15 +1085,12 @@ ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* n
         && !std::strstr(name, "flashlight"))
     {
         static int s_log;
-        if (s_log < 16)
+        if (s_log < 8)
         {
-            Game::logMsg("CreateNamedRT %s %dx%d mode=%d -> LITERAL %ux%u",
+            Game::logMsg("CreateNamedRT %s %dx%d mode=%d (keep engine size, HMD-fb %ux%u is eyes only)",
                 name, w, h, sizeMode, fbW, fbH);
             ++s_log;
         }
-        w = static_cast<int>(fbW);
-        h = static_cast<int>(fbH);
-        sizeMode = RT_SIZE_LITERAL;
     }
     if (!hkCreateNamedRTEx.fOriginal)
         return nullptr;

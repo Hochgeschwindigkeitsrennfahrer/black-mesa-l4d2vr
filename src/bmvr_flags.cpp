@@ -26,6 +26,16 @@ namespace bmvr
     float g_ViewmodelAngOffsetY = 0.f;
     float g_ViewmodelAngOffsetZ = 0.f;
     float g_ControllerPitchTilt = -35.f;
+    float g_IPDScale = 1.f;
+    float g_HeightOffset = 0.f;
+    bool g_AutoMatQueueMode = true;
+    bool g_Haptics = true;
+    bool g_HideCrosshair = true;
+    bool g_MatchHmdHz = true;
+    bool g_DisableViewBob = true;
+    bool g_LeftHanded = false;
+    bool g_RecenterResetsYaw = true;
+    bool g_HideLocalPlayerModel = true;
 
     static HMODULE g_Module = nullptr;
     static std::mutex g_LogMutex;
@@ -41,6 +51,8 @@ namespace bmvr
     static bool g_TryRelativeHmdLook = true;
     static bool g_TryStereoCopy = false;
     static bool g_TryStereoFov = false;
+    static bool g_TryMatQueue = true;
+    static bool g_TrySteamVrEyeRt = false;
     static bool g_Inited = false;
     static bool g_WatchdogStarted = false;
     static char g_Stage[64] = "dll_attach";
@@ -179,12 +191,38 @@ namespace bmvr
                 g_ViewmodelAngOffsetZ = static_cast<float>(atof(val));
             else if (std::strcmp(n, "ControllerPitchTilt") == 0)
                 g_ControllerPitchTilt = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "IPDScale") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= 0.5f && s <= 2.f)
+                    g_IPDScale = s;
+            }
+            else if (std::strcmp(n, "HeightOffset") == 0)
+                g_HeightOffset = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "AutoMatQueueMode") == 0)
+                g_AutoMatQueueMode = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "Haptics") == 0)
+                g_Haptics = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "HideCrosshair") == 0)
+                g_HideCrosshair = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "MatchHmdHz") == 0)
+                g_MatchHmdHz = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "DisableViewBob") == 0)
+                g_DisableViewBob = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "LeftHanded") == 0)
+                g_LeftHanded = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "RecenterResetsYaw") == 0)
+                g_RecenterResetsYaw = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "HideLocalPlayerModel") == 0)
+                g_HideLocalPlayerModel = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ViewmodelDisableMoveBob") == 0)
+                g_DisableViewBob = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
         }
         fclose(f);
-        Log("VR config %ls RenderScale=%.2f TurnSpeed=%.2f snap=%d vm=(%.1f,%.1f,%.1f) tilt=%.1f",
+        Log("VR config %ls RenderScale=%.2f TurnSpeed=%.2f snap=%d vm=(%.1f,%.1f,%.1f) tilt=%.1f ipd=%.2f autoQueue=%d",
             path.c_str(), g_RenderScale, g_TurnSpeed, g_SnapTurning ? 1 : 0,
             g_ViewmodelPosOffsetX, g_ViewmodelPosOffsetY, g_ViewmodelPosOffsetZ,
-            g_ControllerPitchTilt);
+            g_ControllerPitchTilt, g_IPDScale, g_AutoMatQueueMode ? 1 : 0);
     }
 
     static void ApplySkipName(const std::string& name, const char* via)
@@ -213,6 +251,13 @@ namespace bmvr
             g_TryStereoCopy = false;
         else if (name == "stereo_fov")
             g_TryStereoFov = false;
+        else if (name == "mat_queue")
+        {
+            g_TryMatQueue = false;
+            g_AutoMatQueueMode = false;
+        }
+        else if (name == "steamvr_rt")
+            g_TrySteamVrEyeRt = false;
         else
             return;
         Log("Skip %s (%s)", name.c_str(), via ? via : "skip file");
@@ -438,6 +483,13 @@ namespace bmvr
         ConsumeIfStuck(L"rel_look", g_TryRelativeHmdLook, "rel_look", "relative HMD look on RenderView copy");
         ConsumeIfStuck(L"stereo_copy", g_TryStereoCopy, "stereo_copy", "double RenderView blit stereo");
         ConsumeIfStuck(L"stereo_fov", g_TryStereoFov, "stereo_fov", "same-size HMD-FOV double RenderView");
+        ConsumeIfStuck(L"mat_queue", g_TryMatQueue, "mat_queue", "L4D2VR AutoMatQueueMode / SetThreadMode 2");
+        ConsumeIfStuck(L"steamvr_rt", g_TrySteamVrEyeRt, "steamvr_rt", "SteamVR recommended eye RT (offscreen)");
+        // 2026-08-18: 3296x3216 private eyes + SetRT/depth redirect over the
+        // 2560x1440 deferred G-buffer. Stereo pair logged redirected=1, blit
+        // skipped, Present ~90fps, audio OK, Escape menu OK, world black on
+        // desktop and HMD. Crash-sticky never fired (process stayed alive).
+        PersistSkip("steamvr_rt", "3296 offscreen SetRT over 2560 G-buffer blacked world");
         // 16:9 blit stereo is not fused. Do not keep offering it.
         // Verified on this DLL 2026-08-16: CreateDevice + Reset forced 3168x3100,
         // desktop went black, one OpenVR Submit then rt0=null / waiting room.
@@ -473,6 +525,8 @@ namespace bmvr
     bool TryRelativeHmdLook() { return g_TryRelativeHmdLook; }
     bool TryStereoCopy() { return g_TryStereoCopy; }
     bool TryStereoFov() { return g_TryStereoFov; }
+    bool TryMatQueue() { return g_TryMatQueue; }
+    bool TrySteamVrEyeRt() { return g_TrySteamVrEyeRt; }
 
     void DisableNamedRenderTargets(const char* reason)
     {
@@ -513,8 +567,12 @@ namespace bmvr
         SetStage("ok");
     }
 
+    void FitHmdAspectInWindow(uint32_t winW, uint32_t winH, float aspect, uint32_t& eyeW, uint32_t& eyeH);
+
     void ComputeHmdFramebufferSize(uint32_t recW, uint32_t recH, uint32_t winW, uint32_t winH, float projAspect)
     {
+        if (g_FramebufferWidth >= 640 && g_FramebufferHeight >= 360)
+            return;
         if (recW < 640 || recH < 360)
             return;
 
@@ -591,14 +649,77 @@ namespace bmvr
                 eyeH = scaledH;
             }
         }
+        // RenderScale 1.5 of 1584x1440 is 2384x2160. That is taller than a
+        // 1440p HWND. GetScreenSize 2160 on a 1440 swapchain smears the
+        // bottom of the menu and spawn (2026-08-18) and stereo RenderView
+        // at 2384 hung after pass-through 8/8.
+        if (eyeW > winW || eyeH > winH)
+        {
+            const uint32_t beforeW = eyeW, beforeH = eyeH;
+            FitHmdAspectInWindow(winW, winH, aspect, eyeW, eyeH);
+            Log("G-buffer %ux%u exceeds window %ux%u, fitted HMD aspect %ux%u",
+                beforeW, beforeH, winW, winH, eyeW, eyeH);
+        }
         g_FramebufferWidth = eyeW;
         g_FramebufferHeight = eyeH;
+    }
+
+    void FitHmdAspectInWindow(uint32_t winW, uint32_t winH, float aspect, uint32_t& eyeW, uint32_t& eyeH)
+    {
+        if (winW < 640)
+            winW = 1280;
+        if (winH < 360)
+            winH = 720;
+        if (!(aspect > 0.5f && aspect < 3.f))
+            aspect = 1.1f;
+        uint32_t h = winH & ~1u;
+        uint32_t w = (static_cast<uint32_t>(static_cast<float>(h) * aspect + 0.5f) + 1u) & ~1u;
+        if (w > winW)
+        {
+            w = winW & ~1u;
+            h = (static_cast<uint32_t>(static_cast<float>(w) / aspect + 0.5f) + 1u) & ~1u;
+        }
+        w = (w + 15u) & ~15u;
+        h = (h + 15u) & ~15u;
+        while (w > winW && w >= 16)
+            w -= 16;
+        while (h > winH && h >= 16)
+            h -= 16;
+        if (w < 640)
+            w = winW & ~15u;
+        if (h < 360)
+            h = winH & ~15u;
+        eyeW = w;
+        eyeH = h;
+    }
+
+    bool QueryWindowClientSize(uint32_t& width, uint32_t& height)
+    {
+        HWND hwnd = FindWindowA("Valve001", nullptr);
+        if (!hwnd)
+            hwnd = FindWindowA(nullptr, "Black Mesa");
+        if (!hwnd)
+            return false;
+        RECT rc{};
+        if (!GetClientRect(hwnd, &rc))
+            return false;
+        const uint32_t w = static_cast<uint32_t>(rc.right - rc.left);
+        const uint32_t h = static_cast<uint32_t>(rc.bottom - rc.top);
+        if (w < 640 || h < 360)
+            return false;
+        width = w;
+        height = h;
+        return true;
     }
 
     bool HaveHmdFramebufferSize(uint32_t& width, uint32_t& height)
     {
         if (!g_TryHmdFramebuffer || g_FramebufferWidth < 640 || g_FramebufferHeight < 360)
             return false;
+        // Size is latched at CreateDevice. Do not refit to the live HWND:
+        // spawn Reset made GetClientRect 1920x1080 while eyes were 1584x1440,
+        // EnsureStereoEyeSurfaces rebuilt 1200x1072 mid-frame and Present
+        // died (2026-08-18).
         width = g_FramebufferWidth;
         height = g_FramebufferHeight;
         return true;

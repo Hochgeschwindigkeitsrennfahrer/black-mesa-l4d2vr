@@ -21,8 +21,9 @@ Sources live in `src/`. The `L4D2VR/` folder is only include shims so DXVK can `
 | Head tracking | User-verified with fused stereo (L4D2VR/Portal2 HMD on view copies + `SetViewAngles` + CreateMove) |
 | Rendering in headset | Yes — fused stereo Submit (`-oldgameui`) |
 | Load / headset-off freeze | Yes — `WaitGetPoses` on a pose-waiter thread (user-verified 2026-08-16) |
-| Stereo | User-verified fused **1584×1440**. OpenVR recommended (~2544×2480) is **not** the default: first stereo at that size crashed. Raise `VR\config.txt` `RenderScale` (restart) to step up; cap is recommended size. |
-| Motion controllers | User-verified 2026-08-18: uncoupled viewmodel + controller aiming (sd805/Portal 2). No custom hands/reload/dual-wield. |
+| Stereo | User-verified fused **1584×1440**. SteamVR recommended (~3296×3216) offscreen eyes (`steamvr_rt`) blacked desktop and HMD — persist-skipped. |
+| Motion controllers | User-verified 2026-08-18: uncoupled viewmodel + controller aiming (sd805/Portal 2). Per-weapon offsets / haptics / left-hand / hide-body compiled, not user-verified. No custom hands/reload/dual-wield. |
+| Multicore (`mat_queue_mode`) | Compiled: real `GetMatQueueMode` + `SetThreadMode` AutoMatQueueMode. **Not user-verified.** If it dies, next launch skips `mat_queue`. |
 | Gameplay in headset | Yes with `-oldgameui`. New game UI is upside-down / black after load. |
 
 Acceptance is **visible fused Black Mesa gameplay in the headset**.
@@ -94,9 +95,10 @@ Proof the new DLL loaded: `Black Mesa\bmvr_log.txt` appears **this session** (an
 
 `scripts\install.ps1` copies `VR\SteamVRActionManifest` next to `bms.exe` and creates `VR\config.txt` if it is missing (existing config is kept).
 
-- **RenderScale** (restart required): `1.0` is the verified 1584×1440 HMD-aspect fit. `1.25` / `1.5` scale toward OpenVR recommended. Full native (~2544) crashed on first stereo; do not set that as the default.
+- **RenderScale** (restart required): `1.0` is the verified 1584×1440 HMD-aspect fit. Sizes taller than the HWND (including SteamVR recommended ~3296×3216) blacked the world; they are skipped.
 - **HP Reverb G2**: default bindings are `hpmotioncontroller` (and `holographic_controller` if SteamVR reports WMR). Same layout as Touch: left stick walk, right stick turn, right trigger attack, left trigger alt-fire, right B use, right A jump, right grip crouch, left grip reload, left-stick click recenter, right-stick click flashlight (via `CUserCmd` impulse, not Present `ClientCmd`). Left Y next weapon / left X previous weapon via `CUserCmd::weaponselect` — not `invnext`. Pause is unbound — `gameui_activate` and `invnext` both crashed BM from CreateMove.
-- **Uncoupled gun / motion aim** (sd805 L4D2VR + Portal 2 VR, not keyou91 hands): `CalcViewModelView` places the first-person weapon at the right controller. CreateMove aims with the controller; the headset still drives the camera. Stick walk stays look-relative. Bullets still spawn from the eyes until a `Weapon_ShootPosition` hook exists. Tune `ViewmodelPosOffset*` / `ControllerPitchTilt` in `VR\config.txt` (restart after edits; config is read at DLL load). Existing `config.txt` is kept on install — missing keys use the DLL defaults (16, 3, −2 and −35°).
+- **Uncoupled gun / motion aim** (sd805 L4D2VR + Portal 2 VR, not keyou91 hands): `CalcViewModelView` places the first-person weapon at the right controller (left if `LeftHanded=true`). CreateMove aims with that controller; the headset still drives the camera. Stick walk stays look-relative. Per-weapon viewmodel offsets apply from the `v_` model name; `ViewmodelPosOffset*` is the fallback. Recenter (left-stick click) also zeros snap/smooth yaw if `RecenterResetsYaw=true`. Haptics pulse on fire/use/reload/snap-turn. Bullets still spawn from the eyes until a `Weapon_ShootPosition` hook exists. Tune `ViewmodelPosOffset*` / `ControllerPitchTilt` / `IPDScale` / `HeightOffset` in `VR\config.txt` (restart after edits; config is read at DLL load). Existing `config.txt` is kept on install — missing keys use the DLL defaults.
+- **Multicore / QoL (compiled, not user-verified):** `GetMatQueueMode` is the real `IMaterialSystem` vfunc 11 so DXVK's queued Present lock can run. `AutoMatQueueMode` switches 0 in menu/load/pause and 2 in gameplay via `SetThreadMode` (never `ClientCmd`). Crash-sticky `mat_queue`. ICvar probe sets `crosshair 0`, motion blur/grain off, `engine_no_focus_sleep 0`, `fps_max` = HMD Hz, `cl_bob* 0`. `DrawModelExecute` notes viewmodels and can hide the local world-model (`HideLocalPlayerModel`).
 - If sticks do nothing, SteamVR Bindings for **Black Mesa** / this app — confirm the G2 layout is the default we installed. Log lines: `SetActionManifestPath … err=0`, `UpdateActionState err=0`, `VR input walk=`.
 
 If the game exits while trying an L4D2VR mechanism, relaunch: crash-sticky `bmvr_in_*.flag` and durable `bmvr_skip.txt` next to `bms.exe` disable only that attempt.

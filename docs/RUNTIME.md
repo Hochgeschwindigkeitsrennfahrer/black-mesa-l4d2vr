@@ -218,3 +218,71 @@ Both eyes share `_rt_FullFrameFB`. `StretchRect` is queued; the right-eye `Rende
 ## Live debugging
 
 Use **x32dbg** (Black Mesa is 32-bit). Attach to `bms.exe` and check the path of loaded `d3d9.dll`. If it is `C:\Windows\System32\d3d9.dll`, our code is not running.
+
+## Load-to-menu hang (2026-08-18)
+
+Stuck on the loading plaque, never reached `LevelInit background01`.
+
+First hypothesis (two `d3d9.dll` mappings / `DrawModelExecute`) was incomplete: after a process-wide init mutex and leaving `DrawModelExecute` unhooked, the hang remained.
+
+x32dbg on the Steam process (PID 25076): main thread in `ntdll.ZwReadFile` of `bms\bms_textures_033.vpk`, callers `materialsystem` → `stdshader_dx9` → DXVK `SetRenderTarget`, repeating. CPU was busy; Present had run once. Skipping `RenderScale` for the engine G-buffer did **not** unstick load (user 2026-08-18); that change was reverted.
+
+Same hang at 1584×1440 (PID 21052) and again PID 38376: main thread in `d3d9` (`NtClose` / `memset`) from nested `stdshader_dx9` / `SetRenderTarget`. `GetMatQueueMode` logged 0 (queued Present lock was not on). Two load-time calls from the main2 port:
+
+- `GetThreadMode` vfunc 11 during empty-map Present
+- DXVK `SetViewport` rewriting every `!IsInGame` viewport to `m_RenderWidth` (2384×2160) during precache
+
+Queued mode is unchanged for gameplay: `AutoMatQueueMode` still `SetThreadMode(2)` after a non-background map is **in-game**. Load/`!IsInGame` return 0 without touching `IMaterialSystem`. The L4D2VR `!IsInGame` HMD `SetViewport` rewrite is off on BM. `GetScreenSize` / `ClampStereoViewport` also stay off until `IsInGame` — map load sets `eligible=1` while `IsInGame` is still false, and those hooks recreated the nested `SetRenderTarget` freeze after the menu (2026-08-18).
+
+## Map-load hang after menu (2026-08-18)
+
+Menu `background05` ran ~90 FPS with OpenVR submit. Starting a game: `LevelInit map=bm_c1a0a eligible=1` with `inGame=0`, a few Presents at ~21 FPS, then Present stopped. Desktop eventually a solid gray Windows not-responding frame.
+
+x32dbg PID 37216: same nested `materialsystem` → `stdshader_dx9` → DXVK. CIP in `SetViewport` **after** `Game::GetMatQueueMode()` (device lock held). Overnight L4D2VR `SetViewport` called `IsInGame` + `GetThreadMode` on every viewport change. Size-lie skip during `eligible && !IsInGame` was a misdiagnosis: G-buffers stay 2384×2160 from the empty map, so passing through 2560×1440 `GetScreenSize` dirties the viewport on every `SetRT`. Fix: no engine calls from `SetViewport`; keep the HMD size lie for load; `SetRT` capture only during stereo blit.
+
+After that, load reached `bm_c1a0a` in-game (PID 33612). Picture-in-picture warehouse, then the window resized, then a black hung window. Log: `AutoMatQueueMode set 2` three times on the first in-game Presents, `GetScreenSize 1920x1080 -> 2384x2160`, pass-through 2/8, then silence. `BmvrForceHmdAspectWindowedBackbuffer` Reset the HWND to 2384×2160 (`hmd_swap` failure mode) and released VR RTs. `SetThreadMode(2)` waits until 8 pass-through RenderViews finish. Swapchain size stays at the game window when `hmd_swap` is skipped.
+
+PID 27004: menu smear + PiP, then hang after spawn. Pass-through 8/8 at `2560x1440`, then stereo `2384x2160` from `1920x1080` setup; first stereo Present completed, second died. `GetScreenSize 2560x1440 -> 2384x2160` on a 1440-tall HWND is the bottom smear (menu too). `RenderScale` 1.5 must not make the engine G-buffer taller than the window; fit HMD aspect in the HWND (~1584×1440).
+
+## Spawn hang + split desktop (2026-08-18)
+
+PID 16108: pass-through 8/8 and the first stereo frame completed at **1584×1440**, then `Eye/G-buffer size 1200x1072` and Present died. Desktop was the tram in the left ~62% of a 2560×1440 window (`1584/2560`) with the loading UI still in the right 40%, title Not Responding.
+
+Cause: spawn Reset shrank `GetClientRect` to 1920×1080 while eyes/G-buffers were 1584×1440. Live-clamping `HaveHmdFramebufferSize` to the HWND made `EnsureStereoEyeSurfaces` null the 1584 pointers without Release and `CreateTexture` 1200×1072 mid-stereo. Engine Present copies the 1584 G-buffer 1:1 into the 2560 swapchain, so the unused region kept the load screen.
+
+Fix: latch G-buffer size at CreateDevice; do not recreate existing eye textures when the HWND changes; ColorFill the unused desktop backbuffer during in-game RenderView (not the menu).
+
+PID 32704 (2026-08-18): 1200 rebuild gone. Pass-through 8/8 and the first stereo pair completed at 1584×1440 (`setup=1920x1080` copies). Present then died. x32dbg: main thread `rep movsb` in `materialsystem` from DXVK `Present` → `Game::GetMatQueueMode` → `GetThreadMode` vfunc 11 with the device lock held (same nest as overnight). Pass-through 8 armed that probe. Spawn also issues a leftover 1920×1080 main `RenderView` after the stereo pair.
+
+Fix: `GetMatQueueMode` is a cache filled from RenderView only; Present must not call into `IMaterialSystem`. Skip leftover main RenderViews after stereo this frame. `mat_queue` skip still means no `SetThreadMode(2)` until that retry is on.
+
+## Desktop split + black HMD (2026-08-18)
+
+PID 25200 stayed responding at ~40 FPS. Desktop tram occupied the left ~62% of a 2560-wide window; the rest was ColorFill black (`1584/2560`). SteamVR showed Standing by. OpenVR Submit often returned `eL=0` mixed with `108 AlreadySubmitted`. Stereo unbind blit logged fmt 111 (`D3DFMT_R16F`) then fmt 35 then fmt 21 last-wins.
+
+Not headset-verified. Code now: keep the highest-rank scene-color blit (skip R16F; do not let later A8 HUD overwrite A2R10/RGBA16F); wait the blit event query up to 8ms instead of 256 tight `S_FALSE` polls; StretchRect the left eye across the desktop backbuffer after the stereo pair; Submit once per WaitGetPoses when a new stereo frame exists.
+
+That stretch copied fmt=35 `A2R10G10B10` (rank 3) into the eyes and over the full backbuffer — both desktop and HMD went black. The tram the user had seen was the engine's top-left 1584×1440 resolve on the 2560 backbuffer, not that HDR unbind. Next: copy that backbuffer crop into each eye, and only then stretch to the desktop. Revert the 15ms event-query wait (`GetTickCount` granularity logged `S_FALSE` every eye).
+
+## Tall image, fisheye, black pillar, menu mouse (2026-08-18)
+
+User-verified: gameplay visible again, but 1584×1440 G-buffer lie inside a 2560×1440 window. Desktop left ~62% tall/fisheye (~99° OpenVR FOV), right third black. VGUI layout 1584 vs HWND 2560 so menu clicks miss. Head-turn warp from that FOV plus GetProjectionRaw UVs on an already-cropped blit.
+
+Change: stop rewriting `GetScreenSize` / `GetBackBufferDimensions` / `CreateNamedRT` to HMD aspect. Stereo copies keep engine 16:9 size and FOV. Center-crop the backbuffer into the private eye textures. Direct Submit `{0,0,1,1}`. Not headset-verified yet.
+
+User-verified the next day: fusion only at arm's length, world giant, camera above NPC eye level. That 16:9 center-crop displayed ~50° of a 99° HMD frustum while IPD stayed ~2.5in (L4D2VR `GetProjectionRaw` scale). Source SDK VR (`client_virtualreality.cpp`) uses off-center / `m_ViewToProjection` overrides; BM `CViewSetup` is 0x148 and `+0x1C` is `m_eStereoEye`, so do not port those fields. Restore L4D2VR on the **copies only**: `width/height/fov/aspect` = HMD, Submit `m_TextureBounds`, top-left 1584×1440 blit. Do not permanently rewrite videomode (menu mouse). Recenter latch ignores tracking Z≈0 so standing height is not stacked on `setup.origin`. User-verified 2026-08-18: thumbstick recenter fixes height; fusion restored.
+
+## 6DOF roll / viewmodel feet / SteamVR res (2026-08-18)
+
+- L4D2VR `GetViewAngle` includes HMD roll. We had been zeroing `ang.z` and clamping pitch to ±89, so a head tilt rotated the compositor pose against an unrolled image. Camera copies now use `HmdMatrixToSourceAnglesWithRoll`. CreateMove still writes roll=0 so the body does not roll.
+- Viewmodel used `controller - hmdZero` on the engine eye input, which after recenter put the gun at the player's feet. L4D2VR 1:1 is camera + `(controller - current HMD)`. Same here, with a 80hu reach clamp (Portal 2 prototype).
+- `steamvr_rt` (SteamVR recommended 3296×3216 private eyes + `SetRenderTarget`/`SetDepthStencil` redirect, skip backbuffer blit) is **verified black**. Process stayed at ~90 FPS, audio played, Escape menu drew, world was pitch black on desktop and HMD. Engine G-buffers stayed 2560×1440; `redirected=1` stole the composite off the window backbuffer. Persist-skip `steamvr_rt`. Eyes stay the window-fit HMD-aspect blit (~1584×1440). Do not retry an eye RT larger than the HWND until there is a real offscreen G-buffer path.
+
+## Multicore / QoL / motion polish (compiled 2026-08-18, not user-verified)
+
+Overnight port of the L4D2VR `main2` multicore **subset** plus remaining safe QoL. Do not treat as headset-verified.
+
+- `GetMatQueueMode` returns 0 until gameplay is eligible, then calls vfunc 11. DXVK's queued Present exclusive lock stays off during load.
+- `AutoMatQueueMode` uses `SetThreadMode`, not `ClientCmd`. First switch to mode 2 writes `bmvr_in_mat_queue.flag`. If that launch dies, next launch skips auto-queue (`mat_queue` in `bmvr_skip.txt`).
+- Per-weapon viewmodel offsets from `v_` model names; haptics; `IPDScale` / `HeightOffset`; `LeftHanded`; recenter zeros yaw. `DrawModelExecute` stays unhooked (overnight createHook coincided with the load freeze; ABI unverified).
+- ICvar probe disabled: overnight FindVar/SetValue slot scan ran just before the load freeze. Crosshair/blur/bob/`fps_max` stay at game defaults until the vfunc index is confirmed.

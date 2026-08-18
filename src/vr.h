@@ -87,6 +87,8 @@ public:
     Vector m_ViewmodelForward{};
     Vector m_ViewmodelRight{};
     Vector m_ViewmodelUp{};
+    mutable std::recursive_mutex m_ControllerMutex;
+    std::string m_LastViewmodelModel;
     std::mutex m_PoseMutex;
     vr::TrackedDevicePose_t m_WaitedPoses[vr::k_unMaxTrackedDeviceCount]{};
     std::atomic<DWORD> m_WaitedPoseTick{ 0 };
@@ -360,9 +362,11 @@ public:
     float HorizontalFovForAspect(float targetAspect) const;
     void CaptureFrameBeforePresent();
     bool BlitCurrentGameColorTo(IDirect3DSurface9* dst);
+    bool BlitHmdViewFromBackbuffer(IDirect3DSurface9* dst);
     void BeginStereoEyeBlit(IDirect3DSurface9* dst);
     bool EndStereoEyeBlit();
     void CaptureGameColorOnUnbind(IDirect3DSurface9* oldRt, uint32_t vpX, uint32_t vpY, uint32_t vpW, uint32_t vpH);
+    void MirrorStereoToDesktopWindow();
     void ReleaseVRRenderTargetsForDeviceReset();
     bool RefreshBackBufferTexture(bool forceRefresh = false);
     void EnsureOpticsRTTTextures() {}
@@ -378,15 +382,32 @@ public:
     void OnLevelInit(const char* newmap);
     void OnLevelShutdown();
     bool IsGameplayEligible() const { return m_GameplayEligible; }
+    bool HasEngineMap() const { return !m_CurrentMapName.empty(); }
     bool ShouldCompositorSubmit() const;
+    bool StereoEyeBlitActive() const { return m_StereoEyeBlitActive; }
+    bool StereoRedirectedToEye() const { return m_StereoRedirectedToEye; }
+    IDirect3DSurface9* StereoEyeBlitDest() const { return m_StereoEyeBlitDest; }
+    void NoteStereoRedirectedToEye() { m_StereoRedirectedToEye = true; }
+    // First gameplay RenderViews stay single-threaded. SetThreadMode(2) on
+    // the first in-game Present (2026-08-18) ran during spawn Reset to
+    // 2384x2160 and Present died after pass-through 2/8.
+    static constexpr uint32_t kPassThroughViewsBeforeQueued = 8;
+    bool PassThroughWarmupDone() const
+    {
+        return m_PassThroughMainViews >= kPassThroughViewsBeforeQueued;
+    }
     void InstallDeviceHooks(IDirect3DDevice9* device);
     bool EnsureNamedEyeTextures();
     void PrepareNamedStereoFromPresent();
     bool NamedStereoReady() const;
     bool EnsureStereoEyeSurfaces();
     bool StereoEyesReady() const;
+    void ClearUnusedDesktopBackbuffer();
     void ProcessInput();
+    void TickMatQueueFromRenderView();
     uint32_t HeldButtons() const { return m_HeldButtons.load(std::memory_order_acquire); }
+    void NoteViewmodelModel(const char* modelName);
+    vr::ETrackedControllerRole AimControllerRole() const;
 
 private:
     void SetActionManifest();
@@ -408,6 +429,16 @@ private:
     void RefreshIpdFromHmd();
     void GetViewBasis(Vector* forward, Vector* right, Vector* up) const;
     void UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose);
+    void UpdateAutoMatQueueMode();
+    void ApplyVrQualityOfLifeCvars();
+    void PulseAimHaptic(unsigned short durationUs = 2500);
+    void ResolveWeaponViewmodelOffsets(float& ox, float& oy, float& oz) const;
+    int m_AutoMatQueueModeLastRequested = -999;
+    std::chrono::steady_clock::time_point m_AutoMatQueueModeLastCmdTime{};
+    bool m_VrCvarsApplied = false;
+    bool m_MenuFpsMaxSent = false;
+    int m_MenuFpsMaxLastHz = 0;
+    uint32_t m_MatQueueOkPresents = 0;
     IDirect3DQuery9* m_BlitEventQuery = nullptr;
     void FlushStereoBlitGpu();
     UINT KnownWindowWidth() const;
@@ -417,6 +448,8 @@ private:
     IDirect3DSurface9* m_StereoEyeBlitDest = nullptr;
     bool m_StereoEyeBlitActive = false;
     bool m_StereoEyeBlitOk = false;
+    bool m_StereoRedirectedToEye = false;
+    int m_StereoEyeBlitRank = 0;
     uint32_t m_LastStereoBlitWidth = 0;
     uint32_t m_LastStereoBlitHeight = 0;
 };

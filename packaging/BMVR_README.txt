@@ -57,23 +57,20 @@ Edit:
 Then fully quit and restart the game. Eye size is chosen at CreateDevice; changing
 the file while the game is running does nothing.
 
-RenderScale multiplies the working HMD-aspect fit, then aligns to 16 pixels, then
-caps at the headset's OpenVR recommended size.
+RenderScale multiplies the working HMD-aspect fit, then aligns to 16 pixels.
+Sizes taller than the game window are fitted back into the HWND. SteamVR's
+full recommended eye size (~3296x3216 on a G2) blacked the world when used as
+an offscreen RT; that path is skipped.
 
   RenderScale=1.0     ~1584 x 1440 on a 1440p window
                       Verified fused gameplay. Start here.
 
-  RenderScale=1.25    In between. Sharper, more GPU.
-
-  RenderScale=1.50    ~2384 x 2160 on a 1440p window
-                      Verified on HP Reverb G2.
-
-  RenderScale=2.0+    Approaches OpenVR recommended (often ~3200 x 3200).
-                      Full native (~2544 on first stereo) crashed. Do not start here.
-                      If the log says "near the 2544 first-stereo crash", lower it.
+  RenderScale=1.25 / 1.50
+                      Tried a larger G-buffer, then fitted back into the window
+                      so it is not taller than the HWND.
 
 After launch, bmvr_log.txt reports the size actually used, for example:
-  RenderScale 1.50 G-buffer 1584x1440 -> 2384x2160 (OpenVR rec 3288x3212)
+  Eye/G-buffer size 1584x1440 (CreateDevice HMD-aspect, window 2560x1440)
 
 
 5) Controllers (HP Reverb G2 / WMR / Touch)
@@ -97,6 +94,19 @@ If the gun sits too far forward/back, edit VR\config.txt:
   ControllerPitchTilt=-35.0
 
 Those take effect on the next launch (config is read at DLL load).
+
+Also in VR\config.txt (defaults):
+
+  AutoMatQueueMode=true   menu/load = single-thread, gameplay = queued
+  IPDScale=1.0            HeightOffset=0.0
+  Haptics=true            HideCrosshair=true
+  MatchHmdHz=true         DisableViewBob=true
+  LeftHanded=false        RecenterResetsYaw=true
+  HideLocalPlayerModel=true
+
+If AutoMatQueueMode crashes, delete is not needed — the next launch skips
+mat_queue (bmvr_skip.txt next to bms.exe). Set AutoMatQueueMode=false to
+leave the engine's own mat_queue_mode alone (menu still forced to 0).
 
 
 6) If it does not load

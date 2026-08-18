@@ -359,7 +359,8 @@ namespace dxvk {
           bmvr::InstallEarlyFramebufferHook();
           uint32_t bbW = pPresentationParameters->BackBufferWidth;
           uint32_t bbH = pPresentationParameters->BackBufferHeight;
-          if (bmvr::TryHmdFramebuffer() && bmvr::ApplyHmdAspectBackbuffer(bbW, bbH))
+          if (bmvr::TryHmdSwapchain() && bmvr::TryHmdFramebuffer()
+              && bmvr::ApplyHmdAspectBackbuffer(bbW, bbH))
           {
             pPresentationParameters->Windowed = TRUE;
             pPresentationParameters->BackBufferWidth = bbW;

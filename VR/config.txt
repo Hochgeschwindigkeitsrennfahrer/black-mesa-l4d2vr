@@ -1,12 +1,9 @@
 # Black Mesa VR — restart the game after changing RenderScale
-# (eye / swapchain size is picked at CreateDevice).
+# (eye size is picked at CreateDevice).
 
-# Multiplier on the working HMD-aspect fit (~1584x1440 on a 1440p window).
-#   1.0  = verified fused gameplay (start here)
-#   1.25 = sharper
-#   1.50 = ~2384x2160, verified on HP Reverb G2
-#   2.0+ = toward OpenVR recommended; full native crashed on first stereo
-# Capped at the headset recommended size. See BMVR_README.txt in the drop-in zip.
+# Multiplier on the window-fit HMD-aspect size (~1584x1440 on 1440p).
+# 1.0 is the verified fused path. Values above 1.0 try a larger G-buffer
+# then fit back into the HWND (taller-than-window sizes black the world).
 RenderScale=1.0
 
 # Portal 2 VR / L4D2VR right-stick look. Degrees per ms at full deflection.
@@ -24,3 +21,21 @@ ViewmodelAngOffsetY=0.0
 ViewmodelAngOffsetZ=0.0
 # sd805 tilts Vive wands -45°. G2 points more forward.
 ControllerPitchTilt=-35.0
+
+# Stereo IPD multiplier and extra height (Source units) after 6DOF.
+IPDScale=1.0
+HeightOffset=0.0
+
+# L4D2VR AutoMatQueueMode: menu/load/pause uses single-thread (0), gameplay
+# uses queued (2) via IMaterialSystem::SetThreadMode — not ClientCmd.
+# If this crashes, next launch skips it (bmvr_in_mat_queue.flag / bmvr_skip.txt).
+AutoMatQueueMode=true
+
+# Motion / comfort
+Haptics=true
+HideCrosshair=true
+MatchHmdHz=true
+DisableViewBob=true
+LeftHanded=false
+RecenterResetsYaw=true
+HideLocalPlayerModel=true

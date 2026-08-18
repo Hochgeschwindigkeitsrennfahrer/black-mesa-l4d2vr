@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <array>
+#include <atomic>
 #include <string>
 #include <cstdarg>
 #include <Windows.h>
@@ -36,6 +37,7 @@ public:
     IModelRender* m_ModelRender = nullptr;
     IInput* m_VguiInput = nullptr;
     ISurface* m_VguiSurface = nullptr;
+    void* m_Cvar = nullptr;
 
     uintptr_t m_BaseEngine = 0;
     uintptr_t m_BaseClient = 0;
@@ -49,6 +51,8 @@ public:
 
     bool m_Initialized = false;
     bool m_SwitchedWeapons = false;
+    // Present/DXVK must not call IMaterialSystem. Refresh only from RenderView.
+    mutable std::atomic<int> m_CachedMatQueueMode{ 0 };
 
     float m_AnalogForward = 0.f;
     float m_AnalogSide = 0.f;
@@ -61,6 +65,11 @@ public:
     void ClientCmd(const char* szCmdString);
     void ClientCmd_Unrestricted(const char* szCmdString);
     int GetMatQueueMode() const;
+    void ProbeMatQueueModeFromRenderView();
+    bool SetMatQueueMode(int mode) const;
+    bool SetConVarInt(const char* name, int value) const;
+    bool SetConVarFloat(const char* name, float value) const;
+    bool MaterialVTableMatchesDump() const;
 
     static void logMsg(const char* fmt, ...);
     static void errorMsg(const char* msg);

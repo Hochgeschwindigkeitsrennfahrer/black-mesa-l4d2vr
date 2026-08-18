@@ -29,6 +29,8 @@ namespace bmvr
     bool TryRelativeHmdLook();
     bool TryStereoCopy();
     bool TryStereoFov();
+    bool TryMatQueue();
+    bool TrySteamVrEyeRt();
 
     void DisableNamedRenderTargets(const char* reason);
     void DisableStereoRenderView(const char* reason);
@@ -44,6 +46,7 @@ namespace bmvr
     // return the same values or HUD composite uses 16:9 CViewSetup on HMD RTs.
     void ComputeHmdFramebufferSize(uint32_t recW, uint32_t recH, uint32_t winW, uint32_t winH, float projAspect);
     bool HaveHmdFramebufferSize(uint32_t& width, uint32_t& height);
+    bool QueryWindowClientSize(uint32_t& width, uint32_t& height);
     bool ApplyHmdAspectBackbuffer(uint32_t& width, uint32_t& height);
     void InstallEarlyFramebufferHook();
 
@@ -65,4 +68,14 @@ namespace bmvr
     extern float g_ViewmodelAngOffsetZ;
     // L4D2VR tilts Vive wands -45°. G2 points more forward; default -35.
     extern float g_ControllerPitchTilt;
+    extern float g_IPDScale;
+    extern float g_HeightOffset;
+    extern bool g_AutoMatQueueMode;
+    extern bool g_Haptics;
+    extern bool g_HideCrosshair;
+    extern bool g_MatchHmdHz;
+    extern bool g_DisableViewBob;
+    extern bool g_LeftHanded;
+    extern bool g_RecenterResetsYaw;
+    extern bool g_HideLocalPlayerModel;
 }

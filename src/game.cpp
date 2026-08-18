@@ -10,6 +10,7 @@
 #include <initializer_list>
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <string>
 using tCreateInterface = void*(__cdecl*)(const char* name, int* returnCode);
 
@@ -88,8 +89,12 @@ Game::Game()
     // Do not bind ISurface until IsCursorVisible's vtable slot is verified on BM.
     // DXVK Present helpers call it when m_VguiSurface is non-null.
     m_VguiSurface = nullptr;
+    m_Cvar = GetInterfaceAny("vstdlib.dll", { "VEngineCvar007", "VEngineCvar004", "VEngineCvar002" });
+    if (!m_Cvar)
+        m_Cvar = GetInterfaceAny("engine.dll", { "VEngineCvar007", "VEngineCvar004" });
 
-    Game::logMsg("Interfaces: engine=%p matsys=%p clientent=%p", m_EngineClient, m_MaterialSystem, m_ClientEntityList);
+    Game::logMsg("Interfaces: engine=%p matsys=%p clientent=%p icvar=%p",
+        m_EngineClient, m_MaterialSystem, m_ClientEntityList, m_Cvar);
 
     m_Offsets = new Offsets();
     m_VR = new VR(this);
@@ -129,7 +134,7 @@ Game::Game()
 
     m_Initialized = true;
     bmvr::SetStage("game_ready");
-        Game::logMsg("BMVR Game initialized (L4D2VR architecture, Black Mesa offsets). namedRT=%d stereoRV=%d stereoCopy=%d stereoFov=%d hmdSwap=%d hmdFb=%d hmdNative=%d waitIdle=%d absView=%d menuVR=%d relLook=%d",
+        Game::logMsg("BMVR Game initialized (L4D2VR architecture, Black Mesa offsets). namedRT=%d stereoRV=%d stereoCopy=%d stereoFov=%d hmdSwap=%d hmdFb=%d hmdNative=%d steamvrRT=%d waitIdle=%d absView=%d menuVR=%d relLook=%d",
         bmvr::TryNamedRenderTargets() ? 1 : 0,
         bmvr::TryStereoRenderView() ? 1 : 0,
         bmvr::TryStereoCopy() ? 1 : 0,
@@ -137,6 +142,7 @@ Game::Game()
         bmvr::TryHmdSwapchain() ? 1 : 0,
         bmvr::TryHmdFramebuffer() ? 1 : 0,
         bmvr::TryHmdNative() ? 1 : 0,
+        bmvr::TrySteamVrEyeRt() ? 1 : 0,
         bmvr::TryWaitDeviceIdle() ? 1 : 0,
         bmvr::TryAbsoluteHmdView() ? 1 : 0,
         bmvr::TryMenuCompositor() ? 1 : 0,
@@ -238,9 +244,171 @@ void Game::ClientCmd_Unrestricted(const char* szCmdString)
 
 int Game::GetMatQueueMode() const
 {
-    // IMaterialSystem081 GetThreadMode slot is not verified on BM. Calling a
-    // guessed vtable entry from Present took the L4D2VR queued path or crashed.
-    return 0;
+    // Cache only. DXVK Present calls this with the device lock held
+    // (x32dbg PID 32704, 2026-08-18: GetThreadMode nested stdshader memcpy
+    // until Not Responding). Probe from RenderView, not from D3D.
+    return m_CachedMatQueueMode.load(std::memory_order_acquire);
+}
+
+void Game::ProbeMatQueueModeFromRenderView()
+{
+    if (!bmvr::TryMatQueue() || !m_MaterialSystem
+        || !m_VR || !m_VR->IsGameplayEligible()
+        || !m_EngineClient || !m_EngineClient->IsInGame()
+        || !m_VR->PassThroughWarmupDone())
+    {
+        m_CachedMatQueueMode.store(0, std::memory_order_release);
+        return;
+    }
+    int mode = 0;
+    __try
+    {
+        void** vtbl = *reinterpret_cast<void***>(m_MaterialSystem);
+        if (!vtbl || !vtbl[11])
+        {
+            m_CachedMatQueueMode.store(0, std::memory_order_release);
+            return;
+        }
+        using tGetThreadMode = int(__thiscall*)(IMaterialSystem*);
+        mode = reinterpret_cast<tGetThreadMode>(vtbl[11])(m_MaterialSystem);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        m_CachedMatQueueMode.store(0, std::memory_order_release);
+        return;
+    }
+    if (mode < 0 || mode > 2)
+        mode = 0;
+    m_CachedMatQueueMode.store(mode, std::memory_order_release);
+}
+
+bool Game::MaterialVTableMatchesDump() const
+{
+    if (!m_MaterialSystem || !m_Offsets || !m_Offsets->GetBackBufferDimensions.valid)
+        return false;
+    __try
+    {
+        void** vtbl = *reinterpret_cast<void***>(m_MaterialSystem);
+        if (!vtbl)
+            return false;
+        return vtbl[30] == reinterpret_cast<void*>(m_Offsets->GetBackBufferDimensions.address);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool Game::SetMatQueueMode(int mode) const
+{
+    if (!m_MaterialSystem || mode < 0 || mode > 2)
+        return false;
+    if (!m_VR || !m_VR->IsGameplayEligible())
+        return false;
+    if (!m_EngineClient || !m_EngineClient->IsInGame())
+        return false;
+    if (!m_VR->PassThroughWarmupDone())
+        return false;
+    __try
+    {
+        void** vtbl = *reinterpret_cast<void***>(m_MaterialSystem);
+        if (!vtbl || !vtbl[10])
+            return false;
+        using tSetThreadMode = void(__thiscall*)(IMaterialSystem*, int, int);
+        reinterpret_cast<tSetThreadMode>(vtbl[10])(m_MaterialSystem, mode, -1);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    SetConVarInt("mat_queue_mode", mode);
+    return true;
+}
+
+namespace
+{
+    void* FindConVarProbe(void* icvar, const char* name)
+    {
+        (void)icvar;
+        (void)name;
+        // 2026-08-18: calling ICvar vtbl[8..22] as FindVar then ConVar
+        // vtbl[7..14] as SetValue ran just before load-to-menu stuck in
+        // nested stdshader_dx9 / DXVK SetRenderTarget. Do not probe slots
+        // until the BM ICvar FindVar index is confirmed in Ghidra.
+        return nullptr;
+    }
+
+    bool ConVarSetInt(void* cvar, int value)
+    {
+        if (!cvar)
+            return false;
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", value);
+        void** vt = nullptr;
+        __try { vt = *reinterpret_cast<void***>(cvar); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        if (!vt)
+            return false;
+        for (int slot = 7; slot <= 14; ++slot)
+        {
+            __try
+            {
+                using tSetStr = void(__thiscall*)(void*, const char*);
+                if (!vt[slot])
+                    continue;
+                reinterpret_cast<tSetStr>(vt[slot])(cvar, buf);
+                return true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
+        return false;
+    }
+
+    bool ConVarSetFloat(void* cvar, float value)
+    {
+        if (!cvar)
+            return false;
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%.9g", static_cast<double>(value));
+        void** vt = nullptr;
+        __try { vt = *reinterpret_cast<void***>(cvar); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+        if (!vt)
+            return false;
+        for (int slot = 7; slot <= 14; ++slot)
+        {
+            __try
+            {
+                using tSetStr = void(__thiscall*)(void*, const char*);
+                if (!vt[slot])
+                    continue;
+                reinterpret_cast<tSetStr>(vt[slot])(cvar, buf);
+                return true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
+        return false;
+    }
+}
+
+bool Game::SetConVarInt(const char* name, int value) const
+{
+    void* cvar = FindConVarProbe(m_Cvar, name);
+    if (!cvar)
+        return false;
+    return ConVarSetInt(cvar, value);
+}
+
+bool Game::SetConVarFloat(const char* name, float value) const
+{
+    void* cvar = FindConVarProbe(m_Cvar, name);
+    if (!cvar)
+        return false;
+    return ConVarSetFloat(cvar, value);
 }
 
 void Game::logMsg(const char* fmt, ...)

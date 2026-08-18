@@ -111,6 +111,35 @@ namespace dxvk {
             return true;
         }
 
+        static bool BmvrShouldSkipWindowedSizeReset(
+            D3D9SwapChainEx* swap,
+            const D3DPRESENT_PARAMETERS* next)
+        {
+            if (bmvr::TryHmdSwapchain())
+                return false;
+            if (!swap || !next || !next->Windowed)
+                return false;
+            const D3DPRESENT_PARAMETERS* cur = swap->GetPresentParams();
+            if (!cur || !cur->Windowed)
+                return false;
+            if (cur->BackBufferWidth < 640 || cur->BackBufferHeight < 360)
+                return false;
+            if (cur->BackBufferWidth == next->BackBufferWidth
+                && cur->BackBufferHeight == next->BackBufferHeight)
+                return false;
+            static int s_log;
+            if (s_log < 8)
+            {
+                Logger::info(str::format(
+                    "BMVR keeping windowed swapchain ",
+                    cur->BackBufferWidth, "x", cur->BackBufferHeight,
+                    " (skip size Reset ",
+                    next->BackBufferWidth, "x", next->BackBufferHeight, ")"));
+                ++s_log;
+            }
+            return true;
+        }
+
         static void BmvrKeepDesktopWindowed(D3DPRESENT_PARAMETERS* params)
         {
             if (!params)
@@ -132,6 +161,12 @@ namespace dxvk {
         static void BmvrForceHmdAspectWindowedBackbuffer(D3DPRESENT_PARAMETERS* params)
         {
             if (!params)
+                return;
+            // hmd_swap skip: do not resize the windowed swapchain to G-buffer
+            // size. CreateDevice/Reset that to 2384x2160 after bm_c1a0a
+            // (2026-08-18) SetWindowPos'd the HWND, released VR RTs, then
+            // Present died. G-buffers stay HMD-sized via CreateNamedRT.
+            if (!bmvr::TryHmdSwapchain())
                 return;
             uint32_t w = params->BackBufferWidth;
             uint32_t h = params->BackBufferHeight;
@@ -163,7 +198,7 @@ namespace dxvk {
         {
             if (!caller || !local)
                 return;
-            if (!bmvr::TryHmdFramebuffer())
+            if (!bmvr::TryHmdFramebuffer() || !bmvr::TryHmdSwapchain())
                 return;
             if (caller->BackBufferWidth == local->BackBufferWidth
                 && caller->BackBufferHeight == local->BackBufferHeight)
@@ -1612,7 +1647,8 @@ namespace dxvk {
         BmvrKeepDesktopWindowed(&local);
         BmvrForceHmdAspectWindowedBackbuffer(&local);
         BmvrSyncCallerBackbufferSize(caller, &local);
-        if (BmvrShouldSkipIdenticalWindowedReset(m_implicitSwapchain.ptr(), &local)) {
+        if (BmvrShouldSkipIdenticalWindowedReset(m_implicitSwapchain.ptr(), &local)
+            || BmvrShouldSkipWindowedSizeReset(m_implicitSwapchain.ptr(), &local)) {
             static int s_skipLog;
             if (s_skipLog < 4) {
                 Logger::info(str::format(
@@ -3300,55 +3336,43 @@ namespace dxvk {
         if (pViewport == nullptr)
             return D3DERR_INVALIDCALL;
 
-        // Main menu/native VGUI is sensitive to Source observing the adjusted viewport.
-        // Preserve the known-good a4a712bf behavior exactly for !IsInGame(): mutate the
-        // caller's viewport before locking/recording instead of using only a local copy.
-        // L4D2VR resizes the menu viewport to the HMD swapchain. hmd_swap is
-        // off here, so m_RenderWidth stays 0 until the window exists — writing
-        // that into Source's viewport made VGUI draw at 0x0 (no menu buttons).
-        if (g_Game && g_Game->m_VR) {
-            VR* vr = g_Game->m_VR;
-            if (vr->m_RenderWidth >= 640 && vr->m_RenderHeight >= 360 &&
-                g_Game->m_EngineClient && !g_Game->m_EngineClient->IsInGame()) {
-                D3DVIEWPORT9* menuViewport = const_cast<D3DVIEWPORT9*>(pViewport);
-                menuViewport->Width = vr->m_RenderWidth;
-                menuViewport->Height = vr->m_RenderHeight;
-            }
-        }
-
         D3DVIEWPORT9 effectiveViewport = *pViewport;
 
         D3D9DeviceLock lock = LockDevice();
 
-        if (g_Game && g_Game->m_VR && g_Game->m_EngineClient && g_Game->m_EngineClient->IsInGame())
-        {
+        // Do not call IEngineClient or IMaterialSystem from SetViewport.
+        // Overnight L4D2VR copied IsInGame + GetMatQueueMode here (device
+        // lock held). Map-load stdshader then re-entered materialsystem
+        // until Present died (x32dbg 2026-08-18, CIP in this function after
+        // GetMatQueueMode). Only rewrite when RT0 is one of our private
+        // eye/HUD surfaces — those are not bound during menu or load.
+        if (g_Game && g_Game->m_VR && m_state.renderTargets[0] != nullptr) {
             VR* vr = g_Game->m_VR;
-            if (m_state.renderTargets[0] != nullptr && g_Game->GetMatQueueMode() != 0) {
-                IDirect3DSurface9* currentRt = static_cast<IDirect3DSurface9*>(m_state.renderTargets[0].ptr());
-                const bool forceVrViewport =
-                    currentRt == vr->m_D9HUDSurface ||
-                    currentRt == vr->m_D9LeftEyeSurface ||
-                    currentRt == vr->m_D9RightEyeSurface ||
-                    currentRt == vr->m_D9LeftEyeSubmitSurface ||
-                    currentRt == vr->m_D9RightEyeSubmitSurface ||
-                    currentRt == vr->m_D9DesktopMirrorSurface ||
-                    currentRt == vr->m_D9BlankSurface;
+            IDirect3DSurface9* currentRt =
+                static_cast<IDirect3DSurface9*>(m_state.renderTargets[0].ptr());
+            const bool forceVrViewport =
+                currentRt == vr->m_D9HUDSurface ||
+                currentRt == vr->m_D9LeftEyeSurface ||
+                currentRt == vr->m_D9RightEyeSurface ||
+                currentRt == vr->m_D9LeftEyeSubmitSurface ||
+                currentRt == vr->m_D9RightEyeSubmitSurface ||
+                currentRt == vr->m_D9DesktopMirrorSurface ||
+                currentRt == vr->m_D9BlankSurface;
 
-                if (forceVrViewport) {
-                    uint32_t width = vr->m_RenderWidth;
-                    uint32_t height = vr->m_RenderHeight;
+            if (forceVrViewport) {
+                uint32_t width = vr->m_RenderWidth;
+                uint32_t height = vr->m_RenderHeight;
 
-                    const VkExtent2D rtSize = m_state.renderTargets[0]->GetSurfaceExtent();
-                    if (rtSize.width != 0 && rtSize.height != 0) {
-                        width = rtSize.width;
-                        height = rtSize.height;
-                    }
-
-                    effectiveViewport.X = 0;
-                    effectiveViewport.Y = 0;
-                    effectiveViewport.Width = width;
-                    effectiveViewport.Height = height;
+                const VkExtent2D rtSize = m_state.renderTargets[0]->GetSurfaceExtent();
+                if (rtSize.width != 0 && rtSize.height != 0) {
+                    width = rtSize.width;
+                    height = rtSize.height;
                 }
+
+                effectiveViewport.X = 0;
+                effectiveViewport.Y = 0;
+                effectiveViewport.Width = width;
+                effectiveViewport.Height = height;
             }
         }
 
@@ -6363,7 +6387,8 @@ namespace dxvk {
         BmvrKeepDesktopWindowed(&local);
         BmvrForceHmdAspectWindowedBackbuffer(&local);
         BmvrSyncCallerBackbufferSize(caller, &local);
-        if (BmvrShouldSkipIdenticalWindowedReset(m_implicitSwapchain.ptr(), &local)) {
+        if (BmvrShouldSkipIdenticalWindowedReset(m_implicitSwapchain.ptr(), &local)
+            || BmvrShouldSkipWindowedSizeReset(m_implicitSwapchain.ptr(), &local)) {
             m_deviceLostState = D3D9DeviceLostState::Ok;
             return D3D_OK;
         }
