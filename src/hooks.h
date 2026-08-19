@@ -10,6 +10,9 @@ class CUserCmd;
 class QAngle;
 class Vector;
 struct ModelRenderInfo_t;
+struct Ray_t;
+class CTraceFilter;
+class CGameTrace;
 
 template <typename T>
 struct Hook
@@ -60,6 +63,8 @@ typedef void(__thiscall* tGetScreenSize)(void* thisptr, int& width, int& height)
 typedef ITexture*(__thiscall* tCreateNamedRTEx)(void* thisptr, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags);
 typedef float(__thiscall* tGetViewModelFOV)(void* thisptr);
 typedef void(__thiscall* tEndFrame)(void* thisptr);
+typedef void(__thiscall* tTraceRay)(void* thisptr, const Ray_t& ray, unsigned int fMask, CTraceFilter* filter, CGameTrace* pTrace);
+typedef void(__thiscall* tImpulseCommands)(void* thisptr);
 
 class Hooks
 {
@@ -85,6 +90,8 @@ public:
     static inline Hook<tCreateNamedRTEx> hkCreateNamedRTEx;
     static inline Hook<tGetViewModelFOV> hkGetViewModelFOV;
     static inline Hook<tEndFrame> hkEndFrame;
+    static inline Hook<tTraceRay> hkTraceRay;
+    static inline Hook<tImpulseCommands> hkImpulseCommands;
 
     Hooks() = default;
     explicit Hooks(Game* game);
@@ -110,4 +117,8 @@ public:
     static ITexture* __fastcall dCreateNamedRTEx(void* ecx, void* edx, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags);
     static float __fastcall dGetViewModelFOV(void* ecx, void* edx);
     static void __fastcall dEndFrame(void* ecx, void* edx);
+    static void __fastcall dTraceRay(void* ecx, void* edx, const Ray_t& ray, unsigned int fMask, CTraceFilter* filter, CGameTrace* pTrace);
+    static void __fastcall dImpulseCommands(void* ecx, void* edx);
+    static void EnsureServerFlashlightHook();
+    static void RestoreViewmodelArmHides();
 };

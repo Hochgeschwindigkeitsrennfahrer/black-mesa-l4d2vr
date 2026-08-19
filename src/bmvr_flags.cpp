@@ -19,9 +19,9 @@ namespace bmvr
     float g_TurnSpeed = 0.25f;
     bool g_SnapTurning = false;
     float g_SnapTurnAngle = 45.f;
-    float g_ViewmodelPosOffsetX = 16.f;
-    float g_ViewmodelPosOffsetY = 3.f;
-    float g_ViewmodelPosOffsetZ = -2.f;
+    float g_ViewmodelPosOffsetX = 0.f;
+    float g_ViewmodelPosOffsetY = 0.f;
+    float g_ViewmodelPosOffsetZ = 0.f;
     float g_ViewmodelAngOffsetX = 0.f;
     float g_ViewmodelAngOffsetY = 0.f;
     float g_ViewmodelAngOffsetZ = 0.f;
@@ -36,6 +36,17 @@ namespace bmvr
     bool g_LeftHanded = false;
     bool g_RecenterResetsYaw = true;
     bool g_HideLocalPlayerModel = true;
+    bool g_HideViewmodelArms = true;
+    bool g_VrHandsDebugBoxes = true;
+    // false = runtime PostPresentHandoff. true = L4D2VR app handoff (default).
+    bool g_CompositorPostPresentHandoff = true;
+    float g_ViewmodelScale = 1.f;
+    float g_HudMaxFov = 60.f;
+    float g_HudDisplayRatio = 0.82f;
+    // Overlay quad in HMD space. 1.3 m × 1.3 m filled the FOV with a black
+    // rectangle when VGUI never painted. Smaller / closer keeps HUD central.
+    float g_HudDistance = 1.05f;
+    float g_HudSize = 0.70f;
 
     static HMODULE g_Module = nullptr;
     static std::mutex g_LogMutex;
@@ -53,6 +64,13 @@ namespace bmvr
     static bool g_TryStereoFov = false;
     static bool g_TryMatQueue = true;
     static bool g_TrySteamVrEyeRt = false;
+    static bool g_TryHudOverlay = true;
+    static bool g_TryVguiPaint = true;
+    static bool g_TryGameUiActivate = true;
+    static bool g_TryMeleeTrace = true;
+    static bool g_TryFbOverride = true;
+    static bool g_TryDrawHud = true;
+    static bool g_TryDme = true;
     static bool g_Inited = false;
     static bool g_WatchdogStarted = false;
     static char g_Stage[64] = "dll_attach";
@@ -157,7 +175,7 @@ namespace bmvr
                     break;
                 }
             }
-            if (std::strcmp(n, "RenderScale") == 0)
+            if (std::strcmp(n, "RenderScale") == 0 || std::strcmp(n, "VRRenderScale") == 0)
             {
                 const float s = static_cast<float>(atof(val));
                 if (s >= 0.5f && s <= 2.0f)
@@ -215,6 +233,42 @@ namespace bmvr
                 g_RecenterResetsYaw = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "HideLocalPlayerModel") == 0)
                 g_HideLocalPlayerModel = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "HideViewmodelArms") == 0)
+                g_HideViewmodelArms = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrHandsDebugBoxes") == 0)
+                g_VrHandsDebugBoxes = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "CompositorPostPresentHandoff") == 0)
+                g_CompositorPostPresentHandoff = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ViewmodelScale") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= 0.2f && s <= 1.5f)
+                    g_ViewmodelScale = s;
+            }
+            else if (std::strcmp(n, "HudDistance") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= 0.4f && s <= 4.f)
+                    g_HudDistance = s;
+            }
+            else if (std::strcmp(n, "HudSize") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= 0.4f && s <= 4.f)
+                    g_HudSize = s;
+            }
+            else if (std::strcmp(n, "HudMaxFov") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= 30.f && s <= 90.f)
+                    g_HudMaxFov = s;
+            }
+            else if (std::strcmp(n, "HudDisplayRatio") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= 0.4f && s <= 1.f)
+                    g_HudDisplayRatio = s;
+            }
             else if (std::strcmp(n, "ViewmodelDisableMoveBob") == 0)
                 g_DisableViewBob = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
         }
@@ -258,6 +312,20 @@ namespace bmvr
         }
         else if (name == "steamvr_rt")
             g_TrySteamVrEyeRt = false;
+        else if (name == "hud_overlay")
+            g_TryHudOverlay = false;
+        else if (name == "vgui_paint")
+            g_TryVguiPaint = false;
+        else if (name == "gameui")
+            g_TryGameUiActivate = false;
+        else if (name == "melee_trace")
+            g_TryMeleeTrace = false;
+        else if (name == "fb_override")
+            g_TryFbOverride = false;
+        else if (name == "drawhud")
+            g_TryDrawHud = false;
+        else if (name == "dme")
+            g_TryDme = false;
         else
             return;
         Log("Skip %s (%s)", name.c_str(), via ? via : "skip file");
@@ -480,11 +548,24 @@ namespace bmvr
         ConsumeIfStuck(L"wait_idle", g_TryWaitIdle, "wait_idle", "WaitDeviceIdle");
         ConsumeIfStuck(L"abs_view", g_TryAbsView, "abs_view", "absolute HMD CViewSetup");
         ConsumeIfStuck(L"menu_vr", g_TryMenuCompositor, "menu_vr", "menu/background compositor Submit");
-        ConsumeIfStuck(L"rel_look", g_TryRelativeHmdLook, "rel_look", "relative HMD look on RenderView copy");
+        // First gameplay RenderView BeginRisky(rel_look) then DME/FindMaterial
+        // died (2026-08-19). That is not the look copy. Same as skip-file ignore.
+        for (const auto& dir : FlagDirs())
+            DeleteFileW((dir + L"\\bmvr_in_rel_look.flag").c_str());
         ConsumeIfStuck(L"stereo_copy", g_TryStereoCopy, "stereo_copy", "double RenderView blit stereo");
         ConsumeIfStuck(L"stereo_fov", g_TryStereoFov, "stereo_fov", "same-size HMD-FOV double RenderView");
         ConsumeIfStuck(L"mat_queue", g_TryMatQueue, "mat_queue", "L4D2VR AutoMatQueueMode / SetThreadMode 2");
         ConsumeIfStuck(L"steamvr_rt", g_TrySteamVrEyeRt, "steamvr_rt", "SteamVR recommended eye RT (offscreen)");
+        ConsumeIfStuck(L"hud_overlay", g_TryHudOverlay, "hud_overlay", "L4D2VR SteamVR HUD overlay");
+        ConsumeIfStuck(L"vgui_paint", g_TryVguiPaint, "vgui_paint", "VGui_Paint redirect onto bmvrHUD");
+        ConsumeIfStuck(L"gameui", g_TryGameUiActivate, "gameui", "gameui_activate from engine thread");
+        ConsumeIfStuck(L"melee_trace", g_TryMeleeTrace, "melee_trace", "crowbar TraceRay origin rewrite");
+        ConsumeIfStuck(L"fb_override", g_TryFbOverride, "fb_override",
+            "IMaterialSystem::SetRenderTargetFrameBufferSizeOverrides");
+        ConsumeIfStuck(L"drawhud", g_TryDrawHud, "drawhud",
+            "leftover RenderView with RENDERVIEW_DRAWHUD");
+        ConsumeIfStuck(L"dme", g_TryDme, "dme",
+            "CModelRender::DrawModelExecute (hide FP arms)");
         // 2026-08-18: 3296x3216 private eyes + SetRT/depth redirect over the
         // 2560x1440 deferred G-buffer. Stereo pair logged redirected=1, blit
         // skipped, Present ~90fps, audio OK, Escape menu OK, world black on
@@ -527,6 +608,13 @@ namespace bmvr
     bool TryStereoFov() { return g_TryStereoFov; }
     bool TryMatQueue() { return g_TryMatQueue; }
     bool TrySteamVrEyeRt() { return g_TrySteamVrEyeRt; }
+    bool TryHudOverlay() { return g_TryHudOverlay; }
+    bool TryVguiPaint() { return g_TryVguiPaint; }
+    bool TryGameUiActivate() { return g_TryGameUiActivate; }
+    bool TryMeleeTrace() { return g_TryMeleeTrace; }
+    bool TryFramebufferOverride() { return g_TryFbOverride; }
+    bool TryDrawHud() { return g_TryDrawHud; }
+    bool TryDrawModelExecute() { return g_TryDme; }
 
     void DisableNamedRenderTargets(const char* reason)
     {

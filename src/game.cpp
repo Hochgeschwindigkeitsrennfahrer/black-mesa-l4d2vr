@@ -65,6 +65,24 @@ static void* GetInterfaceAny(const char* dll, std::initializer_list<const char*>
     return nullptr;
 }
 
+static void* SehVtableSlot(void* iface, int slot)
+{
+    void* fn = nullptr;
+    if (!iface)
+        return nullptr;
+    __try
+    {
+        void** vt = *reinterpret_cast<void***>(iface);
+        if (vt)
+            fn = vt[slot];
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        fn = nullptr;
+    }
+    return fn;
+}
+
 Game::Game()
 {
     m_BaseEngine = reinterpret_cast<uintptr_t>(GetModuleWithRetry("engine.dll"));
@@ -95,6 +113,10 @@ Game::Game()
 
     Game::logMsg("Interfaces: engine=%p matsys=%p clientent=%p icvar=%p",
         m_EngineClient, m_MaterialSystem, m_ClientEntityList, m_Cvar);
+    Game::logMsg("IEngineClient vtbl ClientCmd7=%p slot107=%p slot108=%p",
+        SehVtableSlot(m_EngineClient, 7),
+        SehVtableSlot(m_EngineClient, 107),
+        SehVtableSlot(m_EngineClient, 108));
 
     m_Offsets = new Offsets();
     m_VR = new VR(this);
@@ -159,6 +181,41 @@ C_BaseEntity* Game::GetClientEntity(int entityIndex)
     if (!m_ClientEntityList)
         return nullptr;
     return static_cast<C_BaseEntity*>(m_ClientEntityList->GetClientEntity(entityIndex));
+}
+
+C_BaseEntity* Game::GetActiveWeaponEntity()
+{
+    if (!m_EngineClient || !m_ClientEntityList)
+        return nullptr;
+    const int local = m_EngineClient->GetLocalPlayer();
+    if (local <= 0)
+        return nullptr;
+    void* player = m_ClientEntityList->GetClientEntity(local);
+    if (!player)
+        return nullptr;
+    constexpr int kActiveWeapon = 0xFA4;
+    constexpr uint32_t kInvalid = 0xFFFFFFFFu;
+    const uint32_t h = *reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<uintptr_t>(player) + kActiveWeapon);
+    if (h == 0 || h == kInvalid)
+        return nullptr;
+    return static_cast<C_BaseEntity*>(m_ClientEntityList->GetClientEntityFromHandle(static_cast<int>(h)));
+}
+
+const char* Game::GetActiveWeaponModelName()
+{
+    C_BaseEntity* weapon = GetActiveWeaponEntity();
+    if (!weapon || !m_ModelInfo)
+        return nullptr;
+    // DT_BaseEntity m_nModelIndex +0x94 (Ghidra FUN_100a4cb0).
+    const short modelIndex = *reinterpret_cast<const short*>(
+        reinterpret_cast<uintptr_t>(weapon) + 0x94);
+    if (modelIndex <= 0)
+        return nullptr;
+    void* model = m_ModelInfo->GetModel(modelIndex);
+    if (!model)
+        return nullptr;
+    return m_ModelInfo->GetModelName(model);
 }
 
 int Game::CycleWeaponSelect(int direction)
@@ -230,16 +287,38 @@ int Game::CycleWeaponSelect(int direction)
     return indices[next];
 }
 
-void Game::ClientCmd(const char* szCmdString)
+bool Game::ClientCmd(const char* szCmdString)
 {
-    if (m_EngineClient)
+    if (!m_EngineClient || !szCmdString)
+        return false;
+    bool ok = false;
+    __try
+    {
         m_EngineClient->ClientCmd(szCmdString);
+        ok = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        logMsg("ClientCmd SEH for '%s'", szCmdString);
+    }
+    return ok;
 }
 
-void Game::ClientCmd_Unrestricted(const char* szCmdString)
+bool Game::ClientCmd_Unrestricted(const char* szCmdString)
 {
-    if (m_EngineClient)
+    if (!m_EngineClient || !szCmdString)
+        return false;
+    bool ok = false;
+    __try
+    {
         m_EngineClient->ClientCmd_Unrestricted(szCmdString);
+        ok = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        logMsg("ClientCmd_Unrestricted SEH for '%s'", szCmdString);
+    }
+    return ok;
 }
 
 int Game::GetMatQueueMode() const

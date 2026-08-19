@@ -78,13 +78,15 @@ After launch, bmvr_log.txt reports the size actually used, for example:
 Left stick walk, right stick turn, right trigger attack, left trigger alt-fire,
 right B use, right A jump, right grip crouch, left grip reload,
 left-stick click recenter, right-stick click flashlight.
-Left Y next weapon, left X previous weapon.
-Pause is unbound (it crashed Black Mesa).
+Left Y next weapon. Left X sprint. Right-stick dpad north/south prev/next weapon.
+Left menu / system button opens the in-game ESC menu (same as keyboard Escape).
+While that menu is up, point the right controller at it and pull the trigger to click.
 
-If sticks do nothing, open SteamVR Bindings for this app and reset the layout
-to the default that shipped in VR\SteamVRActionManifest.
+If sticks or the new pause/sprint bindings do nothing, open SteamVR Bindings for
+this app and reset the layout to the default in VR\SteamVRActionManifest.
 
 The first-person weapon follows the right controller (uncoupled viewmodel).
+HL2 v_ models are oversized in world-space VR; ViewmodelScale=0.5 is the default.
 Shooting aims with that controller; walking still follows where you look.
 If the gun sits too far forward/back, edit VR\config.txt:
 

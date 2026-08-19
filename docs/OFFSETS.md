@@ -13,7 +13,7 @@ Install: `C:\Program Files (x86)\Steam\steamapps\common\Black Mesa`
 | LevelInit | client.dll | `0x110A80` | MATCH | `0x110A80` |
 | LevelShutdown | client.dll | `0x110B30` | MATCH | `0x110B30` |
 | OverrideView | client.dll | `0x110BE0` | MOVED | `0x1D40`, `0x1E70`, `0x2770`, `0x6FA0`, `0x77C0`, `0x8AC0`, `0xFF90`, `0x10840` |
-| DrawModelExecute | engine.dll | `0xF6A20` | MATCH | `0xF6A20` |
+| DrawModelExecute | engine.dll | `0x113E80` | MATCH | `CModelRender` IModelRender slot 19 (`+0x4C`), thiscall 3-arg `ret 0xC`. **Not** `0xF6A20` (DispInfo displacement helper; that hang 2026-08-18). Do **not** `FindMaterial` from this detour (2026-08-19 load crash on first eligible `v_*`). Hide arms from `DrawModelState` studiohwdata materials. |
 | VGui_Paint | engine.dll | `0x238C50` | MATCH | `0x238C50` |
 | GetRenderTarget | materialsystem.dll | `0x68820` | MATCH | `0x68820` |
 | GetViewport | materialsystem.dll | `0x68A70` | MATCH | `0x68A70` |

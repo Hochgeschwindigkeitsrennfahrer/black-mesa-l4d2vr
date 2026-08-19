@@ -54,6 +54,7 @@ public:
     vr::IVRSystem* m_System = nullptr;
     vr::IVRInput* m_Input = nullptr;
     vr::IVROverlay* m_Overlay = nullptr;
+    vr::VROverlayHandle_t m_HUDTopHandle = vr::k_ulOverlayHandleInvalid;
     vr::IVRCompositor* m_Compositor = nullptr;
 
     // Eye / G-buffer size. L4D2VR uses OpenVR recommended size. Named RTs at
@@ -84,11 +85,35 @@ public:
     Vector m_RightControllerForward{};
     Vector m_RightControllerRight{};
     Vector m_RightControllerUp{};
+    float m_RightControllerSpeedMs = 0.f;
+    Vector m_RightControllerRelVel{};
+    Vector m_HmdTrackForward{};
+    vr::HmdMatrix34_t m_RightControllerTracking{};
+    bool m_RightControllerTrackingValid = false;
+    // Physical left/right (not gameplay-swapped). Gun still uses m_RightController*
+    // filled from AimControllerRole(). Independent hand meshes use these.
+    Vector m_LeftControllerPosAbs{};
+    QAngle m_LeftControllerAngAbs{};
+    vr::HmdMatrix34_t m_LeftControllerTracking{};
+    vr::TrackedDeviceIndex_t m_LeftControllerDevice = vr::k_unTrackedDeviceIndexInvalid;
+    bool m_LeftControllerTrackingValid = false;
+    Vector m_PhysicalRightPosAbs{};
+    QAngle m_PhysicalRightAngAbs{};
+    vr::HmdMatrix34_t m_PhysicalRightTracking{};
+    vr::TrackedDeviceIndex_t m_PhysicalRightDevice = vr::k_unTrackedDeviceIndexInvalid;
+    bool m_PhysicalRightTrackingValid = false;
     Vector m_ViewmodelForward{};
     Vector m_ViewmodelRight{};
     Vector m_ViewmodelUp{};
     mutable std::recursive_mutex m_ControllerMutex;
     std::string m_LastViewmodelModel;
+    bool m_HasViewmodelBake = false;
+    float m_ViewmodelBakeOx = 0.f;
+    float m_ViewmodelBakeOy = 0.f;
+    float m_ViewmodelBakeOz = 0.f;
+    bool m_FirstAttackLogged = false;
+    uint32_t m_FirstAttackPresentTick = 0;
+    int m_FirstAttackSpikeLogs = 0;
     std::mutex m_PoseMutex;
     vr::TrackedDevicePose_t m_WaitedPoses[vr::k_unMaxTrackedDeviceCount]{};
     std::atomic<DWORD> m_WaitedPoseTick{ 0 };
@@ -300,15 +325,24 @@ public:
     vr::VRActionHandle_t m_ActionPrevItem = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionResetPosition = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionCrouch = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionCrouchToggle = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionFlashlight = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionScoreboard = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionPause = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionSprint = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionMenuSelect = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionSkeletonLeft = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionSkeletonRight = vr::k_ulInvalidActionHandle;
+    bool m_CompositorAppHandoff = false;
+    uint32_t m_CompositorHandoffSlowCount = 0;
     std::atomic<float> m_WalkForward{ 0.f };
     std::atomic<float> m_WalkSide{ 0.f };
     std::atomic<uint32_t> m_HeldButtons{ 0 };
     std::atomic<float> m_RotationOffsetY{ 0.f };
     std::atomic<uint32_t> m_PendingImpulse{ 0 };
     std::atomic<int> m_PendingInvDelta{ 0 };
+    std::atomic<int> m_PendingGameUi{ 0 };
+    bool m_GameUiVisible = false;
     bool m_PressedTurn = false;
     bool m_StereoEyesDrawnThisFrame = false;
     // 0 = mono, 1 = left, 2 = right. Matches Source StereoEye_t.
@@ -353,8 +387,10 @@ public:
     void WaitPosesForStereoFrame();
     Vector GetViewAngle() const;
     Vector GetViewOrigin(const Vector& setupOrigin) const;
+    void GetViewBasis(Vector* forward, Vector* right, Vector* up) const;
     Vector GetViewOriginLeft(const Vector& setupOrigin) const;
     Vector GetViewOriginRight(const Vector& setupOrigin) const;
+    Vector ControllerTrackingToWorld(const Vector& setupOrigin, const Vector& trackingPos) const;
     Vector GetRightControllerAbsPos(const Vector& eyePosition) const;
     QAngle GetRightControllerAbsAngle() const;
     Vector GetRecommendedViewmodelAbsPos(const Vector& eyePosition) const;
@@ -381,10 +417,21 @@ public:
     bool IsQueuedHudFresh() const { return false; }
     void OnLevelInit(const char* newmap);
     void OnLevelShutdown();
+    void ApplyRenderTargetFramebufferOverride();
+    void LogFullFrameSizeIfReady();
     bool IsGameplayEligible() const { return m_GameplayEligible; }
     bool HasEngineMap() const { return !m_CurrentMapName.empty(); }
     bool ShouldCompositorSubmit() const;
     bool StereoEyeBlitActive() const { return m_StereoEyeBlitActive; }
+    bool HudPaintActive() const { return m_HudPaintActive; }
+    void SetHudPaintActive(bool active) { m_HudPaintActive = active; }
+    bool ShouldRedirectHudRt() const { return false; }
+    void SetRedirectHudRt(bool) {}
+    void SetVguiPaintActive(bool active) { m_VguiPaintActive = active; }
+    void NoteEngineHudRtPush(const char* name, int w, int h);
+    bool EngineHudRtPushed() const { return m_EngineHudRtPushed; }
+    void BlitEngineHudRtToOverlay();
+    bool ComputeHudInset(int fbW, int fbH, int& x, int& y, int& w, int& h) const;
     bool StereoRedirectedToEye() const { return m_StereoRedirectedToEye; }
     IDirect3DSurface9* StereoEyeBlitDest() const { return m_StereoEyeBlitDest; }
     void NoteStereoRedirectedToEye() { m_StereoRedirectedToEye = true; }
@@ -404,10 +451,30 @@ public:
     bool StereoEyesReady() const;
     void ClearUnusedDesktopBackbuffer();
     void ProcessInput();
+    void ApplyMenuCursor();
+    void QueueEscapeKey();
+    void QueueGameUiToggle(bool currentlyPaused);
+    void FlushPendingGameUi();
+    bool GameUiVisible() const { return m_GameUiVisible; }
+    void NoteHudPainted() { m_HudPaintedThisFrame.store(true, std::memory_order_release); }
+    bool HudPaintedThisFrame() const { return m_HudPaintedThisFrame.load(std::memory_order_acquire); }
+    void UpdateCrowbarMelee();
+    bool IsPerformingMelee() const { return m_PerformingMelee; }
+    bool TryGetMeleeTraceOrigin(Vector& origin) const;
+    bool HudOverlayReady() const { return m_HudOverlayReady; }
+    void EnsureHudOverlay();
+    void SubmitHudOverlay();
+    // Bind HUD overlay texture. Caller must already hold LockSubmissionQueue.
+    void BindHudOverlayWhileQueueLocked();
+    void ClearHudSurface(bool opaque);
     void TickMatQueueFromRenderView();
     uint32_t HeldButtons() const { return m_HeldButtons.load(std::memory_order_acquire); }
     void NoteViewmodelModel(const char* modelName);
+    void NoteViewmodelWeaponBake(const char* modelName, const char* boneName, float restX, float restY, float restZ);
     vr::ETrackedControllerRole AimControllerRole() const;
+    void DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye);
+    bool GetFingerCurls(vr::VRActionHandle_t skeletonAction, float outCurls[5]) const;
+    void TryCompositorPostPresentHandoff(DWORD nowMs, DWORD poseAgeMs);
 
 private:
     void SetActionManifest();
@@ -419,6 +486,7 @@ private:
     void PollMapFromEngine();
     bool InitOpenVR();
     void UpdateTracking();
+    bool RefreshPosesFromCompositor();
     void StartPoseWaiter();
     static DWORD WINAPI PoseWaiterThreadMain(LPVOID param);
     void ChooseEyeRenderSize();
@@ -427,12 +495,13 @@ private:
     bool FillSharedTexture(IDirect3DSurface9* surface, SharedTextureHolder& holder);
     void ApplyVulkanYFlip(vr::VRTextureBounds_t& bounds);
     void RefreshIpdFromHmd();
-    void GetViewBasis(Vector* forward, Vector* right, Vector* up) const;
     void UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose);
     void UpdateAutoMatQueueMode();
     void ApplyVrQualityOfLifeCvars();
     void PulseAimHaptic(unsigned short durationUs = 2500);
-    void ResolveWeaponViewmodelOffsets(float& ox, float& oy, float& oz) const;
+    void ResolveWeaponViewmodelPose(float& ox, float& oy, float& oz, float& ax, float& ay, float& az) const;
+    void RefreshActiveWeaponModel();
+    void ApplyViewmodelBasisOffsets();
     int m_AutoMatQueueModeLastRequested = -999;
     std::chrono::steady_clock::time_point m_AutoMatQueueModeLastCmdTime{};
     bool m_VrCvarsApplied = false;
@@ -447,8 +516,29 @@ private:
 
     IDirect3DSurface9* m_StereoEyeBlitDest = nullptr;
     bool m_StereoEyeBlitActive = false;
-    bool m_StereoEyeBlitOk = false;
     bool m_StereoRedirectedToEye = false;
+    bool m_HudPaintActive = false;
+    bool m_EngineHudRtPushed = false;
+    bool m_VguiPaintActive = false;
+    bool m_RedirectHudRt = false;
+    mutable int m_HudInsetX = 0;
+    mutable int m_HudInsetY = 0;
+    mutable int m_HudInsetW = 0;
+    mutable int m_HudInsetH = 0;
+    Vector m_PrevControllerPosAbs{};
+    QAngle m_PrevControllerAngAbs{};
+    DWORD m_PrevControllerTick = 0;
+    DWORD m_MeleeAttackUntilMs = 0;
+    bool m_PerformingMelee = false;
+    bool m_MeleeNewSwing = true;
+    void* m_MeleeHitEntity = nullptr;
+    Vector m_MeleeTraceOrigin{};
+    bool m_CrouchToggled = false;
+    bool m_HudOverlayReady = false;
+    bool m_HudOverlayCreateAttempted = false;
+    std::atomic<bool> m_HudPaintedThisFrame{ false };
+    bool m_MenuTriggerWasDown = false;
+    bool m_StereoEyeBlitOk = false;
     int m_StereoEyeBlitRank = 0;
     uint32_t m_LastStereoBlitWidth = 0;
     uint32_t m_LastStereoBlitHeight = 0;

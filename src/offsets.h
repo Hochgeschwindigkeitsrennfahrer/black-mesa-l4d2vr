@@ -61,6 +61,14 @@ public:
     Offset CalcViewModelView{ "client.dll", 0x29D930,
         "55 8B EC 83 EC 24 53 56 8B 75 08 57 8B F9 85 F6" };
 
+    // Ghidra client.dll image 0x10000000. FUN_1029d930 (CalcViewModelView)
+    // ends in these. FUN_100af720 writes abs origin at this+0x294 and calls
+    // FUN_10077220(this,1) to invalidate; FUN_100af600 writes abs angles at
+    // this+0x2D0 via FUN_10077220(this,2). Raw field writes skip invalidate,
+    // so bones/render origin stay on the camera pivot.
+    static constexpr int kCBaseEntity_SetAbsOrigin = 0xAF720;
+    static constexpr int kCBaseEntity_SetAbsAngles = 0xAF600;
+
     // IClientMode slot 32. Reads viewmodel_fov_override then weapon GetViewModelFOV
     // (~54). That is why console fov does not change gun/near scale in VR.
     Offset GetViewModelFOV{ "client.dll", 0x216510,
@@ -75,8 +83,13 @@ public:
     Offset LevelShutdown{ "client.dll", 0x110B30,
         "55 8B EC 83 EC 20 56 8B F1 B9 ? ? ? ? E8" };
 
-    Offset DrawModelExecute{ "engine.dll", 0xF6A20,
-        "55 8B EC 81 EC ? ? ? ? A1 ? ? ? ? 33 C5 89 45 FC 8B 45 10 56 8B 75 08 57 8B" };
+    // CModelRender::DrawModelExecute — IModelRender vtable slot 19 (+0x4C).
+    // thiscall (state, ModelRenderInfo_t&, bones), ret 0xC. Ghidra FUN_10113e80.
+    // Do NOT use 0xF6A20: that prologue matches DispInfo_LoadDisplacements'
+    // cdecl 5-arg helper (FUN_100f6a20). Hooking it as DME hung load-to-menu
+    // (2026-08-18). DrawModelEx (+0x40) calls Setup (+0x48) then this slot.
+    Offset DrawModelExecute{ "engine.dll", 0x113E80,
+        "55 8B EC 81 EC 68 03 00 00 A1 ? ? ? ? 33 C5 89 45 FC 8B 45 10 53 8B 5D 0C" };
 
     Offset VGui_Paint{ "engine.dll", 0x238C50,
         "55 8B EC 83 EC 18 53 8B D9 8B 0D ? ? ? ? FF 15" };
@@ -133,6 +146,23 @@ public:
 
     Offset ProcessUsercmds{ "server.dll", 0x5320F0,
         "55 8B EC B8 ? ? ? ? E8 ? ? ? ? A1 ? ? ? ? 33 C5 89 45 FC 8B 45 0C 8B 55 08", 0, true };
+
+    // CBasePlayer::ImpulseCommands. Ghidra server.dll FUN_1022dd40.
+    // Hooked lazily once server.dll is loaded (not at Offset() time).
+    static constexpr int kCBasePlayer_ImpulseCommands = 0x22DD40;
+
+    // IMaterialSystem vtable (Ghidra materialsystem.dll, GetRenderContext slot 103).
+    static constexpr int kIMaterialSystem_FindTextureVt = 84; // +0x150
+    // Dump slot 71 + 7 (same shift as FindTexture 77→84 / GetRenderContext 96→103).
+    static constexpr int kIMaterialSystem_FindMaterialVt = 78; // +0x138
+    static constexpr int kIMaterialSystem_SetRTFBOverrideVt = 142; // +0x238
+    static constexpr int kIMaterialSystem_GetRTFBDimensionsVt = 143; // +0x23C
+
+    // CBlackMesaPlayer (server). Impulse int +0xe44; flashlight virtuals.
+    static constexpr int kCBasePlayer_m_nImpulse = 0xE44;
+    static constexpr int kCBasePlayer_FlashlightIsOnVt = 0x5D4 / 4;
+    static constexpr int kCBasePlayer_FlashlightTurnOnVt = 0x5D8 / 4;
+    static constexpr int kCBasePlayer_FlashlightTurnOffVt = 0x5DC / 4;
 
     // L4D2 leftover referenced by copied sdk.h melee helpers. Unused on Black Mesa.
     struct { int address = 0; } GetMeleeWeaponInfoClient;

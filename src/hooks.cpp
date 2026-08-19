@@ -6,7 +6,10 @@
 #include "bmvr_flags.h"
 #include "sigscanner.h"
 #include "in_buttons.h"
+#include "trace.h"
+#include "texture.h"
 #include <Windows.h>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -34,6 +37,18 @@ namespace
     {
         return Hooks::m_Game && Hooks::m_Game->m_EngineClient
             && Hooks::m_Game->m_EngineClient->IsInGame();
+    }
+
+    // Source viewrender.h: RENDERVIEW_DRAWVIEWMODEL=1, RENDERVIEW_DRAWHUD=2.
+    constexpr int kRenderViewDrawHud = 0x2;
+
+    bool TextureNameIsHudRt(const char* name)
+    {
+        if (!name || !name[0])
+            return false;
+        return std::strstr(name, "_rt_gui") != nullptr
+            || std::strstr(name, "_rt_Hud") != nullptr
+            || std::strstr(name, "_rt_HUD") != nullptr;
     }
 }
 
@@ -77,6 +92,7 @@ Hooks::Hooks(Game* game)
     enableIfReady(hkCalcViewModelView, "CalcViewModelView");
     enableIfReady(hkGetViewModelFOV, "GetViewModelFOV");
     enableIfReady(hkEndFrame, "EndFrame");
+    enableIfReady(hkTraceRay, "TraceRay");
 }
 
 Hooks::~Hooks()
@@ -118,9 +134,25 @@ int Hooks::initSourceHooks()
         hkGetScreenSize.createHook((LPVOID)o.GetScreenSize.address, &dGetScreenSize);
     if (o.CreateNamedRTEx.valid)
         hkCreateNamedRTEx.createHook((LPVOID)o.CreateNamedRTEx.address, &dCreateNamedRTEx);
-    // DrawModelExecute stays unhooked: it was never installed before 2026-08-18,
-    // and enabling it coincided with load-to-menu never reaching LevelInit.
-    // Confirm IModelRender ABI (3-arg vs IMatRenderContext first) before retry.
+    if (o.VGui_Paint.valid && bmvr::TryVguiPaint())
+        hkVgui_Paint.createHook((LPVOID)o.VGui_Paint.address, &dVGui_Paint);
+    else if (o.VGui_Paint.valid)
+        Game::logMsg("VGui_Paint createHook skipped (sticky vgui_paint)");
+    // Real CModelRender::DrawModelExecute is engine.dll 0x113E80 (vtable +0x4C),
+    // thiscall 3-arg, ret 0xC. 0xF6A20 is a displacement loader — do not hook it.
+    if (o.DrawModelExecute.valid && bmvr::TryDrawModelExecute())
+    {
+        bmvr::BeginRisky(L"dme");
+        if (hkDrawModelExecute.createHook((LPVOID)o.DrawModelExecute.address, &dDrawModelExecute) != 0)
+        {
+            bmvr::EndRisky(L"dme");
+            Game::logMsg("DrawModelExecute createHook failed");
+        }
+        else
+            Game::logMsg("DrawModelExecute createHook CModelRender+0x4C rva=0x%X", o.DrawModelExecute.offset);
+    }
+    else if (o.DrawModelExecute.valid)
+        Game::logMsg("DrawModelExecute createHook skipped (sticky dme)");
     // LevelInit stays unhooked: MinHook on it crashed inside the original on
     // background01 (docs/RUNTIME.md). Map names come from GetLevelNameShort.
     if (m_Game->MaterialVTableMatchesDump() && m_Game->m_MaterialSystem)
@@ -134,6 +166,17 @@ int Hooks::initSourceHooks()
     else
         Game::logMsg("EndFrame hook skipped (IMaterialSystem vtable does not match dump)");
 
+    if (bmvr::TryMeleeTrace() && m_Game->m_EngineTrace)
+    {
+        void** vt = nullptr;
+        __try { vt = *reinterpret_cast<void***>(m_Game->m_EngineTrace); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { vt = nullptr; }
+        if (vt && vt[5])
+            hkTraceRay.createHook(vt[5], &dTraceRay);
+        else
+            Game::logMsg("TraceRay hook skipped (no EngineTrace vtbl[5])");
+    }
+
     return 1;
 }
 
@@ -141,6 +184,7 @@ namespace
 {
     thread_local IMatRenderContext* g_MatCtx = nullptr;
     thread_local ITexture* g_StereoRedirect = nullptr;
+    thread_local int g_VguiOverlayReentry = 0;
 
     void NoteMatContext(void* ecx)
     {
@@ -206,6 +250,504 @@ namespace
             || std::strstr(name, "\\V_") != nullptr;
     }
 
+    // Source DrawModelState_t (x86). CModelRender::DrawModelExecute
+    // (engine 0x113E80) reads studiohdr flags at state[0]+0x98 and
+    // drawFlags at state+0x14 — first pointer is studiohdr_t*, not CStudioHdr.
+    struct DrawModelStateLite
+    {
+        unsigned char* studioHdr;
+        void* studioHWData;
+        void* renderable;
+        const void* modelToWorld;
+        int decals;
+        int drawFlags;
+        int lod;
+    };
+
+    constexpr int kStudioIdst = 0x54534449; // 'IDST'
+    constexpr int kStudioHdrLength = 76;
+    constexpr int kMaxStudioBones = 256;
+    constexpr int kStudioHdrNumBones = 156;
+    constexpr int kStudioHdrBoneIndex = 160;
+    constexpr int kStudioHdrNumBodyparts = 232;
+    constexpr int kStudioHdrBodypartIndex = 236;
+    constexpr int kStudioBoneSize = 216;
+    constexpr int kStudioBodypartSize = 16;
+    constexpr int kStudioModelSize = 148;
+    constexpr int kStudioModelNumMeshes = 72;
+
+    struct StudioHdrPatch
+    {
+        int* p = nullptr;
+        int original = 0;
+    };
+    constexpr int kMaxStudioHdrPatches = 96;
+    StudioHdrPatch g_ArmHdrPatches[kMaxStudioHdrPatches]{};
+    int g_ArmHdrPatchCount = 0;
+    thread_local float g_ScaledViewmodelBones[kMaxStudioBones][3][4];
+    thread_local float g_ScaledViewmodelModelToWorld[3][4];
+    thread_local unsigned char g_ScaledViewmodelInfo[sizeof(ModelRenderInfo_t)];
+
+    unsigned char* AsStudioHdr(void* p)
+    {
+        if (!p)
+            return nullptr;
+        int id = 0;
+        int ver = 0;
+        __try
+        {
+            id = *reinterpret_cast<int*>(p);
+            ver = *(reinterpret_cast<int*>(p) + 1);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return nullptr;
+        }
+        if (id != kStudioIdst || ver < 44 || ver > 49)
+            return nullptr;
+        return static_cast<unsigned char*>(p);
+    }
+
+    unsigned char* ResolveStudioHdr(void* state)
+    {
+        if (!state)
+            return nullptr;
+        DrawModelStateLite* st = nullptr;
+        unsigned char* hdr = nullptr;
+        void* inner = nullptr;
+        __try
+        {
+            st = reinterpret_cast<DrawModelStateLite*>(state);
+            hdr = AsStudioHdr(st->studioHdr);
+            if (hdr)
+                return hdr;
+            inner = *reinterpret_cast<void**>(st->studioHdr);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return nullptr;
+        }
+        return AsStudioHdr(inner);
+    }
+
+    void ScaleMatrix3x4AroundPivot(float m[3][4], const float pivot[3], float s)
+    {
+        for (int r = 0; r < 3; ++r)
+        {
+            m[r][0] *= s;
+            m[r][1] *= s;
+            m[r][2] *= s;
+            m[r][3] = pivot[r] + (m[r][3] - pivot[r]) * s;
+        }
+    }
+
+    // Source VM layer builds yScale = xScale * aspect from the *window*
+    // (l4d2vr-hands.md). Eye RTs are ~1.1 while the HWND is 16:9, so the gun
+    // stretches along view-up: barrel when the controller is upright, grip
+    // when it is on its side. Undo that in world space around the HMD camera.
+    void UnstretchMatrix3x4ViewY(float m[3][4], const float cam[3],
+        const float right[3], const float up[3], const float fwd[3], float yFix)
+    {
+        const float rel[3] = {
+            m[0][3] - cam[0],
+            m[1][3] - cam[1],
+            m[2][3] - cam[2]
+        };
+        const float vx = rel[0] * right[0] + rel[1] * right[1] + rel[2] * right[2];
+        const float vy = (rel[0] * up[0] + rel[1] * up[1] + rel[2] * up[2]) * yFix;
+        const float vz = rel[0] * fwd[0] + rel[1] * fwd[1] + rel[2] * fwd[2];
+        m[0][3] = cam[0] + right[0] * vx + up[0] * vy + fwd[0] * vz;
+        m[1][3] = cam[1] + right[1] * vx + up[1] * vy + fwd[1] * vz;
+        m[2][3] = cam[2] + right[2] * vx + up[2] * vy + fwd[2] * vz;
+        const float k = yFix - 1.f;
+        for (int c = 0; c < 3; ++c)
+        {
+            const float au = m[0][c] * up[0] + m[1][c] * up[1] + m[2][c] * up[2];
+            m[0][c] += up[0] * au * k;
+            m[1][c] += up[1] * au * k;
+            m[2][c] += up[2] * au * k;
+        }
+    }
+
+    void UnstretchPointViewY(float p[3], const float cam[3],
+        const float right[3], const float up[3], const float fwd[3], float yFix)
+    {
+        const float rel[3] = { p[0] - cam[0], p[1] - cam[1], p[2] - cam[2] };
+        const float vx = rel[0] * right[0] + rel[1] * right[1] + rel[2] * right[2];
+        const float vy = (rel[0] * up[0] + rel[1] * up[1] + rel[2] * up[2]) * yFix;
+        const float vz = rel[0] * fwd[0] + rel[1] * fwd[1] + rel[2] * fwd[2];
+        p[0] = cam[0] + right[0] * vx + up[0] * vy + fwd[0] * vz;
+        p[1] = cam[1] + right[1] * vx + up[1] * vy + fwd[1] * vz;
+        p[2] = cam[2] + right[2] * vx + up[2] * vy + fwd[2] * vz;
+    }
+
+    int StudioHdrNumBones(unsigned char* hdr)
+    {
+        if (!hdr)
+            return 0;
+        int n = 0;
+        __try { n = *reinterpret_cast<int*>(hdr + kStudioHdrNumBones); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+        if (n < 1 || n > kMaxStudioBones)
+            return 0;
+        return n;
+    }
+
+    bool SehCopyAndFixViewmodelMatrices(float* dst, const void* src, int count,
+        const float pivot[3], float scale,
+        const float cam[3], const float right[3], const float up[3], const float fwd[3],
+        float yFix)
+    {
+        if (!dst || !src || count < 1)
+            return false;
+        __try
+        {
+            std::memcpy(dst, src, static_cast<size_t>(count) * 12 * sizeof(float));
+            for (int i = 0; i < count; ++i)
+            {
+                float* m = dst + i * 12;
+                auto matrix = reinterpret_cast<float(*)[4]>(m);
+                if (yFix > 0.2f && yFix < 2.f && fabsf(yFix - 1.f) > 0.03f)
+                    UnstretchMatrix3x4ViewY(matrix, cam, right, up, fwd, yFix);
+                if (scale > 0.2f && scale < 1.5f && fabsf(scale - 1.f) > 0.001f)
+                    ScaleMatrix3x4AroundPivot(matrix, pivot, scale);
+            }
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    bool SehWriteModelScale(void* renderable, float scale)
+    {
+        if (!renderable)
+            return false;
+        __try
+        {
+            *reinterpret_cast<float*>(reinterpret_cast<char*>(renderable) + 0x7C0) = scale;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    const char* StudioRelString(const unsigned char* base, int rel)
+    {
+        if (!base || rel <= 0 || rel > 0x100000)
+            return "";
+        const char* s = reinterpret_cast<const char*>(base + rel);
+        __try
+        {
+            if (!s[0])
+                return "";
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return "";
+        }
+        return s;
+    }
+
+    bool PokeInt(int* p, int value)
+    {
+        if (!p)
+            return false;
+        DWORD oldProt = 0;
+        if (!VirtualProtect(p, sizeof(int), PAGE_READWRITE, &oldProt))
+            return false;
+        bool ok = false;
+        __try
+        {
+            *p = value;
+            ok = true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            ok = false;
+        }
+        DWORD tmp = 0;
+        VirtualProtect(p, sizeof(int), oldProt, &tmp);
+        return ok;
+    }
+
+    void RememberHdrPatch(int* p, int original)
+    {
+        if (!p || g_ArmHdrPatchCount >= kMaxStudioHdrPatches)
+            return;
+        for (int i = 0; i < g_ArmHdrPatchCount; ++i)
+        {
+            if (g_ArmHdrPatches[i].p == p)
+                return;
+        }
+        g_ArmHdrPatches[g_ArmHdrPatchCount].p = p;
+        g_ArmHdrPatches[g_ArmHdrPatchCount].original = original;
+        ++g_ArmHdrPatchCount;
+    }
+
+    int WeaponRootScore(const char* n)
+    {
+        if (!n || !n[0])
+            return -1;
+        if (_stricmp(n, "R_Arm") == 0 || _stricmp(n, "L_Arm") == 0)
+            return -1;
+        if (std::strstr(n, "SCI_Hand") || std::strstr(n, "gman_arms"))
+            return -1;
+        char buf[64]{};
+        strncpy_s(buf, n, _TRUNCATE);
+        for (char* c = buf; *c; ++c)
+            *c = static_cast<char>(std::tolower(static_cast<unsigned char>(*c)));
+        if (std::strstr(buf, "projectile") || std::strstr(buf, "bullet")
+            || std::strstr(buf, "clip") || std::strstr(buf, "trigger")
+            || std::strstr(buf, "shell") || std::strstr(buf, "chamber")
+            || std::strstr(buf, "loader") || std::strstr(buf, "eject")
+            || std::strstr(buf, "muzzle") || std::strstr(buf, "bolt")
+            || std::strstr(buf, "pump") || std::strstr(buf, "screen"))
+            return 0;
+        if (std::strstr(buf, "crowbar") || std::strstr(buf, "bone_gun")
+            || std::strcmp(buf, "357") == 0 || std::strstr(buf, "mp5")
+            || std::strstr(buf, "v_rpg") || std::strstr(buf, "tau")
+            || std::strstr(buf, "egon") || std::strstr(buf, "gauss")
+            || std::strstr(buf, "glock") || std::strstr(buf, "shotgun")
+            || std::strstr(buf, "wrench"))
+            return 10;
+        return 1;
+    }
+
+    void NoteWeaponRootFromHdr(unsigned char* hdr, const char* modelName)
+    {
+        if (!hdr || !Hooks::m_VR)
+            return;
+        int length = 0;
+        int numbones = 0;
+        int boneindex = 0;
+        __try
+        {
+            length = *reinterpret_cast<int*>(hdr + kStudioHdrLength);
+            numbones = *reinterpret_cast<int*>(hdr + kStudioHdrNumBones);
+            boneindex = *reinterpret_cast<int*>(hdr + kStudioHdrBoneIndex);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return;
+        }
+        if (length < 256 || length > 4 * 1024 * 1024)
+            return;
+        if (numbones <= 0 || numbones > 256)
+            return;
+        if (boneindex < 0 || boneindex + numbones * kStudioBoneSize > length)
+            return;
+
+        int bestScore = -1;
+        int bestIndex = -1;
+        float rest[3]{};
+        char bestName[64]{};
+        for (int i = 0; i < numbones; ++i)
+        {
+            unsigned char* bone = hdr + boneindex + i * kStudioBoneSize;
+            int parent = -2;
+            int szname = 0;
+            float pos[3]{};
+            __try
+            {
+                szname = *reinterpret_cast<int*>(bone);
+                parent = *reinterpret_cast<int*>(bone + 4);
+                pos[0] = *reinterpret_cast<float*>(bone + 32);
+                pos[1] = *reinterpret_cast<float*>(bone + 36);
+                pos[2] = *reinterpret_cast<float*>(bone + 40);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                continue;
+            }
+            if (parent != -1)
+                continue;
+            const char* n = StudioRelString(bone, szname);
+            const int score = WeaponRootScore(n);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestIndex = i;
+                rest[0] = pos[0];
+                rest[1] = pos[1];
+                rest[2] = pos[2];
+                strncpy_s(bestName, n, _TRUNCATE);
+            }
+        }
+        if (bestScore < 1 || bestIndex < 0)
+            return;
+        Hooks::m_VR->NoteViewmodelWeaponBake(modelName, bestName, rest[0], rest[1], rest[2]);
+    }
+
+    struct HideArmsResult
+    {
+        int bodyparts = 0;
+        int armsPart = -1;
+        int armsModels = 0;
+        int selected = -1;
+        int meshesZeroed = 0;
+        int alreadyZero = 0;
+        char armsName[32]{};
+        char gunName[64]{};
+        int hwLods = -1;
+        int hwMats = -1;
+    };
+
+    HideArmsResult InspectAndHideArmBodypart(void* state, int body, bool hideMeshes)
+    {
+        HideArmsResult r{};
+        unsigned char* hdr = ResolveStudioHdr(state);
+        if (!hdr)
+            return r;
+
+        if (state)
+        {
+            __try
+            {
+                auto* st = reinterpret_cast<DrawModelStateLite*>(state);
+                int* hw = reinterpret_cast<int*>(st->studioHWData);
+                if (hw)
+                {
+                    r.hwLods = hw[1];
+                    if (r.hwLods > 0 && r.hwLods <= 8 && hw[2])
+                    {
+                        unsigned char* lod0 = reinterpret_cast<unsigned char*>(
+                            static_cast<uintptr_t>(hw[2]));
+                        r.hwMats = *reinterpret_cast<int*>(lod0 + 8);
+                    }
+                }
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
+
+        int length = 0;
+        int numbody = 0;
+        int bodyindex = 0;
+        __try
+        {
+            length = *reinterpret_cast<int*>(hdr + kStudioHdrLength);
+            numbody = *reinterpret_cast<int*>(hdr + kStudioHdrNumBodyparts);
+            bodyindex = *reinterpret_cast<int*>(hdr + kStudioHdrBodypartIndex);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return r;
+        }
+        if (length < 256 || length > 4 * 1024 * 1024)
+            return r;
+        if (numbody <= 0 || numbody > 16)
+            return r;
+        if (bodyindex < 0 || bodyindex + numbody * kStudioBodypartSize > length)
+            return r;
+        r.bodyparts = numbody;
+
+        for (int bi = 0; bi < numbody; ++bi)
+        {
+            unsigned char* bp = hdr + bodyindex + bi * kStudioBodypartSize;
+            int szname = 0;
+            int nummodels = 0;
+            int base = 1;
+            int modelindex = 0;
+            __try
+            {
+                szname = *reinterpret_cast<int*>(bp);
+                nummodels = *reinterpret_cast<int*>(bp + 4);
+                base = *reinterpret_cast<int*>(bp + 8);
+                modelindex = *reinterpret_cast<int*>(bp + 12);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                continue;
+            }
+            const char* bpName = StudioRelString(bp, szname);
+            if (bi == 0)
+                strncpy_s(r.gunName, bpName, _TRUNCATE);
+            if (_stricmp(bpName, "arms") != 0)
+                continue;
+            r.armsPart = bi;
+            r.armsModels = nummodels;
+            strncpy_s(r.armsName, bpName, _TRUNCATE);
+            if (nummodels <= 0 || nummodels > 16 || base <= 0)
+                continue;
+            r.selected = (body / base) % nummodels;
+            if (modelindex < 0 || bp + modelindex + nummodels * kStudioModelSize > hdr + length)
+                continue;
+            for (int mi = 0; mi < nummodels; ++mi)
+            {
+                unsigned char* model = bp + modelindex + mi * kStudioModelSize;
+                int* pMeshes = reinterpret_cast<int*>(model + kStudioModelNumMeshes);
+                int nMesh = 0;
+                __try { nMesh = *pMeshes; }
+                __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+                if (nMesh < 0 || nMesh > 64)
+                    continue;
+                if (nMesh == 0)
+                {
+                    ++r.alreadyZero;
+                    continue;
+                }
+                if (!hideMeshes)
+                    continue;
+                RememberHdrPatch(pMeshes, nMesh);
+                if (PokeInt(pMeshes, 0))
+                    ++r.meshesZeroed;
+            }
+        }
+        return r;
+    }
+
+    void ApplyViewmodelStudioWork(void* state, const char* modelName, int body, int skin,
+        bool hideArms, void* pCustomBoneToWorld)
+    {
+        unsigned char* hdr = ResolveStudioHdr(state);
+        if (!hdr)
+        {
+            static int s_noHdr;
+            if (s_noHdr < 4)
+            {
+                Game::logMsg("HideViewmodelArms no studiohdr %s", modelName ? modelName : "?");
+                ++s_noHdr;
+            }
+        }
+        NoteWeaponRootFromHdr(hdr, modelName);
+        const HideArmsResult hide = InspectAndHideArmBodypart(state, body, hideArms);
+        static int s_armLog;
+        if (s_armLog < 8 && (hideArms || hide.armsPart >= 0))
+        {
+            Game::logMsg(
+                "HideViewmodelArms %s body=%d skin=%d parts=%d arms='%s' idx=%d/%d "
+                "zeroed=%d already=%d hwLod=%d hwMat=%d hide=%d bones=%d",
+                modelName ? modelName : "?", body, skin, hide.bodyparts,
+                hide.armsName[0] ? hide.armsName : "?",
+                hide.selected, hide.armsModels, hide.meshesZeroed, hide.alreadyZero,
+                hide.hwLods, hide.hwMats, hideArms ? 1 : 0,
+                pCustomBoneToWorld ? 1 : 0);
+            ++s_armLog;
+        }
+    }
+
+    void RestoreArmBodypartMeshes()
+    {
+        int n = 0;
+        for (int i = 0; i < g_ArmHdrPatchCount; ++i)
+        {
+            if (g_ArmHdrPatches[i].p)
+            {
+                PokeInt(g_ArmHdrPatches[i].p, g_ArmHdrPatches[i].original);
+                ++n;
+            }
+            g_ArmHdrPatches[i] = {};
+        }
+        if (g_ArmHdrPatchCount)
+            Game::logMsg("HideViewmodelArms restored %d studiohdr nummeshes", n);
+        g_ArmHdrPatchCount = 0;
+    }
+
     struct SourceRenderQueueBuildScope
     {
         VR* vr = nullptr;
@@ -253,6 +795,8 @@ namespace
         // (IMaterialSystem +0x150) then context PushRT +0x23C. Leave it.
         if (std::strstr(name, "_rt_gui"))
             return false;
+        if (std::strstr(name, "bmvrHUD") || std::strstr(name, "vrHUD"))
+            return false;
         return std::strstr(name, "_rt_FullFrameFB") != nullptr;
     }
 
@@ -297,6 +841,57 @@ namespace
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
+        }
+    }
+
+    void CallSetAbsOriginAngles(void* ent, const float* origin, const float* angles)
+    {
+        if (!ent || !origin || !angles)
+            return;
+        HMODULE client = GetModuleHandleA("client.dll");
+        if (!client)
+            return;
+        using SetVecFn = void(__thiscall*)(void*, const float*);
+        auto setOrigin = reinterpret_cast<SetVecFn>(
+            reinterpret_cast<uintptr_t>(client) + Offsets::kCBaseEntity_SetAbsOrigin);
+        auto setAngles = reinterpret_cast<SetVecFn>(
+            reinterpret_cast<uintptr_t>(client) + Offsets::kCBaseEntity_SetAbsAngles);
+        __try
+        {
+            setOrigin(ent, origin);
+            setAngles(ent, angles);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    void CallCalcViewModelViewOriginal(void* ecx, void* owner, const Vector& eyePosition, const QAngle& eyeAngles)
+    {
+        if (!Hooks::hkCalcViewModelView.fOriginal)
+            return;
+        Vector savedVel{};
+        bool zeroVel = bmvr::g_DisableViewBob && owner;
+        if (zeroVel)
+        {
+            __try
+            {
+                savedVel = *reinterpret_cast<Vector*>(reinterpret_cast<char*>(owner) + 0x100);
+                *reinterpret_cast<Vector*>(reinterpret_cast<char*>(owner) + 0x100) = Vector(0.f, 0.f, 0.f);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                zeroVel = false;
+            }
+        }
+        Hooks::hkCalcViewModelView.fOriginal(ecx, owner, eyePosition, eyeAngles);
+        if (zeroVel)
+        {
+            __try
+            {
+                *reinterpret_cast<Vector*>(reinterpret_cast<char*>(owner) + 0x100) = savedVel;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
     }
 
@@ -420,16 +1015,53 @@ namespace
         view.height = eyeHeight;
         view.m_nUnscaledWidth = eyeWidth;
         view.m_nUnscaledHeight = eyeHeight;
-        view.m_flAspectRatio = vr->m_Aspect;
+        // Viewmodel pass uses viewport aspect, not m_flAspectRatio (L4D2VR
+        // vr_hand_math / l4d2vr-hands.md). Match both to the eye RT so the gun
+        // is not 16:9-projected into a ~1.1 HMD buffer (tall grip, short slide).
+        const float rtAspect = static_cast<float>(eyeWidth) / static_cast<float>(eyeHeight);
+        view.m_flAspectRatio = rtAspect;
         view.fov = vr->m_Fov;
         view.fovViewmodel = vr->m_Fov;
+        // L4D2VR: native Source viewmodels use a separate projection and a
+        // compressed 0..0.1 depth range so they draw over the world. In VR the
+        // gun is a world-space mesh; keep Z (and therefore size vs world
+        // geometry) on the same projection as the eye scene.
+        if (view.zNear > 0.01f)
+            view.zNearViewmodel = view.zNear;
+        if (view.zFar > view.zNear)
+            view.zFarViewmodel = view.zFar;
     }
 
     void ClampStereoViewport(int& x, int& y, int& width, int& height)
     {
         if (!Hooks::m_VR)
             return;
-        if (!g_StereoRedirect && !Hooks::m_VR->StereoEyeBlitActive())
+        if (Hooks::m_VR->HudPaintActive())
+        {
+            int hx = 0, hy = 0, hw = 0, hh = 0;
+            int fbW = static_cast<int>(Hooks::m_VR->m_RenderWidth);
+            int fbH = static_cast<int>(Hooks::m_VR->m_RenderHeight);
+            uint32_t hmdW = 0, hmdH = 0;
+            if (bmvr::HaveHmdFramebufferSize(hmdW, hmdH))
+            {
+                fbW = static_cast<int>(hmdW);
+                fbH = static_cast<int>(hmdH);
+            }
+            if (fbW < 640)
+                fbW = (width > 0) ? width : 1280;
+            if (fbH < 360)
+                fbH = (height > 0) ? height : 720;
+            if (Hooks::m_VR->ComputeHudInset(fbW, fbH, hx, hy, hw, hh))
+            {
+                x = hx;
+                y = hy;
+                width = hw;
+                height = hh;
+            }
+            return;
+        }
+        if (!g_StereoRedirect && !Hooks::m_VR->StereoEyeBlitActive()
+            && Hooks::m_VR->m_StereoEye == 0)
             return;
         const int eyeW = static_cast<int>(Hooks::m_VR->m_RenderWidth);
         const int eyeH = static_cast<int>(Hooks::m_VR->m_RenderHeight);
@@ -437,14 +1069,8 @@ namespace
             return;
         x = 0;
         y = 0;
-        if (width > eyeW)
-            width = eyeW;
-        if (height > eyeH)
-            height = eyeH;
-        if (width < 1)
-            width = eyeW;
-        if (height < 1)
-            height = eyeH;
+        width = eyeW;
+        height = eyeH;
     }
 
     void BindStereoPushToEye(ITexture*& pTexture, ITexture*& pDepthTexture, int& nViewX, int& nViewY, int& nViewW, int& nViewH, bool& redirected)
@@ -472,6 +1098,56 @@ namespace
         nViewH = eyeH;
         redirected = true;
     }
+
+    // L4D2VR PaintToHudOnce: extra VGui_Paint into vrHUD. Engine dest stays
+    // untouched so desktop VGUI survives. BM never PushRT `_rt_gui` during
+    // stereo gameplay (log: only gbuffer/null), so the PopRT blit never ran
+    // and the overlay stayed hidden — headset only saw in-eye HUD at the
+    // 16:9 edges (2026-08-18).
+    void PaintVguiToOverlay(void* vgui, int mode)
+    {
+        VR* vr = Hooks::m_VR;
+        if (!vr || !Hooks::hkVgui_Paint.fOriginal)
+            return;
+        if (!vr->HudOverlayReady() || !vr->m_HUDTexture)
+            return;
+        if (vr->HudPaintedThisFrame() && !vr->GameUiVisible())
+            return;
+
+        ITexture* hud = vr->m_HUDTexture;
+        const int tw = hud->GetActualWidth();
+        const int th = hud->GetActualHeight();
+        if (tw < 640 || th < 360)
+            return;
+
+        int x = 0, y = 0, w = tw, h = th;
+        vr->ComputeHudInset(tw, th, x, y, w, h);
+
+        MatCtxScope scope;
+        if (!scope.ctx)
+            return;
+
+        vr->ClearHudSurface(false);
+        vr->SetHudPaintActive(true);
+        {
+            EyeRtPush push(scope.ctx, hud, tw, th);
+            if (Hooks::hkViewport.fOriginal)
+                Hooks::hkViewport.fOriginal(scope.ctx, x, y, w, h);
+            const int paintMode = mode | PAINT_UIPANELS | PAINT_INGAMEPANELS | PAINT_CURSOR;
+            ++g_VguiOverlayReentry;
+            Hooks::hkVgui_Paint.fOriginal(vgui, paintMode);
+            --g_VguiOverlayReentry;
+            static int s_ov;
+            if (s_ov < 8)
+            {
+                Game::logMsg("VGui extra-paint overlay inset=%d,%d %dx%d of %dx%d mode=0x%X pause=%d",
+                    x, y, w, h, tw, th, paintMode, vr->GameUiVisible() ? 1 : 0);
+                ++s_ov;
+            }
+        }
+        vr->SetHudPaintActive(false);
+        vr->NoteHudPainted();
+    }
 }
 
 ITexture* __fastcall Hooks::dGetRenderTarget(void* ecx, void* edx)
@@ -498,6 +1174,16 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
     {
         hkRenderView.fOriginal(ecx, setup, nClearFlags, whatToDraw);
         return;
+    }
+
+    if (m_VR)
+        m_VR->FlushPendingGameUi();
+
+    EnsureServerFlashlightHook();
+    if (m_VR)
+    {
+        m_VR->ApplyRenderTargetFramebufferOverride();
+        m_VR->LogFullFrameSizeIfReady();
     }
 
     const bool queued = m_Game && m_Game->GetMatQueueMode() != 0;
@@ -578,10 +1264,10 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         static int s_setupLog;
         if (s_setupLog < 8)
         {
-            Game::logMsg("RenderView setup=%dx%d fov=%.1f aspect=%.3f origin=(%.1f,%.1f,%.1f) ang=(%.1f,%.1f) submits=%d inGame=%d pass=%u",
+            Game::logMsg("RenderView setup=%dx%d fov=%.1f aspect=%.3f origin=(%.1f,%.1f,%.1f) ang=(%.1f,%.1f) whatToDraw=0x%X submits=%d inGame=%d pass=%u",
                 setup.width, setup.height, setup.fov, setup.m_flAspectRatio,
                 setup.origin.x, setup.origin.y, setup.origin.z,
-                setup.angles.x, setup.angles.y, m_VR->m_SubmitCount, inGame ? 1 : 0,
+                setup.angles.x, setup.angles.y, whatToDraw, m_VR->m_SubmitCount, inGame ? 1 : 0,
                 m_VR->m_PassThroughMainViews);
             ++s_setupLog;
         }
@@ -714,12 +1400,20 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         m_VR->m_HasStereoBodyOrigin = true;
         m_VR->m_StereoEye = 1;
         m_VR->BeginStereoEyeBlit(m_VR->m_D9LeftEyeSurface);
-        callOriginal(leftEyeView, nClearFlags, whatToDraw);
+        {
+            // HUD in the eyes sits at 16:9 monitor edges of the HMD frustum.
+            // Gameplay HUD is restored in one window-sized DRAWHUD pass after
+            // both eyes. Extra VGui_Paint cannot fill _rt_gui.
+            const int eyeDraw = whatToDraw & ~kRenderViewDrawHud;
+            callOriginal(leftEyeView, nClearFlags, eyeDraw);
+        }
         m_VR->EndStereoEyeBlit();
         {
             const bool leftBb = m_VR->BlitHmdViewFromBackbuffer(m_VR->m_D9LeftEyeSurface);
             if (!leftBb)
                 m_VR->BlitCurrentGameColorTo(m_VR->m_D9LeftEyeSurface);
+            if (bmvr::g_VrHandsDebugBoxes)
+                m_VR->DrawIndependentHandMarkers(m_VR->m_D9LeftEyeSurface, 1);
         }
         if (s_eyeRvLog < 8)
         {
@@ -728,17 +1422,37 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         }
         m_VR->m_StereoEye = 2;
         m_VR->BeginStereoEyeBlit(m_VR->m_D9RightEyeSurface);
-        callOriginal(rightEyeView, nClearFlags, whatToDraw);
+        {
+            const int eyeDraw = whatToDraw & ~kRenderViewDrawHud;
+            callOriginal(rightEyeView, nClearFlags, eyeDraw);
+        }
         m_VR->EndStereoEyeBlit();
         {
             const bool rightBb = m_VR->BlitHmdViewFromBackbuffer(m_VR->m_D9RightEyeSurface);
             if (!rightBb)
                 m_VR->BlitCurrentGameColorTo(m_VR->m_D9RightEyeSurface);
+            if (bmvr::g_VrHandsDebugBoxes)
+                m_VR->DrawIndependentHandMarkers(m_VR->m_D9RightEyeSurface, 2);
         }
         m_VR->m_StereoEye = 0;
         m_VR->m_HasStereoBodyOrigin = false;
         if (m_VR->m_IsVREnabled)
             m_VR->ClearUnusedDesktopBackbuffer();
+        if (bmvr::TryDrawHud())
+        {
+            static int s_drawHudFrames;
+            if (s_drawHudFrames == 0)
+                bmvr::BeginRisky(L"drawhud");
+            // Eyes stripped DRAWHUD. One window-sized pass fills _rt_gui /
+            // _rt_Hud (client RenderView only — engine VGui_Paint cannot).
+            // Keep engine width/height; do not NormalizeViewSetupForVREye.
+            CViewSetup hudView = setup;
+            applyL4d2VrHead(hudView, false, true);
+            callOriginal(hudView, nClearFlags, whatToDraw | kRenderViewDrawHud);
+            ++s_drawHudFrames;
+            if (s_drawHudFrames == 120)
+                bmvr::EndRisky(L"drawhud");
+        }
         // Do not stretch eyes onto the backbuffer. That overwrote the
         // engine's 1584 tram strip with a black A2R10 copy (2026-08-18).
 
@@ -803,6 +1517,23 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
             cmd->viewangles.Init(hmdVa.x, hmdVa.y, 0.f);
     }
 
+    if (m_VR)
+        m_VR->FlushPendingGameUi();
+
+    EnsureServerFlashlightHook();
+
+    if (m_VR)
+    {
+        const uint32_t impulse = m_VR->m_PendingImpulse.load(std::memory_order_acquire);
+        if (impulse)
+        {
+            cmd->impulse = static_cast<byte>(impulse);
+            m_VR->m_PendingImpulse.store(0, std::memory_order_release);
+            Game::logMsg("CreateMove applied impulse %u cmd=%d buttons=0x%x",
+                impulse, cmd->command_number, cmd->buttons);
+        }
+    }
+
     if (!m_VR->m_ProcessInputEnabled)
         return result;
 
@@ -826,9 +1557,6 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
         cmd->sidemove += analogS;
     }
     cmd->buttons |= static_cast<int>(m_VR->HeldButtons());
-    const uint32_t impulse = m_VR->m_PendingImpulse.exchange(0, std::memory_order_acq_rel);
-    if (impulse)
-        cmd->impulse = static_cast<byte>(impulse);
     const int inv = m_VR->m_PendingInvDelta.exchange(0, std::memory_order_acq_rel);
     if (inv != 0 && m_Game)
     {
@@ -847,8 +1575,12 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
 void __fastcall Hooks::dLevelInit(void* ecx, void* edx, const char* newmap)
 {
     (void)edx;
+    EnsureServerFlashlightHook();
     if (m_VR)
+    {
         m_VR->OnLevelInit(newmap);
+        m_VR->ApplyRenderTargetFramebufferOverride();
+    }
     if (hkLevelInit.fOriginal)
         hkLevelInit.fOriginal(ecx, newmap);
 }
@@ -873,18 +1605,20 @@ void __fastcall Hooks::dCalcViewModelView(void* ecx, void* edx, void* owner, con
         // Do not IPD the gun — that drew two weapons (2026-08-17).
         if (m_VR->m_ControllerPoseValid)
         {
-            Vector origin = m_VR->GetRecommendedViewmodelAbsPos(eyePosition);
-            QAngle ang = m_VR->GetRecommendedViewmodelAbsAngle();
-            static int s_vmLog;
-            if (s_vmLog < 8)
+            if (m_Game)
             {
-                Game::logMsg("CalcViewModelView controller origin=(%.1f,%.1f,%.1f) ang=(%.1f,%.1f,%.1f) eye=(%.1f,%.1f,%.1f) setup=(%.1f,%.1f,%.1f)",
-                    origin.x, origin.y, origin.z, ang.x, ang.y, ang.z,
-                    eyePosition.x, eyePosition.y, eyePosition.z,
-                    m_VR->m_SetupOrigin.x, m_VR->m_SetupOrigin.y, m_VR->m_SetupOrigin.z);
-                ++s_vmLog;
+                const char* weaponModel = m_Game->GetActiveWeaponModelName();
+                if (weaponModel)
+                    m_VR->NoteViewmodelModel(weaponModel);
             }
-            hkCalcViewModelView.fOriginal(ecx, owner, origin, ang);
+            // L4D2VR: feed the aim-controller pose as CalcViewModelView eye so
+            // lag/bob and $origin are in the same frame as the hard-lock.
+            const Vector targetOrigin = m_VR->GetRecommendedViewmodelAbsPos(eyePosition);
+            const QAngle targetAng = m_VR->GetRecommendedViewmodelAbsAngle();
+            CallCalcViewModelViewOriginal(ecx, owner, targetOrigin, targetAng);
+            const float origin3[3] = { targetOrigin.x, targetOrigin.y, targetOrigin.z };
+            const float angles3[3] = { targetAng.x, targetAng.y, targetAng.z };
+            CallSetAbsOriginAngles(ecx, origin3, angles3);
             return;
         }
         Vector origin = m_VR->GetViewOrigin(
@@ -933,34 +1667,212 @@ void __fastcall Hooks::dGetViewport(void* ecx, void* edx, int& x, int& y, int& w
 void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, const ModelRenderInfo_t& info, void* pCustomBoneToWorld)
 {
     (void)edx;
+    char modelNameBuf[260]{};
+    bool hideArms = false;
+    bool skipLocal = false;
+    bool isViewmodel = false;
     const char* modelName = nullptr;
-    if (m_Game && m_Game->m_ModelInfo)
-        modelName = SafeModelName(m_Game->m_ModelInfo, info.pModel);
-    const bool isViewmodel = ModelNameIsViewmodel(modelName);
-    if (isViewmodel && m_VR)
-        m_VR->NoteViewmodelModel(modelName);
-
-    if (bmvr::g_HideLocalPlayerModel
-        && m_VR
-        && m_VR->IsGameplayEligible()
-        && !isViewmodel)
+    int body = 0;
+    int skin = 0;
+    int entityIndex = 0;
+    __try
     {
-        const int local = SafeLocalPlayerIndex();
-        if (local > 0 && info.entity_index == local)
+        void* pModel = info.pModel;
+        entityIndex = info.entity_index;
+        body = info.body;
+        skin = info.skin;
+        if (m_Game && m_Game->m_ModelInfo)
+            modelName = SafeModelName(m_Game->m_ModelInfo, pModel);
+        if (modelName && modelName[0])
         {
-            static int s_hideLog;
-            if (s_hideLog < 4)
+            strncpy_s(modelNameBuf, modelName, _TRUNCATE);
+            modelName = modelNameBuf;
+        }
+        isViewmodel = ModelNameIsViewmodel(modelName);
+        static int s_dmeEnter;
+        if (s_dmeEnter < 6)
+        {
+            Game::logMsg("DME %s viewmodel=%d eligible=%d body=%d skin=%d ent=%d bones=%d",
+                modelName ? modelName : "?", isViewmodel ? 1 : 0,
+                (m_VR && m_VR->IsGameplayEligible()) ? 1 : 0,
+                body, skin, entityIndex, pCustomBoneToWorld ? 1 : 0);
+            ++s_dmeEnter;
+        }
+        if (bmvr::g_HideLocalPlayerModel
+            && m_VR
+            && m_VR->IsGameplayEligible()
+            && !isViewmodel)
+        {
+            const int local = SafeLocalPlayerIndex();
+            if (local > 0 && entityIndex == local)
+                skipLocal = true;
+        }
+        hideArms = bmvr::g_HideViewmodelArms
+            && isViewmodel
+            && m_VR
+            && m_VR->m_IsVREnabled
+            && m_VR->IsGameplayEligible()
+            && EngineInGame();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        hideArms = false;
+        skipLocal = false;
+        isViewmodel = false;
+        Game::logMsg("DME info SEH - passthrough original");
+    }
+
+    if (skipLocal)
+    {
+        static int s_hideLog;
+        if (s_hideLog < 4)
+        {
+            Game::logMsg("HideLocalPlayerModel skip %s", modelName ? modelName : "?");
+            ++s_hideLog;
+        }
+        return;
+    }
+
+    if (isViewmodel && m_VR && m_VR->IsGameplayEligible() && EngineInGame())
+        ApplyViewmodelStudioWork(state, modelName, body, skin, hideArms, pCustomBoneToWorld);
+
+    void* bonesToDraw = pCustomBoneToWorld;
+    const ModelRenderInfo_t* infoToDraw = &info;
+    if (isViewmodel && m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible()
+        && EngineInGame() && m_VR->m_ControllerPoseValid)
+    {
+        const float scale = bmvr::g_ViewmodelScale;
+        float yFix = 1.f;
+        bool eyePass = m_VR->m_StereoEye != 0 || m_VR->StereoEyeBlitActive();
+        if (!eyePass && g_MatCtx && hkGetViewport.fOriginal)
+        {
+            int vx = 0, vy = 0, vw = 0, vh = 0;
+            hkGetViewport.fOriginal(g_MatCtx, vx, vy, vw, vh);
+            if (vw >= 640 && vh >= 360 && m_VR->m_RenderWidth >= 640 && m_VR->m_RenderHeight >= 360)
             {
-                Game::logMsg("HideLocalPlayerModel skip entity=%d %s",
-                    info.entity_index, modelName ? modelName : "?");
-                ++s_hideLog;
+                const float vpAspect = static_cast<float>(vw) / static_cast<float>(vh);
+                const float eyeAspect = static_cast<float>(m_VR->m_RenderWidth)
+                    / static_cast<float>(m_VR->m_RenderHeight);
+                if (fabsf(vpAspect - eyeAspect) < 0.12f)
+                    eyePass = true;
             }
-            return;
+        }
+        if (eyePass && m_VR->m_RenderWidth >= 640 && m_VR->m_RenderHeight >= 360)
+        {
+            uint32_t winW = 0, winH = 0;
+            bmvr::QueryWindowClientSize(winW, winH);
+            if (winW < 640 || winH < 360)
+            {
+                winW = 16;
+                winH = 9;
+            }
+            const float winAspect = static_cast<float>(winW) / static_cast<float>(winH);
+            const float eyeAspect = static_cast<float>(m_VR->m_RenderWidth)
+                / static_cast<float>(m_VR->m_RenderHeight);
+            if (winAspect > 0.5f && eyeAspect > 0.5f)
+                yFix = eyeAspect / winAspect;
+        }
+        const bool needScale = scale > 0.2f && scale < 1.5f && fabsf(scale - 1.f) > 0.001f;
+        const bool needYFix = yFix > 0.2f && yFix < 2.f && fabsf(yFix - 1.f) > 0.03f;
+        if (needScale || needYFix)
+        {
+            Vector pivot = info.origin;
+            const Vector body = m_VR->m_HasStereoBodyOrigin ? m_VR->m_StereoBodyOrigin : m_VR->m_SetupOrigin;
+            if (body.LengthSqr() > 1.f)
+                pivot = m_VR->GetRightControllerAbsPos(body);
+            const float pivot3[3] = { pivot.x, pivot.y, pivot.z };
+
+            Vector cam = m_VR->GetViewOrigin(body.LengthSqr() > 1.f ? body : info.origin);
+            if (m_VR->m_StereoEye == 2)
+                cam = m_VR->GetViewOriginRight(body.LengthSqr() > 1.f ? body : info.origin);
+            else if (m_VR->m_StereoEye == 1)
+                cam = m_VR->GetViewOriginLeft(body.LengthSqr() > 1.f ? body : info.origin);
+            Vector fwd, right, up;
+            m_VR->GetViewBasis(&fwd, &right, &up);
+            const float cam3[3] = { cam.x, cam.y, cam.z };
+            const float right3[3] = { right.x, right.y, right.z };
+            const float up3[3] = { up.x, up.y, up.z };
+            const float fwd3[3] = { fwd.x, fwd.y, fwd.z };
+
+            unsigned char* hdr = ResolveStudioHdr(state);
+            const int nBones = StudioHdrNumBones(hdr);
+            bool usedBones = false;
+            if (pCustomBoneToWorld && nBones > 0
+                && SehCopyAndFixViewmodelMatrices(&g_ScaledViewmodelBones[0][0][0], pCustomBoneToWorld,
+                    nBones, pivot3, needScale ? scale : 1.f, cam3, right3, up3, fwd3, needYFix ? yFix : 1.f))
+            {
+                bonesToDraw = g_ScaledViewmodelBones;
+                usedBones = true;
+            }
+            else if (needScale)
+                SehWriteModelScale(info.pRenderable, scale);
+
+            std::memcpy(g_ScaledViewmodelInfo, &info, sizeof(ModelRenderInfo_t));
+            auto* scaledInfo = reinterpret_cast<ModelRenderInfo_t*>(g_ScaledViewmodelInfo);
+            float origin3[3] = { info.origin.x, info.origin.y, info.origin.z };
+            if (needYFix)
+                UnstretchPointViewY(origin3, cam3, right3, up3, fwd3, yFix);
+            if (needScale)
+            {
+                origin3[0] = pivot.x + (origin3[0] - pivot.x) * scale;
+                origin3[1] = pivot.y + (origin3[1] - pivot.y) * scale;
+                origin3[2] = pivot.z + (origin3[2] - pivot.z) * scale;
+            }
+            scaledInfo->origin.x = origin3[0];
+            scaledInfo->origin.y = origin3[1];
+            scaledInfo->origin.z = origin3[2];
+            if (info.pModelToWorld
+                && SehCopyAndFixViewmodelMatrices(&g_ScaledViewmodelModelToWorld[0][0], info.pModelToWorld,
+                    1, pivot3, needScale ? scale : 1.f, cam3, right3, up3, fwd3, needYFix ? yFix : 1.f))
+            {
+                scaledInfo->pModelToWorld = reinterpret_cast<const matrix3x4_t*>(g_ScaledViewmodelModelToWorld);
+            }
+            infoToDraw = scaledInfo;
+            static int s_scaleLog;
+            if (s_scaleLog < 8)
+            {
+                Game::logMsg("Viewmodel DME scale=%.2f yFix=%.3f eyePass=%d bones=%d usedBones=%d pivot=(%.1f,%.1f,%.1f) origin=(%.1f,%.1f,%.1f)->(%.1f,%.1f,%.1f)",
+                    scale, yFix, eyePass ? 1 : 0, nBones, usedBones ? 1 : 0,
+                    pivot.x, pivot.y, pivot.z,
+                    info.origin.x, info.origin.y, info.origin.z,
+                    scaledInfo->origin.x, scaledInfo->origin.y, scaledInfo->origin.z);
+                ++s_scaleLog;
+            }
         }
     }
 
     if (hkDrawModelExecute.fOriginal)
-        hkDrawModelExecute.fOriginal(ecx, state, info, pCustomBoneToWorld);
+    {
+        __try
+        {
+            hkDrawModelExecute.fOriginal(ecx, state, *infoToDraw, bonesToDraw);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            Game::logMsg("DME original SEH %s", modelName ? modelName : "?");
+        }
+    }
+
+    // Studio draw is queued after this returns (NO_DRAW restore-after-original
+    // left HEV arms visible 2026-08-19). Keep arms nummeshes=0 until map end.
+
+    // Menu DME is not the crash (background04 ran thousands of presents).
+    // End sticky only after a gameplay original returns.
+    if (m_VR && m_VR->IsGameplayEligible() && EngineInGame() && hkDrawModelExecute.fOriginal)
+    {
+        static int s_gameplayDme;
+        if (s_gameplayDme < 2)
+        {
+            ++s_gameplayDme;
+            if (s_gameplayDme == 1)
+                bmvr::EndRisky(L"dme");
+        }
+    }
+}
+
+void Hooks::RestoreViewmodelArmHides()
+{
+    RestoreArmBodypartMeshes();
 }
 
 void __fastcall Hooks::dEndFrame(void* ecx, void* edx)
@@ -981,6 +1893,18 @@ void __fastcall Hooks::dEndFrame(void* ecx, void* edx)
 void __fastcall Hooks::dPushRenderTargetAndViewport(void* ecx, void* edx, ITexture* pTexture, ITexture* pDepthTexture, int nViewX, int nViewY, int nViewW, int nViewH)
 {
     NoteMatContext(ecx);
+    const char* pushName = SafeTextureName(pTexture);
+    if (m_VR && m_VR->IsGameplayEligible())
+    {
+        static int s_pushNames;
+        if (s_pushNames < 16)
+        {
+            Game::logMsg("PushRT name=%s %dx%d", pushName, nViewW, nViewH);
+            ++s_pushNames;
+        }
+    }
+    if (m_VR && TextureNameIsHudRt(pushName))
+        m_VR->NoteEngineHudRtPush(pushName, nViewW, nViewH);
     if (g_StereoRedirect)
     {
         bool redir = false;
@@ -1003,14 +1927,162 @@ void __fastcall Hooks::dPushRenderTargetAndViewport(void* ecx, void* edx, ITextu
 
 void __fastcall Hooks::dPopRenderTargetAndViewport(void* ecx, void* edx)
 {
+    if (m_VR && m_VR->EngineHudRtPushed())
+        m_VR->BlitEngineHudRtToOverlay();
     if (hkPopRenderTargetAndViewport.fOriginal)
         hkPopRenderTargetAndViewport.fOriginal(ecx);
 }
 
 void __fastcall Hooks::dVGui_Paint(void* ecx, void* edx, int mode)
 {
+    (void)edx;
+    if (g_VguiOverlayReentry)
+    {
+        if (hkVgui_Paint.fOriginal)
+            hkVgui_Paint.fOriginal(ecx, mode);
+        return;
+    }
+
+    const bool inGame = EngineInGame();
+    const bool eligible = m_VR && m_VR->IsGameplayEligible();
+
+    // Never steal the engine destination. Last steal emptied _rt_gui.
+    // Menu/background stay original only. In-game: original (desktop) plus
+    // one extra paint into bmvrHUD (headset overlay).
+    static int s_paintLog;
+    static int s_ingamePaintLog;
+    if (s_paintLog < 8)
+    {
+        Game::logMsg("VGui_Paint original dest inGame=%d eligible=%d mode=0x%X overlay=%d",
+            inGame ? 1 : 0, eligible ? 1 : 0, mode,
+            (m_VR && m_VR->HudOverlayReady()) ? 1 : 0);
+        ++s_paintLog;
+    }
+    else if (eligible && s_ingamePaintLog < 4)
+    {
+        Game::logMsg("VGui_Paint in-game original mode=0x%X overlay=%d",
+            mode, (m_VR && m_VR->HudOverlayReady()) ? 1 : 0);
+        ++s_ingamePaintLog;
+    }
     if (hkVgui_Paint.fOriginal)
+    {
+        if (m_VR)
+            m_VR->SetVguiPaintActive(true);
         hkVgui_Paint.fOriginal(ecx, mode);
+        if (m_VR)
+            m_VR->SetVguiPaintActive(false);
+    }
+    if (inGame && eligible && m_VR && m_VR->HudOverlayReady())
+        PaintVguiToOverlay(ecx, mode);
+}
+
+void __fastcall Hooks::dTraceRay(void* ecx, void* edx, const Ray_t& ray, unsigned int fMask, CTraceFilter* filter, CGameTrace* pTrace)
+{
+    (void)edx;
+    // Do not rewrite every engine TraceRay while melee is latched. That
+    // redirected NPC/move probes to the controller and pulled enemies
+    // toward the player (2026-08-18). Swing only pulses IN_ATTACK so the
+    // crowbar uses the same Weapon_ShootPosition path as the trigger.
+    if (hkTraceRay.fOriginal)
+        hkTraceRay.fOriginal(ecx, ray, fMask, filter, pTrace);
+}
+
+void Hooks::EnsureServerFlashlightHook()
+{
+    if (hkImpulseCommands.pTarget)
+        return;
+    HMODULE server = GetModuleHandleA("server.dll");
+    if (!server)
+        return;
+    auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kCBasePlayer_ImpulseCommands;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(p, &mbi, sizeof(mbi)) || !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+    {
+        static int s_nq;
+        if (s_nq < 2)
+        {
+            Game::logMsg("ImpulseCommands RVA 0x%X not executable", Offsets::kCBasePlayer_ImpulseCommands);
+            ++s_nq;
+        }
+        return;
+    }
+    bool hasImpulseField = false;
+    __try
+    {
+        for (int i = 0; i < 120; ++i)
+        {
+            if (p[i] == 0x44 && p[i + 1] == 0x0E && p[i + 2] == 0x00 && p[i + 3] == 0x00)
+            {
+                hasImpulseField = true;
+                break;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        hasImpulseField = false;
+    }
+    if (!hasImpulseField)
+    {
+        Game::logMsg("ImpulseCommands skipped (no m_nImpulse +0xE44 near 0x%X)",
+            Offsets::kCBasePlayer_ImpulseCommands);
+        hkImpulseCommands.pTarget = p;
+        return;
+    }
+    if (hkImpulseCommands.createHook(p, &dImpulseCommands) != 0
+        || hkImpulseCommands.enableHook() != 0)
+    {
+        Game::logMsg("ImpulseCommands hook failed rva=0x%X", Offsets::kCBasePlayer_ImpulseCommands);
+        return;
+    }
+    Game::logMsg("Hook enabled: ImpulseCommands rva=0x%X (impulse 100 -> EF_DIMLIGHT)",
+        Offsets::kCBasePlayer_ImpulseCommands);
+}
+
+void __fastcall Hooks::dImpulseCommands(void* ecx, void* edx)
+{
+    (void)edx;
+    int impulse = 0;
+    __try
+    {
+        impulse = *reinterpret_cast<int*>(reinterpret_cast<char*>(ecx) + Offsets::kCBasePlayer_m_nImpulse);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        impulse = 0;
+    }
+    if (impulse == 100)
+    {
+        bool wasOn = false;
+        __try
+        {
+            void** vt = *reinterpret_cast<void***>(ecx);
+            using IsOnFn = bool(__thiscall*)(void*);
+            using ToggleFn = void(__thiscall*)(void*);
+            if (vt && vt[Offsets::kCBasePlayer_FlashlightIsOnVt])
+                wasOn = reinterpret_cast<IsOnFn>(vt[Offsets::kCBasePlayer_FlashlightIsOnVt])(ecx);
+            if (vt)
+            {
+                if (wasOn && vt[Offsets::kCBasePlayer_FlashlightTurnOffVt])
+                    reinterpret_cast<ToggleFn>(vt[Offsets::kCBasePlayer_FlashlightTurnOffVt])(ecx);
+                else if (!wasOn && vt[Offsets::kCBasePlayer_FlashlightTurnOnVt])
+                    reinterpret_cast<ToggleFn>(vt[Offsets::kCBasePlayer_FlashlightTurnOnVt])(ecx);
+            }
+            *reinterpret_cast<int*>(reinterpret_cast<char*>(ecx) + Offsets::kCBasePlayer_m_nImpulse) = 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        static int s_flashLog;
+        if (s_flashLog < 8)
+        {
+            Game::logMsg("Impulse 100 flashlight wasOn=%d (EF_DIMLIGHT virtuals; suit/gamerules may no-op TurnOn)",
+                wasOn ? 1 : 0);
+            ++s_flashLog;
+        }
+    }
+    if (hkImpulseCommands.fOriginal)
+        hkImpulseCommands.fOriginal(ecx);
 }
 
 void __fastcall Hooks::dGetBackBufferDimensions(void* ecx, void* edx, int& width, int& height)
@@ -1018,12 +2090,33 @@ void __fastcall Hooks::dGetBackBufferDimensions(void* ecx, void* edx, int& width
     (void)edx;
     if (hkGetBackBufferDimensions.fOriginal)
         hkGetBackBufferDimensions.fOriginal(ecx, width, height);
+    if (m_VR && m_VR->HudPaintActive())
+    {
+        int x = 0, y = 0, w = 0, h = 0;
+        int fbW = 0;
+        int fbH = 0;
+        if (m_VR->m_HUDTexture)
+        {
+            fbW = m_VR->m_HUDTexture->GetActualWidth();
+            fbH = m_VR->m_HUDTexture->GetActualHeight();
+        }
+        if (fbW < 640)
+            fbW = (width > 0) ? width : 1280;
+        if (fbH < 360)
+            fbH = (height > 0) ? height : 720;
+        if (m_VR->ComputeHudInset(fbW, fbH, x, y, w, h))
+        {
+            width = w;
+            height = h;
+            return;
+        }
+    }
     // Menu / G-buffer creation keep the 16:9 window. During an eye RenderView,
     // L4D2VR reports HMD size so projection/HUD in that pass match the eye RT.
-    if (m_VR && m_VR->StereoEyeBlitActive()
-        && m_VR->m_RenderWidth >= 640 && m_VR->m_RenderHeight >= 360
-        && m_VR->m_RenderWidth <= static_cast<UINT>(width)
-        && m_VR->m_RenderHeight <= static_cast<UINT>(height))
+    // Viewmodel FOV uses viewport/GetScreenSize aspect, not m_flAspectRatio —
+    // always return the eye RT (do not require eye <= window).
+    if (m_VR && (m_VR->StereoEyeBlitActive() || m_VR->m_StereoEye != 0)
+        && m_VR->m_RenderWidth >= 640 && m_VR->m_RenderHeight >= 360)
     {
         width = static_cast<int>(m_VR->m_RenderWidth);
         height = static_cast<int>(m_VR->m_RenderHeight);
@@ -1046,10 +2139,29 @@ void __fastcall Hooks::dGetScreenSize(void* ecx, void* edx, int& width, int& hei
     (void)edx;
     if (hkGetScreenSize.fOriginal)
         hkGetScreenSize.fOriginal(ecx, width, height);
-    if (m_VR && m_VR->StereoEyeBlitActive()
-        && m_VR->m_RenderWidth >= 640 && m_VR->m_RenderHeight >= 360
-        && m_VR->m_RenderWidth <= static_cast<UINT>(width)
-        && m_VR->m_RenderHeight <= static_cast<UINT>(height))
+    if (m_VR && m_VR->HudPaintActive())
+    {
+        int x = 0, y = 0, w = 0, h = 0;
+        int fbW = 0;
+        int fbH = 0;
+        if (m_VR->m_HUDTexture)
+        {
+            fbW = m_VR->m_HUDTexture->GetActualWidth();
+            fbH = m_VR->m_HUDTexture->GetActualHeight();
+        }
+        if (fbW < 640)
+            fbW = (width > 0) ? width : 1280;
+        if (fbH < 360)
+            fbH = (height > 0) ? height : 720;
+        if (m_VR->ComputeHudInset(fbW, fbH, x, y, w, h))
+        {
+            width = w;
+            height = h;
+            return;
+        }
+    }
+    if (m_VR && (m_VR->StereoEyeBlitActive() || m_VR->m_StereoEye != 0)
+        && m_VR->m_RenderWidth >= 640 && m_VR->m_RenderHeight >= 360)
     {
         width = static_cast<int>(m_VR->m_RenderWidth);
         height = static_cast<int>(m_VR->m_RenderHeight);
@@ -1094,7 +2206,29 @@ ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* n
     }
     if (!hkCreateNamedRTEx.fOriginal)
         return nullptr;
-    return hkCreateNamedRTEx.fOriginal(ecx, name, w, h, sizeMode, format, depth, textureFlags, renderTargetFlags);
+    ITexture* tex = hkCreateNamedRTEx.fOriginal(ecx, name, w, h, sizeMode, format, depth, textureFlags, renderTargetFlags);
+    if (tex && name && (fullMode || namedFb))
+    {
+        int aw = 0, ah = 0;
+        __try
+        {
+            aw = tex->GetActualWidth();
+            ah = tex->GetActualHeight();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            aw = 0;
+            ah = 0;
+        }
+        static int s_actualLog;
+        if (s_actualLog < 12)
+        {
+            Game::logMsg("CreateNamedRT %s requested %dx%d mode=%d actual %dx%d",
+                name, w, h, sizeMode, aw, ah);
+            ++s_actualLog;
+        }
+    }
+    return tex;
 }
 
 void bmvr::InstallEarlyFramebufferHook()

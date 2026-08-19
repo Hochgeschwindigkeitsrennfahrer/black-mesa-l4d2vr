@@ -392,6 +392,3 @@ public:
 	virtual void	fn4() = 0;
 	virtual void	TraceRay(const Ray_t& ray, unsigned int fMask, CTraceFilter* pTraceFilter, trace_t* pTrace) = 0;
 };
-
-
-typedef void(__fastcall* tTraceRay)(void* thisptr, void* not_edx, Ray_t& ray, unsigned int fMask, CTraceFilter* pTraceFilter, CGameTrace* pTrace);

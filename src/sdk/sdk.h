@@ -80,9 +80,9 @@ public:
 	virtual bool IsThirdPersonCamera() = 0;
 };
 
-// VEngineClient015 on Black Mesa (prototype sdk.h, same early slots as L4D2
-// VEngineClient013). Extra 015 methods are appended; IsInGame / GetLocalPlayer /
-// ClientCmd / IsPaused / ClientCmd_Unrestricted occupy the same early indices.
+// VEngineClient015 on Black Mesa. Early slots match L4D2 VEngineClient013
+// (ClientCmd 7, IsInGame, GetLevelName, IsPaused). ClientCmd_Unrestricted is
+// slot 108 (vtable +0x1B0), not 107 — confirmed by client.dll FUN_101f0550.
 class IEngineClient
 {
 public:
@@ -196,6 +196,10 @@ public:
 	virtual void* sub_1005D000() = 0;
 	virtual void* sub_1005DED0() = 0;
 	virtual void* sub_1005CBB0() = 0;
+	// VEngineClient015: client.dll calls the command runner at vtable +0x1B0
+	// (slot 108) with "gameui_activate" (Ghidra FUN_101f0550). Slot 107 (0x1AC)
+	// SEH'd every pause press from ProcessInput (bmvr_log 2026-08-18).
+	virtual void* ClientCmd_Unrestricted_V014() = 0;
 	virtual void* ClientCmd_Unrestricted(const char* szCmdString) = 0;
 };
 

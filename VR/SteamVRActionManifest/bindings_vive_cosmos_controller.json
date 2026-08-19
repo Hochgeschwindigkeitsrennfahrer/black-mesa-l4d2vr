@@ -1,5 +1,5 @@
 {
-   "action_manifest_version": 0,
+   "action_manifest_version": 1,
    "alias_info": {},
    "bindings": {
       "/actions/base": {
@@ -41,7 +41,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/ResetPosition"
+                     "output": "/actions/main/in/Sprint"
                   },
                   "position": {
                      "output": "/actions/main/in/Walk"
@@ -56,7 +56,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/Flashlight"
+                     "output": "/actions/main/in/ResetPosition"
                   },
                   "position": {
                      "output": "/actions/main/in/Turn"
@@ -80,6 +80,19 @@
             {
                "inputs": {
                   "click": {
+                     "output": "/actions/main/in/Flashlight"
+                  }
+               },
+               "mode": "button",
+               "parameters": {
+                  "click_activate_threshold": "0.55",
+                  "click_deactivate_threshold": "0.45"
+               },
+               "path": "/user/hand/right/input/grip"
+            },
+            {
+               "inputs": {
+                  "click": {
                      "output": "/actions/main/in/PrimaryAttack"
                   }
                },
@@ -92,10 +105,10 @@
                      "output": "/actions/main/in/boolean_turnright"
                   },
                   "north": {
-                     "output": "/actions/main/in/PrevItem"
+                     "output": "/actions/main/in/Jump"
                   },
                   "south": {
-                     "output": "/actions/main/in/NextItem"
+                     "output": "/actions/main/in/CrouchToggle"
                   },
                   "west": {
                      "output": "/actions/main/in/boolean_turnleft"
@@ -122,15 +135,6 @@
                "inputs": {
                   "click": {
                      "output": "/actions/main/in/ActivateVR"
-                  }
-               },
-               "mode": "button",
-               "path": "/user/hand/right/input/a"
-            },
-            {
-               "inputs": {
-                  "click": {
-                     "output": "/actions/main/in/Jump"
                   }
                },
                "mode": "button",
@@ -180,15 +184,6 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/Crouch"
-                  }
-               },
-               "mode": "button",
-               "path": "/user/hand/right/input/grip"
-            },
-            {
-               "inputs": {
-                  "click": {
                      "output": "/actions/main/in/NextItem"
                   }
                },
@@ -212,6 +207,33 @@
                },
                "mode": "button",
                "path": "/user/hand/left/input/trigger"
+            },
+            {
+               "inputs": {
+                  "click": {
+                     "output": "/actions/main/in/Pause"
+                  }
+               },
+               "mode": "button",
+               "path": "/user/hand/left/input/application_menu"
+            },
+            {
+               "inputs": {
+                  "click": {
+                     "output": "/actions/main/in/Pause"
+                  }
+               },
+               "mode": "button",
+               "path": "/user/hand/left/input/system"
+            },
+            {
+               "inputs": {
+                  "click": {
+                     "output": "/actions/main/in/Pause"
+                  }
+               },
+               "mode": "button",
+               "path": "/user/hand/left/input/menu"
             }
          ]
       }
@@ -219,7 +241,7 @@
    "category": "steamvr_input",
    "controller_type": "vive_cosmos_controller",
    "description": "",
-   "name": "Default Left 4 Dead 2 VR bindings for Vive Cosmos Controllers",
+   "name": "Black Mesa VR Cosmos v3 Y-next X-prev",
    "options": {},
    "simulated_actions": []
 }

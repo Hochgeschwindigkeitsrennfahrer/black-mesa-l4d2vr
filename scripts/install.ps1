@@ -77,8 +77,38 @@ if (-not (Test-Path $CfgDst)) {
   Write-Host "Installed $CfgDst (edit RenderScale here; restart to apply)"
 } else {
   Write-Host "Kept existing $CfgDst"
+  $cfgText = Get-Content -LiteralPath $CfgDst -Raw
+  $cfgText = [regex]::Replace($cfgText, '(?m)^HudDistance=.*$', 'HudDistance=1.05')
+  $cfgText = [regex]::Replace($cfgText, '(?m)^HudSize=.*$', 'HudSize=0.70')
+  $cfgText = [regex]::Replace($cfgText, '(?m)^ViewmodelScale=.*$', 'ViewmodelScale=1.0')
+  $cfgText = [regex]::Replace($cfgText, '(?m)^CompositorPostPresentHandoff=.*$', 'CompositorPostPresentHandoff=true')
+  if ($cfgText -notmatch '(?m)^HudDistance=') { $cfgText += "`r`nHudDistance=1.05`r`n" }
+  if ($cfgText -notmatch '(?m)^HudSize=') { $cfgText += "`r`nHudSize=0.70`r`n" }
+  if ($cfgText -notmatch '(?m)^ViewmodelScale=') { $cfgText += "`r`nViewmodelScale=1.0`r`n" }
+  if ($cfgText -notmatch '(?m)^CompositorPostPresentHandoff=') { $cfgText += "`r`nCompositorPostPresentHandoff=true`r`n" }
+  Set-Content -LiteralPath $CfgDst -Value $cfgText -Encoding ASCII -NoNewline
+  Write-Host "Updated HudDistance/HudSize/ViewmodelScale/CompositorPostPresentHandoff in $CfgDst"
 }
 Write-Host "Installed SteamVR bindings to $ManifestDst"
+Write-Host "If SteamVR still has X=Flashlight or old jump/crouch, restore BMVR defaults (v3: Y=next, X=prev, right grip=flashlight)."
+
+$CfgGame = Join-Path $GameRoot "bms\cfg"
+if (-not (Test-Path $CfgGame)) { throw "Missing $CfgGame" }
+$BmvrCfgSrc = Join-Path $VrSrc "bmvr.cfg"
+$BmvrCfgDst = Join-Path $CfgGame "bmvr.cfg"
+Copy-Item -Force $BmvrCfgSrc $BmvrCfgDst
+Write-Host "Installed $BmvrCfgDst (crosshair off only; no flashlight cvars)"
+$Autoexec = Join-Path $CfgGame "autoexec.cfg"
+if (Test-Path $Autoexec) {
+  $autoText = Get-Content -LiteralPath $Autoexec -Raw
+  if ($autoText -notmatch '(?m)^\s*exec\s+bmvr') {
+    Add-Content -LiteralPath $Autoexec -Value "`r`nexec bmvr`r`n"
+    Write-Host "Appended 'exec bmvr' to $Autoexec"
+  }
+} else {
+  Set-Content -LiteralPath $Autoexec -Value "exec bmvr`r`n" -Encoding ASCII
+  Write-Host "Created $Autoexec"
+}
 
 # Stock dxvk.conf sets deviceLossOnFocusLoss=True and overrides our built-in
 # bms.exe profile (False). Steam verify restores the stock file.

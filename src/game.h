@@ -61,9 +61,11 @@ public:
 
     void* GetInterface(const char* dllname, const char* interfacename);
     C_BaseEntity* GetClientEntity(int entityIndex);
+    C_BaseEntity* GetActiveWeaponEntity();
+    const char* GetActiveWeaponModelName();
     int CycleWeaponSelect(int direction);
-    void ClientCmd(const char* szCmdString);
-    void ClientCmd_Unrestricted(const char* szCmdString);
+    bool ClientCmd(const char* szCmdString);
+    bool ClientCmd_Unrestricted(const char* szCmdString);
     int GetMatQueueMode() const;
     void ProbeMatQueueModeFromRenderView();
     bool SetMatQueueMode(int mode) const;

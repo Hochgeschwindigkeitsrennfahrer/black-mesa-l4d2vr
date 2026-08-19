@@ -285,4 +285,12 @@ Overnight port of the L4D2VR `main2` multicore **subset** plus remaining safe Qo
 - `GetMatQueueMode` returns 0 until gameplay is eligible, then calls vfunc 11. DXVK's queued Present exclusive lock stays off during load.
 - `AutoMatQueueMode` uses `SetThreadMode`, not `ClientCmd`. First switch to mode 2 writes `bmvr_in_mat_queue.flag`. If that launch dies, next launch skips auto-queue (`mat_queue` in `bmvr_skip.txt`).
 - Per-weapon viewmodel offsets from `v_` model names; haptics; `IPDScale` / `HeightOffset`; `LeftHanded`; recenter zeros yaw. `DrawModelExecute` stays unhooked (overnight createHook coincided with the load freeze; ABI unverified).
-- ICvar probe disabled: overnight FindVar/SetValue slot scan ran just before the load freeze. Crosshair/blur/bob/`fps_max` stay at game defaults until the vfunc index is confirmed.
+- ICvar probe disabled: overnight FindVar/SetValue slot scan ran just before the load freeze. Crosshair is forced off via `bms/cfg/bmvr.cfg` (`crosshair 0` / `hud_crosshair_enable 0`) exec'd from autoexec — not Present ClientCmd.
+
+## HUD / pause / sprint / viewmodel scale / crowbar melee (compiled 2026-08-18)
+
+- HUD/pause VGUI is laid out for a ~60° inset inside the 1584×1440 HMD crop (Source `vr_hud_max_fov` idea) so lens FOV does not clip the edges. Pause menu is copied from the backbuffer into both eyes at Present.
+- Left menu/system button posts `VK_ESCAPE` to the game window (not `gameui_activate`). Trigger aims a VGUI cursor at that inset while paused.
+- Sprint is `IN_SPEED` on left X (G2/Touch). Crowbar swing synthesizes `IN_ATTACK` from controller speed (BM has no L4D2 `TestMeleeSwing`).
+- Viewmodels write `C_BaseAnimating::m_flModelScale` at +0x7C0 (Ghidra DT_BaseAnimating). Default `ViewmodelScale=0.5`.
+- SteamVR overlay SS still cannot enlarge BM G-buffers past the HWND.

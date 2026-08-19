@@ -78,4 +78,26 @@ namespace bmvr
     extern bool g_LeftHanded;
     extern bool g_RecenterResetsYaw;
     extern bool g_HideLocalPlayerModel;
+    // Hybrid VR hands: hide FP `arms` bodypart by zeroing studiohdr nummeshes
+    // (not MATERIAL_VAR_NO_DRAW). Opposite of L4D2VR NativeViewmodelHandsOnly.
+    extern bool g_HideViewmodelArms;
+    // Debug boxes at each controller in the HMD eye surfaces (v1 independent hands).
+    extern bool g_VrHandsDebugBoxes;
+    // false = runtime PostPresentHandoff (default). true = app handoff (L4D2VR).
+    extern bool g_CompositorPostPresentHandoff;
+    // World-space v_ models vs world props. Applied in DrawModelExecute around
+    // the controller (not m_flModelScale at entity origin). Range 0.2–1.5.
+    extern float g_ViewmodelScale;
+    extern float g_HudMaxFov;
+    extern float g_HudDisplayRatio;
+    extern float g_HudDistance;
+    extern float g_HudSize;
+
+    bool TryHudOverlay();
+    bool TryVguiPaint();
+    bool TryGameUiActivate();
+    bool TryMeleeTrace();
+    bool TryFramebufferOverride();
+    bool TryDrawHud();
+    bool TryDrawModelExecute();
 }
