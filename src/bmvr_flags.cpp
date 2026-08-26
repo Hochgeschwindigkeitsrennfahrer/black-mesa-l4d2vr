@@ -30,7 +30,8 @@ namespace bmvr
     float g_ControllerPitchTilt = -35.f;
     float g_IPDScale = 1.f;
     float g_HeightOffset = 0.f;
-    bool g_AutoMatQueueMode = true;
+    bool g_AutoMatQueueMode = false;
+    uint32_t g_AntiAliasing = 0;
     bool g_Haptics = true;
     bool g_HideCrosshair = true;
     bool g_MatchHmdHz = true;
@@ -70,6 +71,8 @@ namespace bmvr
     bool g_VrHandsUseHevGloves = true;
     uint32_t g_FullFrameActualWidth = 0;
     uint32_t g_FullFrameActualHeight = 0;
+    uint32_t g_GbActualWidth = 0;
+    uint32_t g_GbActualHeight = 0;
     // false = runtime PostPresentHandoff. true = L4D2VR app handoff (default).
     // Runtime mode lets the pose-waiter WaitGetPoses touch the Vulkan queue and
     // stall ~110ms (~20fps). App mode is the 90fps path. First-shot PostPresentHandoff
@@ -102,6 +105,12 @@ namespace bmvr
     static bool g_TryStereoFov = false;
     static bool g_TryMatQueue = true;
     static bool g_TrySteamVrEyeRt = false;
+    // Private eyes at OpenVR recommended * RenderScale. World RTs stay at
+    // the HWND (gbmatch squash-blit). LITERAL FullFrame/G-buffer at rec
+    // filled only the top HWND slice of the eyes (2026-08-26, user miss).
+    static bool g_TryOffscreenHmd = true;
+    static bool g_TryOffscreenWorldGrow = false;
+    static bool g_GameplayWorldRts = false;
     static bool g_TryHudOverlay = true;
     static bool g_TryVguiPaint = true;
     static bool g_TryGameUiActivate = true;
@@ -277,6 +286,12 @@ namespace bmvr
                 g_HeightOffset = static_cast<float>(atof(val));
             else if (std::strcmp(n, "AutoMatQueueMode") == 0)
                 g_AutoMatQueueMode = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "AntiAliasing") == 0 || std::strcmp(n, "msaa") == 0)
+            {
+                const int nAa = atoi(val);
+                g_AntiAliasing = (nAa == 2 || nAa == 4 || nAa == 8 || nAa == 16)
+                    ? static_cast<uint32_t>(nAa) : 0u;
+            }
             else if (std::strcmp(n, "Haptics") == 0)
                 g_Haptics = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "HideCrosshair") == 0)
@@ -387,10 +402,10 @@ namespace bmvr
                 g_DisableViewBob = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
         }
         fclose(f);
-        Log("VR config %ls RenderScale=%.2f TurnSpeed=%.2f snap=%d vm=(%.1f,%.1f,%.1f) tilt=%.1f ipd=%.2f autoQueue=%d",
+        Log("VR config %ls RenderScale=%.2f TurnSpeed=%.2f snap=%d vm=(%.1f,%.1f,%.1f) tilt=%.1f ipd=%.2f autoQueue=%d aa=%u",
             path.c_str(), g_RenderScale, g_TurnSpeed, g_SnapTurning ? 1 : 0,
             g_ViewmodelPosOffsetX, g_ViewmodelPosOffsetY, g_ViewmodelPosOffsetZ,
-            g_ControllerPitchTilt, g_IPDScale, g_AutoMatQueueMode ? 1 : 0);
+            g_ControllerPitchTilt, g_IPDScale, g_AutoMatQueueMode ? 1 : 0, g_AntiAliasing);
     }
 
     static void ApplySkipName(const std::string& name, const char* via)
@@ -425,6 +440,10 @@ namespace bmvr
         }
         else if (name == "steamvr_rt")
             g_TrySteamVrEyeRt = false;
+        else if (name == "hmd_offscreen")
+            g_TryOffscreenHmd = false;
+        else if (name == "hmd_world")
+            g_TryOffscreenWorldGrow = false;
         else if (name == "hud_overlay")
             g_TryHudOverlay = false;
         else if (name == "vgui_paint")
@@ -718,7 +737,7 @@ namespace bmvr
         CreateThread(nullptr, 0, WatchdogThread, nullptr, 0, nullptr);
     }
 
-    static void ConsumeIfStuck(const wchar_t* name, bool& enabled, const char* key, const char* label)
+    static void ConsumeIfStuck(const wchar_t* name, bool& enabled, const char* key, const char* label, bool persist = true)
     {
         bool stuck = false;
         for (const auto& dir : FlagDirs())
@@ -732,8 +751,13 @@ namespace bmvr
         if (!stuck)
             return;
         enabled = false;
-        PersistSkip(key, "previous launch died while trying it");
-        Log("Disabled %s: previous launch died while trying it", label);
+        if (persist)
+        {
+            PersistSkip(key, "previous launch died while trying it");
+            Log("Disabled %s: previous launch died while trying it", label);
+        }
+        else
+            Log("Disabled %s this launch only (previous launch died; not skip-filed)", label);
     }
 
     void InitFromDisk()
@@ -767,6 +791,8 @@ namespace bmvr
         for (const auto& dir : FlagDirs())
             DeleteFileW((dir + L"\\bmvr_in_mat_queue.flag").c_str());
         ConsumeIfStuck(L"steamvr_rt", g_TrySteamVrEyeRt, "steamvr_rt", "SteamVR recommended eye RT (offscreen)");
+        ConsumeIfStuck(L"hmd_offscreen", g_TryOffscreenHmd, "hmd_offscreen",
+            "offscreen HMD eyes + gameplay FullFrame/G-buffer grow", false);
         ConsumeIfStuck(L"hud_overlay", g_TryHudOverlay, "hud_overlay", "L4D2VR SteamVR HUD overlay");
         ConsumeIfStuck(L"vgui_paint", g_TryVguiPaint, "vgui_paint", "VGui_Paint redirect onto bmvrHUD");
         ConsumeIfStuck(L"gameui", g_TryGameUiActivate, "gameui", "gameui_activate from engine thread");
@@ -817,11 +843,14 @@ namespace bmvr
         PersistSkip("stereo_fov", "HMD FOV in 16:9 pixels is magnified and not fused");
         PersistSkip("ff_hmdfit", "unbind A2R10 FullFrame whites HMD; G-buffer 1584 vs PushRT 2560");
         PersistSkip("ff_gbfit", "LITERAL FullFrame+G-buffer 1584 died on background04 before stereo; user miss");
+        PersistSkip("hmd_world", "LITERAL FullFrame+G-buffer at SteamVR rec still PushRT 2560x1440; HMD warp + bottom garbage");
         // Do not PersistSkip fl_gbmatch — other builds wrote a policy skip
         // that silently disabled the flashlight path. Crash-sticky only.
         // Named HDR wrap + rewriting CSimpleWorldView PushRT(NULL) dies after
         // the third bind even when the named RT is 2560x1440. Do not retry it.
         g_TryNamedStereoWrap = false;
+        Log("hmd_offscreen=%d hmd_world=%d (eyes at SteamVR rec; world RTs stay HWND; gbmatch blit)",
+            g_TryOffscreenHmd ? 1 : 0, g_TryOffscreenWorldGrow ? 1 : 0);
         SetStage("init");
     }
 
@@ -839,6 +868,9 @@ namespace bmvr
     bool TryStereoFov() { return g_TryStereoFov; }
     bool TryMatQueue() { return g_TryMatQueue; }
     bool TrySteamVrEyeRt() { return g_TrySteamVrEyeRt; }
+    bool TryOffscreenHmd() { return g_TryOffscreenHmd; }
+    bool TryOffscreenWorldGrow() { return g_TryOffscreenWorldGrow; }
+    void SetGameplayWorldRts(bool gameplayMap) { g_GameplayWorldRts = gameplayMap; }
     bool TryHudOverlay() { return g_TryHudOverlay; }
     bool TryVguiPaint() { return g_TryVguiPaint; }
     bool TryGameUiActivate() { return g_TryGameUiActivate; }
@@ -911,17 +943,37 @@ namespace bmvr
             uint32_t eyeH = (recH + 15u) & ~15u;
             if (eyeW >= 640 && eyeH >= 360)
             {
-                static bool s_stampedNative;
-                if (!s_stampedNative)
+                // Index/G2 rec is often taller than a 1080p HWND (e.g. 1444x1800
+                // vs 1920x1080). Stamping that as the engine G-buffer made
+                // GetBackBufferDimensions 1456x1808 on a 1080 swapchain and
+                // the world could not run. Eyes still use ComputeOffscreenEyeSize
+                // (not HWND-clamped); world RTs stay at the window.
+                const bool overWindow = winW >= 640 && winH >= 360
+                    && (eyeW > winW + 32 || eyeH > winH + 32);
+                if (overWindow)
                 {
-                    s_stampedNative = true;
-                    BeginRisky(L"hmd_native");
-                    Log("HMD native G-buffer %ux%u (OpenVR recommended %ux%u, window %ux%u)",
-                        eyeW, eyeH, recW, recH, winW, winH);
+                    static bool s_loggedNativeOverWindow;
+                    if (!s_loggedNativeOverWindow)
+                    {
+                        s_loggedNativeOverWindow = true;
+                        Log("Skip hmd_native size %ux%u over window %ux%u (world stays HWND; eyes stay SteamVR rec)",
+                            eyeW, eyeH, winW, winH);
+                    }
                 }
-                g_FramebufferWidth = eyeW;
-                g_FramebufferHeight = eyeH;
-                return;
+                else
+                {
+                    static bool s_stampedNative;
+                    if (!s_stampedNative)
+                    {
+                        s_stampedNative = true;
+                        BeginRisky(L"hmd_native");
+                        Log("HMD native G-buffer %ux%u (OpenVR recommended %ux%u, window %ux%u)",
+                            eyeW, eyeH, recW, recH, winW, winH);
+                    }
+                    g_FramebufferWidth = eyeW;
+                    g_FramebufferHeight = eyeH;
+                    return;
+                }
             }
         }
 
@@ -1036,19 +1088,67 @@ namespace bmvr
         return true;
     }
 
+    static bool SizesNear(uint32_t a, uint32_t b, int slop = 48)
+    {
+        const int d = static_cast<int>(a) - static_cast<int>(b);
+        return d > -slop && d < slop;
+    }
+
+    bool ComputeOffscreenEyeSize(uint32_t& width, uint32_t& height)
+    {
+        if (!g_TryOffscreenHmd)
+            return false;
+        const uint32_t recW = g_RecommendedEyeWidth;
+        const uint32_t recH = g_RecommendedEyeHeight;
+        if (recW < 640 || recH < 360)
+            return false;
+        float s = g_RenderScale;
+        if (!(s > 0.24f && s < 4.f))
+            s = 1.f;
+        uint32_t w = (static_cast<uint32_t>(static_cast<float>(recW) * s + 0.5f) + 15u) & ~15u;
+        uint32_t h = (static_cast<uint32_t>(static_cast<float>(recH) * s + 0.5f) + 15u) & ~15u;
+        if (w > 4096)
+            w = 4096;
+        if (h > 4096)
+            h = 4096;
+        if (w < 640)
+            w = (recW + 15u) & ~15u;
+        if (h < 360)
+            h = (recH + 15u) & ~15u;
+        width = w;
+        height = h;
+        return w >= 640 && h >= 360;
+    }
+
     bool ComputeGrownWorldFramebuffer(uint32_t& width, uint32_t& height)
     {
-        // Disabled 2026-08-20: LITERAL grow to 2560x2144 + eyes 2192x2144
-        // warped/smeared HMD and put gun/hands behind the player. Sticky
-        // ff_stereo already persisted. Root cause: NormalizeViewSetupForVREye
-        // sets CViewSetup aspect from eyeW/eyeH (became 1.022) while OpenVR
-        // HMD aspect is ~1.097 and Submit blitted 2192x1440 from a 2560x1440
-        // window crop into 2192x2144 eyes. Growing RTs alone is not enough —
-        // projection/blit/yFix must stay coupled to HMD aspect. Do not grow
-        // FullFrame again until that architecture is redesigned.
-        (void)width;
-        (void)height;
-        return false;
+        // Persist-skipped hmd_world: engine PushRT stays HWND-sized.
+        if (!g_TryOffscreenWorldGrow || !g_TryOffscreenHmd || !g_GameplayWorldRts)
+            return false;
+        return ComputeOffscreenEyeSize(width, height);
+    }
+
+    bool OffscreenWorldMatchesEyes()
+    {
+        if (!g_TryOffscreenWorldGrow || !g_TryOffscreenHmd || !g_GameplayWorldRts)
+            return false;
+        uint32_t eyeW = 0, eyeH = 0;
+        if (!ComputeOffscreenEyeSize(eyeW, eyeH))
+            return false;
+        if (g_FullFrameActualWidth < 640 || g_FullFrameActualHeight < 360)
+            return false;
+        if (g_GbActualWidth < 640 || g_GbActualHeight < 360)
+            return false;
+        return SizesNear(g_FullFrameActualWidth, eyeW) && SizesNear(g_FullFrameActualHeight, eyeH)
+            && SizesNear(g_GbActualWidth, eyeW) && SizesNear(g_GbActualHeight, eyeH);
+    }
+
+    bool UseGbMatchViewLock()
+    {
+        // When FullFrame+G-buffer+eyes match, stereo views must be that size
+        // so flashlight apply hits the deferred buffers. Mismatch (GB 3728 /
+        // view 2560) was the 2026-08-26 flashlight/ghost failure.
+        return g_TryFlashlightGbMatch && !OffscreenWorldMatchesEyes();
     }
 
     bool HaveHmdFramebufferSize(uint32_t& width, uint32_t& height)

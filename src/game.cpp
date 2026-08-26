@@ -168,7 +168,7 @@ Game::Game()
 
     m_Initialized = true;
     bmvr::SetStage("game_ready");
-        Game::logMsg("BMVR Game initialized (L4D2VR architecture, Black Mesa offsets). namedRT=%d stereoRV=%d stereoCopy=%d stereoFov=%d hmdSwap=%d hmdFb=%d hmdNative=%d steamvrRT=%d waitIdle=%d absView=%d menuVR=%d relLook=%d",
+    Game::logMsg("BMVR Game initialized (L4D2VR architecture, Black Mesa offsets). namedRT=%d stereoRV=%d stereoCopy=%d stereoFov=%d hmdSwap=%d hmdFb=%d hmdNative=%d steamvrRT=%d offscreen=%d hmd_world=%d waitIdle=%d absView=%d menuVR=%d relLook=%d",
         bmvr::TryNamedRenderTargets() ? 1 : 0,
         bmvr::TryStereoRenderView() ? 1 : 0,
         bmvr::TryStereoCopy() ? 1 : 0,
@@ -177,6 +177,8 @@ Game::Game()
         bmvr::TryHmdFramebuffer() ? 1 : 0,
         bmvr::TryHmdNative() ? 1 : 0,
         bmvr::TrySteamVrEyeRt() ? 1 : 0,
+        bmvr::TryOffscreenHmd() ? 1 : 0,
+        bmvr::TryOffscreenWorldGrow() ? 1 : 0,
         bmvr::TryWaitDeviceIdle() ? 1 : 0,
         bmvr::TryAbsoluteHmdView() ? 1 : 0,
         bmvr::TryMenuCompositor() ? 1 : 0,
@@ -630,12 +632,17 @@ bool Game::SetMatQueueMode(int mode) const
 {
     if (!m_MaterialSystem || mode < 0 || mode > 2 || !m_MatSlotsValid)
         return false;
-    if (!m_VR || !m_VR->IsGameplayEligible())
-        return false;
-    if (!m_EngineClient || !m_EngineClient->IsInGame())
-        return false;
-    if (!m_VR->PassThroughWarmupDone())
-        return false;
+    // Mode 2 is the queued path. Mode 0 must stay callable so we can undo an
+    // archived cvar 2 / leftover SetThreadMode without waiting for warmup.
+    if (mode != 0)
+    {
+        if (!m_VR || !m_VR->IsGameplayEligible())
+            return false;
+        if (!m_EngineClient || !m_EngineClient->IsInGame())
+            return false;
+        if (!m_VR->PassThroughWarmupDone())
+            return false;
+    }
     __try
     {
         void** vtbl = *reinterpret_cast<void***>(m_MaterialSystem);
@@ -775,8 +782,6 @@ namespace
         {
             found = nullptr;
         }
-        if (found && !ConVarNameIs(found, name))
-            return nullptr;
         return found;
     }
 
@@ -790,29 +795,43 @@ namespace
         static int s_slot = -1;
         if (s_icvar == icvar && s_found && std::strcmp(s_name, name) == 0)
             return s_found;
-        // VEngineCvar004 (BM): IAppSystem 0-4, Register 5, GetCommandLineValue 6,
-        // FindCommandBase 7/8, FindVar 9. Slot 12 is FindVar if IAppSystem has
-        // the extra 3 methods. Never scan a range (2026-08-18 hang).
-        const int slots[] = { 9, 12 };
+        // VEngineCvar004 on BM is the 2013 ICvar vtable (RTTI CCvar in
+        // vstdlib.dll). IAppSystem 0-7, AllocateDLLIdentifier 8, Register 9,
+        // Unregister 10/11, GetCommandLineValue 12, FindCommandBase 13/14,
+        // FindVar 15, FindVar const 16. Slots 9 and 12 returned null (those
+        // are Register / GetCommandLineValue). Never scan a range.
+        const int slots[] = { 15, 16 };
         void* found = nullptr;
         int used = -1;
+        void* firstRaw = nullptr;
+        int rawSlot = -1;
         for (int slot : slots)
         {
-            found = FindConVarAtSlot(icvar, name, slot);
-            if (found)
+            void* raw = FindConVarAtSlot(icvar, name, slot);
+            if (!raw)
+                continue;
+            if (rawSlot < 0)
             {
-                used = slot;
-                break;
+                rawSlot = slot;
+                firstRaw = raw;
             }
+            if (!ConVarNameIs(raw, name))
+                continue;
+            found = raw;
+            used = slot;
+            break;
         }
         static int s_log;
-        if (s_log < 8)
+        const bool always = name && std::strcmp(name, "mat_queue_mode") == 0;
+        if (always || s_log < 8)
         {
             int nameSlot = -1;
-            const char* got = found ? ConVarGetName(found, nameSlot) : "";
-            Game::logMsg("ICvar FindVar '%s' slot=%d ptr=%p name='%s' nameSlot=%d",
-                name, used, found, got ? got : "", nameSlot);
-            ++s_log;
+            void* logPtr = found ? found : firstRaw;
+            const char* got = logPtr ? ConVarGetName(logPtr, nameSlot) : "";
+            Game::logMsg("ICvar FindVar '%s' slot=%d ptr=%p rawSlot=%d raw=%p name='%s' nameSlot=%d",
+                name, used, found, rawSlot, firstRaw, got ? got : "", nameSlot);
+            if (!always)
+                ++s_log;
         }
         if (!found)
             return nullptr;
@@ -824,6 +843,47 @@ namespace
         return found;
     }
 
+    bool ConVarWriteFields(void* cvar, float fval, int ival, bool writeStringAsInt)
+    {
+        if (!cvar)
+            return false;
+        void* parent = nullptr;
+        __try { parent = *reinterpret_cast<void**>(reinterpret_cast<uint8_t*>(cvar) + 0x1C); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { parent = nullptr; }
+        void* objs[2] = { cvar, (parent && parent != cvar) ? parent : nullptr };
+        bool ok = false;
+        for (void* obj : objs)
+        {
+            if (!obj)
+                continue;
+            uint8_t* b = reinterpret_cast<uint8_t*>(obj);
+            union { float f; uint32_t u; } fu;
+            fu.f = fval;
+            fu.u ^= reinterpret_cast<uint32_t>(obj);
+            const uint32_t storedInt = static_cast<uint32_t>(ival) ^ reinterpret_cast<uint32_t>(obj);
+            __try
+            {
+                *reinterpret_cast<uint32_t*>(b + 0x2C) = fu.u;
+                *reinterpret_cast<uint32_t*>(b + 0x30) = storedInt;
+                if (writeStringAsInt)
+                {
+                    char* str = *reinterpret_cast<char**>(b + 0x24);
+                    const int cap = *reinterpret_cast<int*>(b + 0x28);
+                    if (str && cap >= 2)
+                    {
+                        _snprintf(str, static_cast<size_t>(cap), "%d", ival);
+                        str[cap - 1] = '\0';
+                    }
+                }
+                ok = true;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+            }
+        }
+        return ok;
+    }
+
     bool ConVarSetInt(void* cvar, int value)
     {
         if (!cvar)
@@ -831,25 +891,11 @@ namespace
         int nameSlot = -1;
         if (!ConVarGetName(cvar, nameSlot) || nameSlot < 0)
             return false;
-        void** vt = nullptr;
-        __try { vt = *reinterpret_cast<void***>(cvar); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-        if (!vt)
-            return false;
-        // GetName 4 → SetValue(int) 12; GetName 6 → SetValue(int) 14.
-        const int setSlot = nameSlot + 8;
-        __try
-        {
-            if (!vt[setSlot])
-                return false;
-            using tSetInt = void(__thiscall*)(void*, int);
-            reinterpret_cast<tSetInt>(vt[setSlot])(cvar, value);
-            return true;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return false;
-        }
+        // Do not call virtual SetValue(int). FCVAR_MATERIAL_THREAD cvars
+        // queue through IMaterialSystem vt[0x88] and crashed on mat_vsync
+        // during the first RenderView (2026-08-26). Console reads the xor'd
+        // int at +0x30 and the string at +0x24 (InternalSetValue layout).
+        return ConVarWriteFields(cvar, static_cast<float>(value), value, true);
     }
 
     bool ConVarSetFloat(void* cvar, float value)
@@ -859,24 +905,7 @@ namespace
         int nameSlot = -1;
         if (!ConVarGetName(cvar, nameSlot) || nameSlot < 0)
             return false;
-        void** vt = nullptr;
-        __try { vt = *reinterpret_cast<void***>(cvar); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
-        if (!vt)
-            return false;
-        const int setSlot = nameSlot + 7;
-        __try
-        {
-            if (!vt[setSlot])
-                return false;
-            using tSetFloat = void(__thiscall*)(void*, float);
-            reinterpret_cast<tSetFloat>(vt[setSlot])(cvar, value);
-            return true;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return false;
-        }
+        return ConVarWriteFields(cvar, value, static_cast<int>(value), true);
     }
 }
 

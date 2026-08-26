@@ -220,6 +220,14 @@ namespace
             return false;
         if (std::strstr(name, "_rt_FullFrameFB") || std::strstr(name, "_rt_ResolvedFullFrame"))
             return false;
+        // Gameplay G-buffers are the stereo scene. `_rt_gbXog` contains "xog"
+        // and was treated as aux, so every later PushRT/Viewport/GetScreenSize
+        // stayed 2560x1440 on 2544x2480 RTs (warp + bottom garbage, 2026-08-26).
+        if (std::strstr(name, "_rt_gb")
+            && !std::strstr(name, "shadow") && !std::strstr(name, "Shadow")
+            && !std::strstr(name, "flashlight") && !std::strstr(name, "Flashlight")
+            && !std::strstr(name, "csm") && !std::strstr(name, "CSM"))
+            return false;
         if (std::strstr(name, "Water") || std::strstr(name, "water"))
             return true;
         if (std::strstr(name, "Reflect") || std::strstr(name, "Refract"))
@@ -232,7 +240,7 @@ namespace
         if (std::strstr(name, "shadow") || std::strstr(name, "Shadow") || std::strstr(name, "CSM")
             || std::strstr(name, "csm") || std::strstr(name, "flashlight") || std::strstr(name, "Flashlight"))
             return true;
-        if (std::strstr(name, "Dof") || std::strstr(name, "xbow") || std::strstr(name, "xog")
+        if (std::strstr(name, "Dof") || std::strstr(name, "xbow")
             || std::strstr(name, "gbShadow") || std::strstr(name, "_rt_ls"))
             return true;
         return false;
@@ -1305,7 +1313,7 @@ namespace
         view.m_nUnscaledY = 0;
         // fl_gbmatch: keep engine 2560 width/height so deferred flashlight
         // apply matches the G-buffer. Still write HMD fov/aspect (below).
-        if (!bmvr::TryFlashlightGbMatch())
+        if (!bmvr::UseGbMatchViewLock())
         {
             view.width = eyeWidth;
             view.height = eyeHeight;
@@ -1327,6 +1335,41 @@ namespace
             view.zNearViewmodel = view.zNear;
         if (view.zFar > view.zNear)
             view.zFarViewmodel = view.zFar;
+    }
+
+    bool IsOffscreenWorldRtName(const char* name)
+    {
+        if (!name || !name[0] || name[0] == '?')
+            return false;
+        if (std::strstr(name, "shadow") || std::strstr(name, "Shadow")
+            || std::strstr(name, "flashlight") || std::strstr(name, "Flashlight")
+            || std::strstr(name, "csm") || std::strstr(name, "CSM")
+            || std::strstr(name, "Hud") || std::strstr(name, "gui")
+            || std::strstr(name, "Dof") || std::strstr(name, "Water")
+            || std::strstr(name, "Camera") || std::strstr(name, "_rt_ls"))
+            return false;
+        return std::strstr(name, "_rt_FullFrame") != nullptr
+            || std::strstr(name, "_rt_ResolvedFullFrame") != nullptr
+            || std::strstr(name, "_rt_gb") != nullptr;
+    }
+
+    bool OffscreenStereoSizeLie(int& width, int& height)
+    {
+        if (!bmvr::OffscreenWorldMatchesEyes() || !Hooks::m_VR)
+            return false;
+        // Skip only HUD / true aux. Stereo callOriginal stays nest 1, but
+        // inner views must still see HMD size.
+        if (AuxSceneRtBound() || Hooks::m_VR->HudPaintActive())
+            return false;
+        if (!Hooks::m_VR->StereoEyeBlitActive() && Hooks::m_VR->m_StereoEye == 0)
+            return false;
+        const int eyeW = static_cast<int>(Hooks::m_VR->m_RenderWidth);
+        const int eyeH = static_cast<int>(Hooks::m_VR->m_RenderHeight);
+        if (eyeW < 640 || eyeH < 360)
+            return false;
+        width = eyeW;
+        height = eyeH;
+        return true;
     }
 
     bool LooksLikeAuxSceneView(const CViewSetup& setup)
@@ -1351,7 +1394,10 @@ namespace
     {
         if (!Hooks::m_VR)
             return;
-        if (NestedRenderView() || AuxSceneRtBound())
+        if (AuxSceneRtBound())
+            return;
+        if (NestedRenderView() && !Hooks::m_VR->StereoEyeBlitActive()
+            && Hooks::m_VR->m_StereoEye == 0)
             return;
         if (Hooks::m_VR->HudPaintActive())
         {
@@ -1394,7 +1440,7 @@ namespace
         // Flashlight apply PushRT/Viewport is 2560 (G-buffer actual). Forcing
         // 1584 here is why the beam never landed in fused eyes. Keep engine
         // size; squash-blit after RenderView.
-        if (bmvr::TryFlashlightGbMatch())
+        if (bmvr::UseGbMatchViewLock())
             return;
         x = 0;
         y = 0;
@@ -1533,8 +1579,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         m_VR->WaitPosesForStereoFrame();
 
     if (m_VR && m_Game && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible()
-        && inGame && mainView && m_VR->PassThroughWarmupDone()
-        && !m_VR->m_StereoEyesDrawnThisFrame)
+        && inGame && mainView && !m_VR->m_StereoEyesDrawnThisFrame)
         m_VR->TickMatQueueFromRenderView();
 
     // L4D2VR/Portal2: HMD angles + origin on a COPY. Writing the same values
@@ -1736,18 +1781,23 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         {
             s_hmdFbOnce = 1;
             bmvr::BeginRisky(L"hmd_fb");
+            if (bmvr::TryOffscreenHmd())
+                bmvr::BeginRisky(L"hmd_offscreen");
             if (bmvr::TrySteamVrEyeRt())
                 bmvr::BeginRisky(L"steamvr_rt");
-            if (bmvr::TryFlashlightGbMatch())
+            if (bmvr::UseGbMatchViewLock())
                 bmvr::BeginRisky(L"fl_gbmatch");
-            Game::logMsg("Stereo HMD-fb begin setup=%dx%d unscaled=%dx%d stereoEye=%d eye=%dx%d fov=%.1f->%.1f aspect=%.3f->%.3f zNear=%.1f ipd=%.2f L=(%.1f,%.1f,%.1f) R=(%.1f,%.1f,%.1f) steamvr_rt=%d gbmatch=%d",
+            Game::logMsg("Stereo HMD-fb begin setup=%dx%d unscaled=%dx%d stereoEye=%d eye=%dx%d fov=%.1f->%.1f aspect=%.3f->%.3f zNear=%.1f ipd=%.2f L=(%.1f,%.1f,%.1f) R=(%.1f,%.1f,%.1f) steamvr_rt=%d offscreen=%d worldMatch=%d gbmatch=%d",
                 setup.width, setup.height, setup.m_nUnscaledWidth, setup.m_nUnscaledHeight,
                 setup.m_eStereoEye, eyeW, eyeH,
                 setup.fov, leftEyeView.fov, setup.m_flAspectRatio, leftEyeView.m_flAspectRatio,
                 leftEyeView.zNear, ipd,
                 leftEyeView.origin.x, leftEyeView.origin.y, leftEyeView.origin.z,
                 rightEyeView.origin.x, rightEyeView.origin.y, rightEyeView.origin.z,
-                bmvr::TrySteamVrEyeRt() ? 1 : 0, bmvr::TryFlashlightGbMatch() ? 1 : 0);
+                bmvr::TrySteamVrEyeRt() ? 1 : 0,
+                bmvr::TryOffscreenHmd() ? 1 : 0,
+                bmvr::OffscreenWorldMatchesEyes() ? 1 : 0,
+                bmvr::UseGbMatchViewLock() ? 1 : 0);
         }
 
         m_VR->m_DirectEyeSubmit = true;
@@ -1774,17 +1824,20 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         }
         const bool leftUnbind = m_VR->EndStereoEyeBlit();
         {
-            // GB-match renders 2560 into FullFrame; unbind of A2R10 whites the
-            // LDR eyes (ff_hmdfit). Always crop/squash from the backbuffer.
-            if (bmvr::TryFlashlightGbMatch()
-                || !(leftUnbind && m_VR->StereoUnbindMatchesEye()))
+            (void)leftUnbind;
+            // Native: LDR backbuffer bind was redirected onto the eye (G-buffer
+            // and FullFrame match). Do not StretchRect the 2560 window over it.
+            // Unbind of A2R10 FullFrame still whites LDR eyes (ff_hmdfit).
+            const bool keepNative = bmvr::OffscreenWorldMatchesEyes()
+                && m_VR->StereoRedirectedToEye();
+            if (!keepNative)
             {
                 const bool leftBb = m_VR->BlitHmdViewFromBackbuffer(m_VR->m_D9LeftEyeSurface);
                 if (!leftBb)
                     m_VR->BlitCurrentGameColorTo(m_VR->m_D9LeftEyeSurface);
             }
             if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud)
-                m_VR->DrawIndependentHandMarkers(m_VR->m_D9LeftEyeSurface, 1);
+                m_VR->DrawIndependentHandMarkers(m_VR->ColorTargetForStereoEye(1), 1);
         }
         if (s_eyeRvLog < 8)
         {
@@ -1800,18 +1853,22 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         }
         const bool rightUnbind = m_VR->EndStereoEyeBlit();
         {
-            if (bmvr::TryFlashlightGbMatch()
-                || !(rightUnbind && m_VR->StereoUnbindMatchesEye()))
+            (void)rightUnbind;
+            const bool keepNative = bmvr::OffscreenWorldMatchesEyes()
+                && m_VR->StereoRedirectedToEye();
+            if (!keepNative)
             {
                 const bool rightBb = m_VR->BlitHmdViewFromBackbuffer(m_VR->m_D9RightEyeSurface);
                 if (!rightBb)
                     m_VR->BlitCurrentGameColorTo(m_VR->m_D9RightEyeSurface);
             }
             if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud)
-                m_VR->DrawIndependentHandMarkers(m_VR->m_D9RightEyeSurface, 2);
+                m_VR->DrawIndependentHandMarkers(m_VR->ColorTargetForStereoEye(2), 2);
         }
         m_VR->m_StereoEye = 0;
-        if (m_VR->m_IsVREnabled)
+        if (bmvr::OffscreenWorldMatchesEyes())
+            m_VR->MirrorStereoToDesktopWindow();
+        else if (m_VR->m_IsVREnabled)
             m_VR->ClearUnusedDesktopBackbuffer();
         // gbmatch already draws flashlight in the eye passes. A third window
         // DRAWHUD pass was a 15fps regression. Keep it only for the fused
@@ -1843,16 +1900,23 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         static int s_hmdFbDone;
         if (s_hmdFbDone < 4)
         {
-            Game::logMsg("Stereo HMD-fb pair done %dx%d redirected=%d",
-                eyeW, eyeH, m_VR->StereoRedirectedToEye() ? 1 : 0);
+            Game::logMsg("Stereo HMD-fb pair done %dx%d redirected=%d worldMatch=%d",
+                eyeW, eyeH, m_VR->StereoRedirectedToEye() ? 1 : 0,
+                bmvr::OffscreenWorldMatchesEyes() ? 1 : 0);
+            if (bmvr::OffscreenWorldMatchesEyes())
+                Game::logMsg("offscreen native: FullFrame/G-buffer match eyes %dx%d", eyeW, eyeH);
             ++s_hmdFbDone;
         }
 
         static int s_hmdFbFrames;
         ++s_hmdFbFrames;
-        if (s_hmdFbFrames == 120)
+        if (s_hmdFbFrames >= 120)
         {
+            // >= not == : live SS / later BeginRisky must not leave flags
+            // after the first successful 120 frames (installer false-ban).
             bmvr::EndRisky(L"hmd_fb");
+            if (bmvr::TryOffscreenHmd())
+                bmvr::EndRisky(L"hmd_offscreen");
             if (bmvr::TrySteamVrEyeRt())
                 bmvr::EndRisky(L"steamvr_rt");
             if (bmvr::TryFullFrameStereo())
@@ -2328,6 +2392,34 @@ void __fastcall Hooks::dPushRenderTargetAndViewport(void* ecx, void* edx, ITextu
     }
     if (m_VR && TextureNameIsHudRt(pushName))
         m_VR->NoteEngineHudRtPush(pushName, nViewW, nViewH);
+    // Native offscreen: ViewDrawScene still PushRT's HMD-sized G-buffers at
+    // HWND 2560x1440. Do not trust GetActualWidth here — it can report the
+    // videomode (1440) after LITERAL grew the GPU texture to 2480.
+    if (m_VR && bmvr::OffscreenWorldMatchesEyes()
+        && (m_VR->StereoEyeBlitActive() || m_VR->m_StereoEye != 0)
+        && !AuxSceneRtBound() && !m_VR->HudPaintActive())
+    {
+        const int eyeW = static_cast<int>(m_VR->m_RenderWidth);
+        const int eyeH = static_cast<int>(m_VR->m_RenderHeight);
+        const bool namedWorld = IsOffscreenWorldRtName(pushName);
+        const bool backbuffer = (pTexture == nullptr)
+            || (pushName && (std::strcmp(pushName, "null") == 0));
+        if (eyeW >= 640 && eyeH >= 360 && (namedWorld || backbuffer)
+            && (nViewW != eyeW || nViewH != eyeH || nViewW <= 0 || nViewH <= 0))
+        {
+            static int s_offVp;
+            if (s_offVp < 12)
+            {
+                Game::logMsg("PushRT %s viewport %dx%d -> eye %dx%d (offscreen native)",
+                    pushName, nViewW, nViewH, eyeW, eyeH);
+                ++s_offVp;
+            }
+            nViewX = 0;
+            nViewY = 0;
+            nViewW = eyeW;
+            nViewH = eyeH;
+        }
+    }
     if (g_StereoRedirect)
     {
         bool redir = false;
@@ -2564,6 +2656,8 @@ void __fastcall Hooks::dGetBackBufferDimensions(void* ecx, void* edx, int& width
             return;
         }
     }
+    if (OffscreenStereoSizeLie(width, height))
+        return;
     // Same-buffer stereo (ff_hmdfit only; ff_gbfit is persist-skipped).
     if (bmvr::TryHmdFitFullFrame()
         && m_VR && !NestedRenderView() && !AuxSceneRtBound()
@@ -2626,6 +2720,8 @@ void __fastcall Hooks::dGetScreenSize(void* ecx, void* edx, int& width, int& hei
             return;
         }
     }
+    if (OffscreenStereoSizeLie(width, height))
+        return;
     if (bmvr::TryHmdFitFullFrame()
         && m_VR && !NestedRenderView() && !AuxSceneRtBound()
         && (m_VR->StereoEyeBlitActive() || m_VR->m_StereoEye != 0)
@@ -2685,8 +2781,29 @@ ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* n
         || std::strstr(name, "PowerOfTwo") || std::strstr(name, "_rt_Camera"));
 
     uint32_t growW = 0, growH = 0;
-    const bool wantGrow = !skipGrow && (namedFb || namedGb || (fullMode && namedFb))
-        && bmvr::ComputeGrownWorldFramebuffer(growW, growH);
+    // FullFrame/G-buffer LITERAL grow is persist-skipped (hmd_world): BM
+    // PushRT stays HWND-sized, so a taller GPU texture only fills the top.
+    const bool looksLikeSceneBuffer = fullMode || w <= 0 || h <= 0
+        || (w >= 1280 && h >= 720 && w != h);
+    uint32_t offW = 0, offH = 0;
+    const bool wantGrowFb = namedFb && !skipGrow && sizeMode != RT_SIZE_PICMIP
+        && bmvr::TryOffscreenWorldGrow()
+        && bmvr::ComputeOffscreenEyeSize(offW, offH);
+    uint32_t gbW = 0, gbH = 0;
+    const bool wantGrowGb = namedGb && looksLikeSceneBuffer && !skipGrow
+        && sizeMode != RT_SIZE_PICMIP
+        && bmvr::ComputeGrownWorldFramebuffer(gbW, gbH);
+    if (wantGrowFb)
+    {
+        growW = offW;
+        growH = offH;
+    }
+    if (wantGrowGb)
+    {
+        growW = gbW;
+        growH = gbH;
+    }
+    const bool wantGrow = wantGrowFb || wantGrowGb;
     if (wantGrow)
     {
         const int oldW = w;
@@ -2698,12 +2815,14 @@ ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* n
         static int s_growLog;
         if (s_growLog < 12)
         {
-            Game::logMsg("CreateNamedRT %s grow %dx%d mode=%d -> %dx%d LITERAL (rec=%ux%u)",
+            Game::logMsg("CreateNamedRT %s grow %dx%d mode=%d -> %dx%d LITERAL (offscreen rec=%ux%u ff=%d gb=%d)",
                 name ? name : "?", oldW, oldH, oldMode, w, h,
-                bmvr::g_RecommendedEyeWidth, bmvr::g_RecommendedEyeHeight);
+                bmvr::g_RecommendedEyeWidth, bmvr::g_RecommendedEyeHeight,
+                wantGrowFb ? 1 : 0, wantGrowGb ? 1 : 0);
             ++s_growLog;
         }
-        bmvr::BeginRisky(L"ff_stereo");
+        // Do not BeginRisky here. Stereo enter already marks hmd_offscreen;
+        // a later map-change grow left the flag set after EndRisky(120).
     }
     else if (bmvr::TryHmdFitFullFrame()
         && haveFb && !skipGrow && (namedFb || namedGb)
@@ -2785,6 +2904,15 @@ ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* n
         {
             bmvr::g_FullFrameActualWidth = static_cast<uint32_t>(aw);
             bmvr::g_FullFrameActualHeight = static_cast<uint32_t>(ah);
+        }
+        if (aw >= 640 && ah >= 360 && namedGb)
+        {
+            if (static_cast<uint32_t>(aw) >= bmvr::g_GbActualWidth
+                && static_cast<uint32_t>(ah) >= bmvr::g_GbActualHeight)
+            {
+                bmvr::g_GbActualWidth = static_cast<uint32_t>(aw);
+                bmvr::g_GbActualHeight = static_cast<uint32_t>(ah);
+            }
         }
     }
     return tex;

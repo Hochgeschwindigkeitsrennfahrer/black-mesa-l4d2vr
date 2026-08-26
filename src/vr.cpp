@@ -225,14 +225,17 @@ namespace
         // Map-load stdshader hammers SetRT. GetRenderTarget/GetViewport on
         // every call was extra DXVK lock + COM during that nest. Capture
         // only matters while a stereo eye blit is in progress.
+        bool redirectedToEye = false;
         if (index == 0 && vr && device && !vr->m_CaptureReentry && vr->StereoEyeBlitActive())
         {
-            if (bmvr::TrySteamVrEyeRt() && vr->StereoEyeBlitDest() && rt
+            if ((bmvr::TrySteamVrEyeRt() || bmvr::OffscreenWorldMatchesEyes())
+                && vr->StereoEyeBlitDest() && rt
                 && rt != vr->StereoEyeBlitDest()
                 && SurfaceMatchesWindowOrBackbuffer(device, rt))
             {
                 rt = vr->StereoEyeBlitDest();
                 vr->NoteStereoRedirectedToEye();
+                redirectedToEye = true;
             }
             IDirect3DSurface9* oldRt = nullptr;
             D3DVIEWPORT9 vp{};
@@ -252,14 +255,31 @@ namespace
         }
         if (!g_OrigSetRenderTarget)
             return D3DERR_INVALIDCALL;
-        return g_OrigSetRenderTarget(device, index, rt);
+        const HRESULT hr = g_OrigSetRenderTarget(device, index, rt);
+        // Redirecting the 2560x1440 backbuffer onto a taller eye keeps the
+        // window viewport (1440). DXVK only forces full-eye size on the next
+        // SetViewport while RT0 is already the eye — so do that here.
+        if (SUCCEEDED(hr) && redirectedToEye && vr
+            && vr->m_RenderWidth >= 640 && vr->m_RenderHeight >= 360)
+        {
+            D3DVIEWPORT9 eyeVp{};
+            eyeVp.X = 0;
+            eyeVp.Y = 0;
+            eyeVp.Width = vr->m_RenderWidth;
+            eyeVp.Height = vr->m_RenderHeight;
+            eyeVp.MinZ = 0.f;
+            eyeVp.MaxZ = 1.f;
+            device->SetViewport(&eyeVp);
+        }
+        return hr;
     }
 
     HRESULT __stdcall HookedSetDepthStencil(IDirect3DDevice9* device, IDirect3DSurface9* depth)
     {
         VR* vr = (g_Game && g_Game->m_VR) ? g_Game->m_VR : nullptr;
         IDirect3DSurface9* eyeDepth = nullptr;
-        if (vr && vr->StereoEyeBlitActive() && bmvr::TrySteamVrEyeRt())
+        if (vr && vr->StereoEyeBlitActive()
+            && (bmvr::TrySteamVrEyeRt() || bmvr::OffscreenWorldMatchesEyes()))
         {
             if (vr->StereoEyeBlitDest() == vr->m_D9LeftEyeSurface)
                 eyeDepth = vr->m_D9LeftEyeDepthSurface;
@@ -459,6 +479,7 @@ void VR::OnLevelInit(const char* newmap)
 {
     m_CurrentMapName = newmap ? newmap : "";
     m_GameplayEligible = IsGameplayMapName(newmap);
+    bmvr::SetGameplayWorldRts(m_GameplayEligible);
     m_SeenGameplay = false;
     m_GameplayFrames = 0;
     m_EligiblePresents = 0;
@@ -489,6 +510,7 @@ bool VR::ShouldCompositorSubmit() const
 void VR::OnLevelShutdown()
 {
     m_GameplayEligible = false;
+    bmvr::SetGameplayWorldRts(false);
     m_SeenGameplay = false;
     m_SafeLookActive = false;
     m_LookApplyEnabled = false;
@@ -516,15 +538,29 @@ void VR::ApplyRenderTargetFramebufferOverride(void* materialSystem)
         mat = m_Game->m_MaterialSystem;
     if (!mat)
         return;
+
+    static uint32_t s_setW = 0;
+    static uint32_t s_setH = 0;
+
     uint32_t w = 0, h = 0;
+    static bool s_latchedOffscreen = false;
     if (!bmvr::ComputeGrownWorldFramebuffer(w, h))
     {
-        w = bmvr::g_RecommendedEyeWidth;
-        h = bmvr::g_RecommendedEyeHeight;
-        if (w < 640 || h < 360)
+        s_latchedOffscreen = false;
+        uint32_t winW = 0, winH = 0;
+        if (s_setW != 0 && bmvr::QueryWindowClientSize(winW, winH)
+            && (s_setW != winW || s_setH != winH))
+        {
+            w = winW;
+            h = winH;
+        }
+        else
             return;
-        w = (w + 15u) & ~15u;
-        h = (h + 15u) & ~15u;
+    }
+    else if (s_latchedOffscreen && s_setW != 0)
+    {
+        // Do not follow live SteamVR SS. G-buffers are sized at map load.
+        return;
     }
 
     void** vt = nullptr;
@@ -540,8 +576,6 @@ void VR::ApplyRenderTargetFramebufferOverride(void* materialSystem)
         || !vt[Offsets::kIMaterialSystem_GetRTFBDimensionsVt])
         return;
 
-    static uint32_t s_setW = 0;
-    static uint32_t s_setH = 0;
     if (s_setW == w && s_setH == h)
         return;
 
@@ -558,6 +592,8 @@ void VR::ApplyRenderTargetFramebufferOverride(void* materialSystem)
             mat, gotW, gotH);
         s_setW = w;
         s_setH = h;
+        uint32_t offW = 0, offH = 0;
+        s_latchedOffscreen = bmvr::ComputeGrownWorldFramebuffer(offW, offH);
         bmvr::EndRisky(L"fb_override");
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
@@ -636,6 +672,7 @@ void VR::HandleMissingRenderContext(const char* location)
 bool VR::InitOpenVR()
 {
     ++m_OpenVRInitAttempts;
+    m_AntiAliasing = bmvr::g_AntiAliasing;
 
     if (bmvr::g_OpenVRInitedFromCreateDevice && vr::VRSystem())
     {
@@ -742,9 +779,9 @@ bool VR::InitOpenVR()
     m_Compositor->CompositorBringToFront();
     SetActionManifest();
     StartPoseWaiter();
-    Game::logMsg("OpenVR scene app ready compositor=%p canRender=%d fov=%.1f aspect=%.3f appHandoff=%d",
+    Game::logMsg("OpenVR scene app ready compositor=%p canRender=%d fov=%.1f aspect=%.3f appHandoff=%d aa=%u",
         (void*)m_Compositor, m_Compositor->CanRenderScene() ? 1 : 0, m_Fov, m_Aspect,
-        m_CompositorAppHandoff ? 1 : 0);
+        m_CompositorAppHandoff ? 1 : 0, m_AntiAliasing);
     return true;
 }
 
@@ -1220,6 +1257,8 @@ UINT VR::KnownWindowHeight() const
 
 void VR::ChooseEyeRenderSize()
 {
+    PollSteamVrRecommendedSize();
+
     if (m_CreatedVRTextures.load(std::memory_order_acquire)
         && m_D9LeftEyeSurface && m_D9RightEyeSurface
         && m_VKLeftEye.m_VulkanData.m_nWidth >= 640
@@ -1231,6 +1270,17 @@ void VR::ChooseEyeRenderSize()
         const UINT haveH = m_VKLeftEye.m_VulkanData.m_nHeight;
         const bool wantSteamVr = bmvr::TrySteamVrEyeRt() && recW >= 640 && recH >= 360
             && (haveW + 32 < recW || haveH + 32 < recH);
+        uint32_t offW = 0, offH = 0;
+        const bool haveOff = bmvr::ComputeOffscreenEyeSize(offW, offH);
+        const bool wantOffscreenResize = haveOff
+            && (haveW + 32 < offW || haveH + 32 < offH || offW + 32 < haveW || offH + 32 < haveH);
+        if (wantOffscreenResize && m_EyeResizeSettleMs != 0
+            && (GetTickCount() - m_EyeResizeSettleMs) < 300)
+        {
+            m_RenderWidth = haveW;
+            m_RenderHeight = haveH;
+            return;
+        }
         uint32_t ffW = 0, ffH = 0;
         const bool wantFullFrame = bmvr::TryFullFrameStereo()
             && bmvr::g_FullFrameActualWidth >= 640 && bmvr::g_FullFrameActualHeight >= 360;
@@ -1243,14 +1293,14 @@ void VR::ChooseEyeRenderSize()
             {
                 // Fall through and recreate eyes at FullFrame-fitted size.
             }
-            else if (!wantSteamVr)
+            else if (!wantSteamVr && !wantOffscreenResize)
             {
                 m_RenderWidth = haveW;
                 m_RenderHeight = haveH;
                 return;
             }
         }
-        else if (!wantSteamVr)
+        else if (!wantSteamVr && !wantOffscreenResize)
         {
             m_RenderWidth = haveW;
             m_RenderHeight = haveH;
@@ -1262,6 +1312,21 @@ void VR::ChooseEyeRenderSize()
     const uint32_t recH = bmvr::g_RecommendedEyeHeight;
     const UINT winWKnown = KnownWindowWidth();
     const UINT winHKnown = KnownWindowHeight();
+
+    uint32_t offW = 0, offH = 0;
+    if (bmvr::ComputeOffscreenEyeSize(offW, offH))
+    {
+        if (m_RenderWidth != offW || m_RenderHeight != offH)
+        {
+            Game::logMsg(
+                "Eye RT %ux%u (offscreen rec=%ux%u RenderScale=%.2f window %ux%u)",
+                offW, offH, recW, recH, bmvr::g_RenderScale, winWKnown, winHKnown);
+        }
+        m_RenderWidth = offW;
+        m_RenderHeight = offH;
+        return;
+    }
+
     // steamvr_rt: offscreen eyes at GetRecommendedRenderTargetSize(). Verified
     // 2026-08-18: 3296x3216 > 2560x1440 G-buffer, SetRT redirect, skipped BB
     // blit, world black on desktop and HMD (audio + Escape menu still worked).
@@ -2203,6 +2268,7 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
     const bool haveOldVp = SUCCEEDED(device->GetViewport(&oldVp));
     device->GetRenderTarget(0, &oldRt);
     device->GetDepthStencilSurface(&oldDepth);
+    device->SetDepthStencilSurface(nullptr);
     if (FAILED(device->SetRenderTarget(0, eyeSurf)))
     {
         if (oldRt)
@@ -2218,6 +2284,14 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
         gloveDepth = m_D9LeftEyeDepthSurface;
     else if (stereoEye == 2)
         gloveDepth = m_D9RightEyeDepthSurface;
+    if (gloveDepth)
+    {
+        D3DSURFACE_DESC depthDesc{};
+        if (FAILED(gloveDepth->GetDesc(&depthDesc))
+            || depthDesc.MultiSampleType != desc.MultiSampleType
+            || depthDesc.Width != desc.Width || depthDesc.Height != desc.Height)
+            gloveDepth = nullptr;
+    }
     if (gloveDepth)
         device->SetDepthStencilSurface(gloveDepth);
     else if (stereoEye != 0)
@@ -2893,6 +2967,14 @@ void VR::ApplyVrQualityOfLifeCvars()
     setf("mat_motion_blur_percent_of_screen_max", 0.f);
     setf("mat_motion_blur_rotation_intensity", 0.f);
     setf("mat_motion_blur_falling_intensity", 0.f);
+    // fps_max 0: do not cap at HMD Hz (was 90 on G2). WaitGetPoses still
+    // paces the compositor. MatchHmdHz no longer writes fps_max.
+    if (m_Game->SetConVarInt("fps_max", 0) || m_Game->SetConVarFloat("fps_max", 0.f))
+    {
+        ++n;
+        m_MenuFpsMaxLastHz = 0;
+        Game::logMsg("fps_max 0 (uncapped; compositor syncs via WaitGetPoses)");
+    }
     if (bmvr::g_DisableViewBob)
     {
         setf("cl_bob", 0.f);
@@ -2900,20 +2982,6 @@ void VR::ApplyVrQualityOfLifeCvars()
         setf("cl_bobup", 0.f);
         setf("cl_viewmodel_lag", 0.f);
         seti("r_jiggle_bones", 0);
-    }
-    if (bmvr::g_MatchHmdHz && m_System)
-    {
-        const float hz = m_System->GetFloatTrackedDeviceProperty(
-            vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float);
-        int target = static_cast<int>(hz + 0.5f);
-        if (target < 30) target = 30;
-        if (target > 360) target = 360;
-        if (m_Game->SetConVarInt("fps_max", target) || m_Game->SetConVarFloat("fps_max", static_cast<float>(target)))
-        {
-            ++n;
-            m_MenuFpsMaxLastHz = target;
-            Game::logMsg("fps_max %d (HMD %.1f Hz)", target, hz);
-        }
     }
     // Two stereo RenderViews reuse Source occlusion queries / areaportals from
     // the previous eye. That latches empty vis (skybox only) until look/walk
@@ -2930,7 +2998,7 @@ void VR::ApplyVrQualityOfLifeCvars()
     seti("r_waterforcereflectentities", 0);
     seti("r_waterforceexpensive", 0);
     seti("nr_gbuffer_for_reflection_enabled", 0);
-    Game::logMsg("VR QoL cvars applied (%d ok) icvar=%p hideCrosshair=%d bobOff=%d vis=occlusion0 portalsopenall waterrefl0 nrgbuf0 (ICvar FindVar stubbed — use bmvr.cfg)",
+    Game::logMsg("VR QoL cvars applied (%d ok) icvar=%p hideCrosshair=%d bobOff=%d vis=occlusion0 portalsopenall waterrefl0 nrgbuf0",
         n, m_Game->m_Cvar, bmvr::g_HideCrosshair ? 1 : 0, bmvr::g_DisableViewBob ? 1 : 0);
 }
 
@@ -2938,6 +3006,9 @@ void VR::TickMatQueueFromRenderView()
 {
     if (m_Game)
         m_Game->ProbeMatQueueModeFromRenderView();
+    ApplyVrQualityOfLifeCvars();
+    // QoL SetValue(mat_vsync) crashed the first RenderView (2026-08-26).
+    // Crosshair stays in bmvr.cfg. Only mat_queue_mode is written after warmup.
     UpdateAutoMatQueueMode();
 }
 
@@ -2967,31 +3038,13 @@ void VR::UpdateAutoMatQueueMode()
     }
 
     const bool inGame = m_Game->m_EngineClient && m_Game->m_EngineClient->IsInGame();
-    if (bmvr::g_MatchHmdHz && m_System)
+    if (m_MenuFpsMaxLastHz != 0)
     {
-        if (!inGame)
+        if (m_Game->SetConVarInt("fps_max", 0) || m_Game->SetConVarFloat("fps_max", 0.f))
         {
-            if (!m_MenuFpsMaxSent)
-            {
-                const float hz = m_System->GetFloatTrackedDeviceProperty(
-                    vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_DisplayFrequency_Float);
-                int target = static_cast<int>(hz + 0.5f);
-                if (target < 30) target = 30;
-                if (target > 360) target = 360;
-                if (m_MenuFpsMaxLastHz != target)
-                {
-                    if (m_Game->SetConVarInt("fps_max", target)
-                        || m_Game->SetConVarFloat("fps_max", static_cast<float>(target)))
-                    {
-                        m_MenuFpsMaxLastHz = target;
-                        Game::logMsg("fps_max %d (HMD %.1f Hz)", target, hz);
-                    }
-                }
-                m_MenuFpsMaxSent = true;
-            }
+            m_MenuFpsMaxLastHz = 0;
+            Game::logMsg("fps_max 0 (uncapped inGame=%d)", inGame ? 1 : 0);
         }
-        else
-            m_MenuFpsMaxSent = false;
     }
 
     if (!bmvr::TryMatQueue())
@@ -3007,26 +3060,20 @@ void VR::UpdateAutoMatQueueMode()
     const bool loadingMap = inGame && !hasLocalPlayer;
 
     int desired = 0;
-    if (!bmvr::g_AutoMatQueueMode)
-    {
-        if (inGame)
-        {
-            if (m_AutoMatQueueModeLastRequested == 0)
-                m_AutoMatQueueModeLastRequested = -999;
-            return;
-        }
-        desired = 0;
-    }
-    else
+    if (bmvr::g_AutoMatQueueMode)
     {
         const bool warmup = !PassThroughWarmupDone();
         desired = (!inGame || !m_GameplayEligible || paused || loadingMap || warmup) ? 0 : 2;
     }
 
+    static bool s_forcedSingleThreadOnce;
     if (current == desired)
     {
-        m_AutoMatQueueModeLastRequested = desired;
-        return;
+        if (bmvr::g_AutoMatQueueMode || s_forcedSingleThreadOnce)
+        {
+            m_AutoMatQueueModeLastRequested = desired;
+            return;
+        }
     }
 
     const auto now = std::chrono::steady_clock::now();
@@ -3043,6 +3090,8 @@ void VR::UpdateAutoMatQueueMode()
     const bool ok = m_Game->SetMatQueueMode(desired);
     m_AutoMatQueueModeLastRequested = desired;
     m_AutoMatQueueModeLastCmdTime = now;
+    if (desired == 0 && ok)
+        s_forcedSingleThreadOnce = true;
     if (desired == 2 && !ok)
         bmvr::EndRisky(L"mat_queue");
     const char* reason = "in-game";
@@ -3053,6 +3102,74 @@ void VR::UpdateAutoMatQueueMode()
     else if (paused) reason = "paused";
     Game::logMsg("AutoMatQueueMode set %d (was %d) ok=%d reason=%s",
         desired, current, ok ? 1 : 0, reason);
+}
+
+void VR::PollSteamVrRecommendedSize()
+{
+    if (!m_System)
+        return;
+    uint32_t recW = 0, recH = 0;
+    m_System->GetRecommendedRenderTargetSize(&recW, &recH);
+    if (recW < 640 || recH < 360)
+        return;
+    if (recW == bmvr::g_RecommendedEyeWidth && recH == bmvr::g_RecommendedEyeHeight)
+        return;
+    const uint32_t prevW = bmvr::g_RecommendedEyeWidth;
+    const uint32_t prevH = bmvr::g_RecommendedEyeHeight;
+    bmvr::g_RecommendedEyeWidth = recW;
+    bmvr::g_RecommendedEyeHeight = recH;
+    if (prevW >= 640 && prevH >= 360)
+    {
+        m_EyeResizeSettleMs = GetTickCount();
+        Game::logMsg("SteamVR recommended RT %ux%u -> %ux%u (live SS; eyes recreate after settle)",
+            prevW, prevH, recW, recH);
+    }
+}
+
+void VR::ReclaimCompositorFocus(const char* reason)
+{
+    if (!m_Compositor)
+        return;
+    const DWORD now = GetTickCount();
+    if (m_LastCompositorReclaimMs != 0 && (now - m_LastCompositorReclaimMs) < 1000)
+        return;
+    m_LastCompositorReclaimMs = now;
+    m_Compositor->CompositorBringToFront();
+    m_Compositor->SetExplicitTimingMode(m_CompositorAppHandoff
+        ? vr::VRCompositorTimingMode_Explicit_ApplicationPerformsPostPresentHandoff
+        : vr::VRCompositorTimingMode_Explicit_RuntimePerformsPostPresentHandoff);
+    if (m_HandoffSuspended.load(std::memory_order_acquire))
+    {
+        m_HandoffSuspended.store(false, std::memory_order_release);
+        m_HandoffSlowRun.store(0, std::memory_order_release);
+        m_HandoffFastFrames.store(0, std::memory_order_release);
+    }
+    m_Compositor->ForceInterleavedReprojectionOn(false);
+    Game::logMsg("Compositor reclaim (%s) canRender=%d poseErr=%d",
+        reason ? reason : "?",
+        m_Compositor->CanRenderScene() ? 1 : 0,
+        m_LastPoseWaitError.load(std::memory_order_acquire));
+}
+
+void VR::TickCompositorFocus()
+{
+    if (!m_Compositor)
+        return;
+    const bool can = m_Compositor->CanRenderScene();
+    if (m_LastCanRenderScene && !can)
+        Game::logMsg("Compositor lost scene focus (alt-tab / dashboard)");
+    if (!m_LastCanRenderScene && can)
+        ReclaimCompositorFocus("CanRenderScene restored");
+    m_LastCanRenderScene = can;
+
+    vr::EDeviceActivityLevel activity = vr::k_EDeviceActivityLevel_Unknown;
+    if (m_System)
+        activity = m_System->GetTrackedDeviceActivityLevel(vr::k_unTrackedDeviceIndex_Hmd);
+    const bool hmdActive = activity == vr::k_EDeviceActivityLevel_UserInteraction
+        || activity == vr::k_EDeviceActivityLevel_UserInteraction_Timeout;
+    const int poseErr = m_LastPoseWaitError.load(std::memory_order_acquire);
+    if (hmdActive && (!can || poseErr == static_cast<int>(vr::VRCompositorError_DoNotHaveFocus)))
+        ReclaimCompositorFocus("HMD active without scene focus");
 }
 
 float VR::HorizontalFovForAspect(float targetAspect) const
@@ -3212,16 +3329,82 @@ bool VR::FillSharedTexture(IDirect3DSurface9* surface, SharedTextureHolder& hold
     return holder.m_VulkanData.m_nImage != 0;
 }
 
+IDirect3DSurface9* VR::SubmitSurfaceForEye(IDirect3DSurface9* eye) const
+{
+    if (eye && eye == m_D9LeftEyeSurface)
+        return m_D9LeftEyeSubmitSurface;
+    if (eye && eye == m_D9RightEyeSurface)
+        return m_D9RightEyeSubmitSurface;
+    return nullptr;
+}
+
+void VR::NoteMsaaEyeScene(IDirect3DSurface9* dst, bool copied)
+{
+    if (!copied || !dst)
+        return;
+    if (dst == m_D9LeftEyeSurface && m_D9LeftEyeSubmitSurface)
+        m_LeftEyeMsaaHasScene = true;
+    else if (dst == m_D9RightEyeSurface && m_D9RightEyeSubmitSurface)
+        m_RightEyeMsaaHasScene = true;
+}
+
+IDirect3DSurface9* VR::ColorTargetForStereoEye(int stereoEye) const
+{
+    if (stereoEye == 1)
+    {
+        if (m_LeftEyeMsaaHasScene || !m_D9LeftEyeSubmitSurface)
+            return m_D9LeftEyeSurface;
+        return m_D9LeftEyeSubmitSurface;
+    }
+    if (stereoEye == 2)
+    {
+        if (m_RightEyeMsaaHasScene || !m_D9RightEyeSubmitSurface)
+            return m_D9RightEyeSurface;
+        return m_D9RightEyeSubmitSurface;
+    }
+    return nullptr;
+}
+
+void VR::ResolveMsaaEyesToSubmit(IDirect3DDevice9* device)
+{
+    if (!device)
+        return;
+    m_CaptureReentry = true;
+    if (m_LeftEyeMsaaHasScene && m_D9LeftEyeSurface && m_D9LeftEyeSubmitSurface
+        && m_D9LeftEyeSurface != m_D9LeftEyeSubmitSurface)
+    {
+        const HRESULT hr = device->StretchRect(
+            m_D9LeftEyeSurface, nullptr, m_D9LeftEyeSubmitSurface, nullptr, D3DTEXF_NONE);
+        if (FAILED(hr))
+            Game::logMsg("MSAA left eye resolve hr=0x%08X", (unsigned)hr);
+    }
+    if (m_RightEyeMsaaHasScene && m_D9RightEyeSurface && m_D9RightEyeSubmitSurface
+        && m_D9RightEyeSurface != m_D9RightEyeSubmitSurface)
+    {
+        const HRESULT hr = device->StretchRect(
+            m_D9RightEyeSurface, nullptr, m_D9RightEyeSubmitSurface, nullptr, D3DTEXF_NONE);
+        if (FAILED(hr))
+            Game::logMsg("MSAA right eye resolve hr=0x%08X", (unsigned)hr);
+    }
+    m_CaptureReentry = false;
+}
+
 void VR::ReleaseVRRenderTargetsForDeviceReset()
 {
     std::lock_guard<TextureStateMutex> lock(m_TextureMutex);
     ReleaseT(m_D9LeftEyeSurface);
     ReleaseT(m_D9RightEyeSurface);
+    ReleaseT(m_D9LeftEyeSubmitSurface);
+    ReleaseT(m_D9RightEyeSubmitSurface);
     g_VrGloves.OnDeviceLost();
     ReleaseT(m_D9LeftEyeDepthSurface);
     ReleaseT(m_D9RightEyeDepthSurface);
     ReleaseT(m_D9LeftEyeTexture);
     ReleaseT(m_D9RightEyeTexture);
+    ReleaseT(m_D9LeftEyeSubmitTexture);
+    ReleaseT(m_D9RightEyeSubmitTexture);
+    m_LeftEyeMsaaHasScene = false;
+    m_RightEyeMsaaHasScene = false;
     ReleaseT(m_D9FrameColorSurface);
     ReleaseT(m_BlitEventQuery);
     m_LeftEyeTexture = nullptr;
@@ -3340,6 +3523,7 @@ bool VR::EnsurePrivateEyeSurfaces(IDirect3DDevice9* device)
     if (!device)
         return false;
 
+    m_AntiAliasing = bmvr::g_AntiAliasing;
     ChooseEyeRenderSize();
     UINT w = m_RenderWidth;
     UINT h = m_RenderHeight;
@@ -3361,7 +3545,17 @@ bool VR::EnsurePrivateEyeSurfaces(IDirect3DDevice9* device)
         const bool growForFullFrame = bmvr::TryFullFrameStereo()
             && w > haveW + 32
             && !m_StereoEyeBlitActive;
-        if ((!bmvr::TrySteamVrEyeRt() && !growForFullFrame) || haveW + 32 >= w)
+        const bool liveOffscreenResize = bmvr::TryOffscreenHmd()
+            && !m_StereoEyeBlitActive
+            && (w + 32 < haveW || h + 32 < haveH || haveW + 32 < w || haveH + 32 < h);
+        if (liveOffscreenResize && m_EyeResizeSettleMs != 0
+            && (GetTickCount() - m_EyeResizeSettleMs) < 300)
+        {
+            m_RenderWidth = haveW;
+            m_RenderHeight = haveH;
+            return true;
+        }
+        if ((!bmvr::TrySteamVrEyeRt() && !growForFullFrame && !liveOffscreenResize) || (!liveOffscreenResize && haveW + 32 >= w))
         {
             Game::logMsg("Keep existing D3D eyes %ux%u (requested %ux%u; HWND resize must not recreate)",
                 haveW, haveH, w, h);
@@ -3370,8 +3564,11 @@ bool VR::EnsurePrivateEyeSurfaces(IDirect3DDevice9* device)
             return true;
         }
         Game::logMsg("Recreating D3D eyes %ux%u -> %ux%u (%s)",
-            haveW, haveH, w, h, growForFullFrame ? "FullFrame stereo" : "SteamVR recommended");
-        if (growForFullFrame)
+            haveW, haveH, w, h,
+            liveOffscreenResize ? "SteamVR live SS" : (growForFullFrame ? "FullFrame stereo" : "SteamVR recommended"));
+        // Do not BeginRisky on live SS. Stereo already settled hmd_offscreen
+        // after 120 frames; a recreate+quit false-banned the path.
+        if (growForFullFrame && !liveOffscreenResize)
             bmvr::BeginRisky(L"ff_stereo");
         m_CreatedVRTextures.store(false, std::memory_order_release);
     }
@@ -3391,13 +3588,22 @@ bool VR::EnsurePrivateEyeSurfaces(IDirect3DDevice9* device)
         }
         if (!*surf)
             (*tex)->GetSurfaceLevel(0, surf);
-        if (!FillSharedTexture(*surf, vk))
+        // MSAA eyes cannot be OpenVR submit targets (GetVRDesc is skipped).
+        if (!UseVrMsaa())
         {
-            Game::logMsg("GetVRDesc failed for eye id=%d surf=%p", (int)id, (void*)*surf);
-            return false;
+            if (!FillSharedTexture(*surf, vk))
+            {
+                Game::logMsg("GetVRDesc failed for eye id=%d surf=%p", (int)id, (void*)*surf);
+                return false;
+            }
+            Game::logMsg("Eye RT id=%d %ux%u img=%llu", (int)id, vk.m_VulkanData.m_nWidth, vk.m_VulkanData.m_nHeight,
+                (unsigned long long)vk.m_VulkanData.m_nImage);
         }
-        Game::logMsg("Eye RT id=%d %ux%u img=%llu", (int)id, vk.m_VulkanData.m_nWidth, vk.m_VulkanData.m_nHeight,
-            (unsigned long long)vk.m_VulkanData.m_nImage);
+        else
+        {
+            Game::logMsg("Eye RT id=%d %ux%u MSAA=%u (submit texture holds Vulkan desc)",
+                (int)id, w, h, m_AntiAliasing);
+        }
         return true;
     };
 
@@ -3415,16 +3621,64 @@ bool VR::EnsurePrivateEyeSurfaces(IDirect3DDevice9* device)
         return true;
     };
 
-    const bool leftOk = createEye(Texture_LeftEye, &m_D9LeftEyeTexture, &m_D9LeftEyeSurface, m_VKLeftEye);
-    const bool rightOk = createEye(Texture_RightEye, &m_D9RightEyeTexture, &m_D9RightEyeSurface, m_VKRightEye);
+    bool leftOk = createEye(Texture_LeftEye, &m_D9LeftEyeTexture, &m_D9LeftEyeSurface, m_VKLeftEye);
+    bool rightOk = createEye(Texture_RightEye, &m_D9RightEyeTexture, &m_D9RightEyeSurface, m_VKRightEye);
     const bool depthOk = createDepth(Texture_LeftEye, &m_D9LeftEyeDepthSurface)
         && createDepth(Texture_RightEye, &m_D9RightEyeDepthSurface);
     EnsureFrameCopySurface(device, w, h);
 
-    m_CreatedVRTextures.store(leftOk && rightOk && m_VKLeftEye.m_VulkanData.m_nImage && m_VKRightEye.m_VulkanData.m_nImage,
+    bool submitOk = !UseVrMsaa();
+    if (UseVrMsaa())
+    {
+        auto createSubmit = [&](TextureID id, IDirect3DTexture9** tex, IDirect3DSurface9** surf, SharedTextureHolder& vk) -> bool {
+            ReleaseT(*surf);
+            ReleaseT(*tex);
+            m_CreatingTextureID = id;
+            const HRESULT hr = device->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, tex, nullptr);
+            m_CreatingTextureID = Texture_None;
+            if (FAILED(hr) || !*tex)
+            {
+                Game::logMsg("CreateTexture submit id=%d hr=0x%08X", (int)id, (unsigned)hr);
+                return false;
+            }
+            if (!*surf)
+                (*tex)->GetSurfaceLevel(0, surf);
+            if (!FillSharedTexture(*surf, vk))
+            {
+                Game::logMsg("GetVRDesc failed for submit id=%d surf=%p", (int)id, (void*)*surf);
+                return false;
+            }
+            Game::logMsg("Eye submit RT id=%d %ux%u img=%llu", (int)id, vk.m_VulkanData.m_nWidth, vk.m_VulkanData.m_nHeight,
+                (unsigned long long)vk.m_VulkanData.m_nImage);
+            return true;
+        };
+        submitOk = createSubmit(Texture_LeftEyeSubmit, &m_D9LeftEyeSubmitTexture, &m_D9LeftEyeSubmitSurface, m_VKLeftEye)
+            && createSubmit(Texture_RightEyeSubmit, &m_D9RightEyeSubmitTexture, &m_D9RightEyeSubmitSurface, m_VKRightEye);
+        if (!submitOk)
+        {
+            Game::logMsg("MSAA submit RTs failed; recreating eyes without MSAA");
+            m_AntiAliasing = 0;
+            bmvr::g_AntiAliasing = 0;
+            ReleaseT(m_D9LeftEyeSubmitSurface);
+            ReleaseT(m_D9RightEyeSubmitSurface);
+            ReleaseT(m_D9LeftEyeSubmitTexture);
+            ReleaseT(m_D9RightEyeSubmitTexture);
+            const bool leftRetry = createEye(Texture_LeftEye, &m_D9LeftEyeTexture, &m_D9LeftEyeSurface, m_VKLeftEye);
+            const bool rightRetry = createEye(Texture_RightEye, &m_D9RightEyeTexture, &m_D9RightEyeSurface, m_VKRightEye);
+            leftOk = leftRetry;
+            rightOk = rightRetry;
+            submitOk = leftRetry && rightRetry
+                && m_VKLeftEye.m_VulkanData.m_nImage && m_VKRightEye.m_VulkanData.m_nImage;
+        }
+    }
+
+    m_CreatedVRTextures.store(leftOk && rightOk && submitOk
+        && m_VKLeftEye.m_VulkanData.m_nImage && m_VKRightEye.m_VulkanData.m_nImage,
         std::memory_order_release);
-    Game::logMsg("VR D3D eye RTs ready=%d depth=%d L=%p R=%p copy=%p %ux%u",
-        m_CreatedVRTextures.load() ? 1 : 0, depthOk ? 1 : 0,
+    if (m_CreatedVRTextures.load(std::memory_order_acquire))
+        m_EyeResizeSettleMs = 0;
+    Game::logMsg("VR D3D eye RTs ready=%d depth=%d msaa=%u submit=%d L=%p R=%p copy=%p %ux%u",
+        m_CreatedVRTextures.load() ? 1 : 0, depthOk ? 1 : 0, m_AntiAliasing, submitOk ? 1 : 0,
         (void*)m_D9LeftEyeSurface, (void*)m_D9RightEyeSurface, (void*)m_D9FrameColorSurface, w, h);
     return m_CreatedVRTextures.load();
 }
@@ -3515,14 +3769,50 @@ void VR::MirrorStereoToDesktopWindow()
         return;
     }
 
+    D3DSURFACE_DESC bbDesc{};
+    UINT eyeW = 0, eyeH = 0;
+    if (FAILED(bb->GetDesc(&bbDesc)) || !ResolveSurfaceSize(m_D9LeftEyeSurface, eyeW, eyeH)
+        || bbDesc.Width < 640 || bbDesc.Height < 360 || eyeW < 640 || eyeH < 360)
+    {
+        bb->Release();
+        device->Release();
+        return;
+    }
+
+    const float srcAspect = static_cast<float>(eyeW) / static_cast<float>(eyeH);
+    const float dstAspect = static_cast<float>(bbDesc.Width) / static_cast<float>(bbDesc.Height);
+    UINT dw = bbDesc.Width;
+    UINT dh = bbDesc.Height;
+    UINT dx = 0;
+    UINT dy = 0;
+    if (srcAspect > dstAspect)
+    {
+        dh = static_cast<UINT>(static_cast<float>(bbDesc.Width) / srcAspect + 0.5f);
+        if (dh > bbDesc.Height)
+            dh = bbDesc.Height;
+        dy = (bbDesc.Height - dh) / 2;
+    }
+    else
+    {
+        dw = static_cast<UINT>(static_cast<float>(bbDesc.Height) * srcAspect + 0.5f);
+        if (dw > bbDesc.Width)
+            dw = bbDesc.Width;
+        dx = (bbDesc.Width - dw) / 2;
+    }
+    RECT dest = {
+        static_cast<LONG>(dx), static_cast<LONG>(dy),
+        static_cast<LONG>(dx + dw), static_cast<LONG>(dy + dh)
+    };
+
     IDirect3DSurface9* oldRt = nullptr;
     device->GetRenderTarget(0, &oldRt);
     m_CaptureReentry = true;
     if (oldRt == bb)
         device->SetRenderTarget(0, m_D9LeftEyeSurface);
-    HRESULT hr = device->StretchRect(m_D9LeftEyeSurface, nullptr, bb, nullptr, D3DTEXF_LINEAR);
+    device->ColorFill(bb, nullptr, D3DCOLOR_XRGB(0, 0, 0));
+    HRESULT hr = device->StretchRect(m_D9LeftEyeSurface, nullptr, bb, &dest, D3DTEXF_LINEAR);
     if (FAILED(hr))
-        hr = device->StretchRect(m_D9LeftEyeSurface, nullptr, bb, nullptr, D3DTEXF_NONE);
+        hr = device->StretchRect(m_D9LeftEyeSurface, nullptr, bb, &dest, D3DTEXF_NONE);
     if (oldRt)
         device->SetRenderTarget(0, oldRt);
     m_CaptureReentry = false;
@@ -3530,11 +3820,9 @@ void VR::MirrorStereoToDesktopWindow()
     static int s_mirrorLog;
     if (s_mirrorLog < 4 || FAILED(hr))
     {
-        D3DSURFACE_DESC bbDesc{};
-        bb->GetDesc(&bbDesc);
-        Game::logMsg("Desktop stretch left eye %ux%u -> BB %ux%u hr=0x%08X blitRank=%d",
-            m_RenderWidth, m_RenderHeight, bbDesc.Width, bbDesc.Height,
-            (unsigned)hr, m_StereoEyeBlitRank);
+        Game::logMsg("Desktop letterbox left eye %ux%u -> BB %ux%u dest=%d,%d %ux%u hr=0x%08X",
+            eyeW, eyeH, bbDesc.Width, bbDesc.Height,
+            dest.left, dest.top, dw, dh, (unsigned)hr);
         ++s_mirrorLog;
     }
 
@@ -3577,7 +3865,7 @@ bool VR::BlitHmdViewFromBackbuffer(IDirect3DSurface9* dst, bool flushGpu)
     // GB-match: the 2560 BB holds the full HMD frustum (anamorphic in 16:9
     // pixels). Top-left 1584 crop would drop FOV. Squash the whole BB into
     // the 1.1 eye (cancels the 16:9 vs 1.1 pixel stretch).
-    const bool squashFull = bmvr::TryFlashlightGbMatch();
+    const bool squashFull = bmvr::UseGbMatchViewLock();
     if (squashFull)
     {
         cropW = bbW;
@@ -3593,15 +3881,29 @@ bool VR::BlitHmdViewFromBackbuffer(IDirect3DSurface9* dst, bool flushGpu)
     m_LastEyeBlitWasWindowCrop = false;
 
     m_CaptureReentry = true;
-    HRESULT hr = device->StretchRect(bb, srcPtr, dst, nullptr, D3DTEXF_NONE);
+    const bool upscale = m_RenderWidth > bbW + 32 || m_RenderHeight > bbH + 32;
+    const D3DTEXTUREFILTERTYPE filter = upscale ? D3DTEXF_LINEAR : D3DTEXF_NONE;
+    HRESULT hr = device->StretchRect(bb, srcPtr, dst, nullptr, filter);
+    if (FAILED(hr))
+    {
+        IDirect3DSurface9* submit = SubmitSurfaceForEye(dst);
+        if (submit && submit != dst)
+            hr = device->StretchRect(bb, srcPtr, submit, nullptr, filter);
+    }
+    else
+        NoteMsaaEyeScene(dst, true);
     m_CaptureReentry = false;
 
     static int s_bbBlitLog;
     if (s_bbBlitLog < 8 || FAILED(hr))
     {
-        Game::logMsg("HMD BB blit %u,%u %ux%u of BB %ux%u -> eye hr=0x%08X (fallback crop=%d squash=%d)",
-            x0, y0, cropW, cropH, bbW, bbH, (unsigned)hr,
-            (srcPtr != nullptr) ? 1 : 0, squashFull ? 1 : 0);
+        Game::logMsg(
+            "HMD BB blit %u,%u %ux%u of BB %ux%u -> eye %ux%u hr=0x%08X (crop=%d squash=%d upscale=%d)",
+            x0, y0, cropW, cropH, bbW, bbH, m_RenderWidth, m_RenderHeight, (unsigned)hr,
+            (srcPtr != nullptr) ? 1 : 0, squashFull ? 1 : 0, upscale ? 1 : 0);
+        if (upscale && squashFull)
+            Game::logMsg("G-buffer did not grow; upscaling window %ux%u into offscreen eyes %ux%u",
+                bbW, bbH, m_RenderWidth, m_RenderHeight);
         ++s_bbBlitLog;
     }
 
@@ -3861,6 +4163,10 @@ void VR::BeginStereoEyeBlit(IDirect3DSurface9* dst)
     m_StereoEyeBlitDest = dst;
     m_StereoEyeBlitActive = dst != nullptr;
     m_StereoEyeBlitOk = false;
+    if (dst == m_D9LeftEyeSurface)
+        m_LeftEyeMsaaHasScene = false;
+    else if (dst == m_D9RightEyeSurface)
+        m_RightEyeMsaaHasScene = false;
     m_StereoRedirectedToEye = false;
     m_StereoEyeBlitRank = 0;
 }
@@ -3875,7 +4181,7 @@ bool VR::EndStereoEyeBlit()
 
 bool VR::StereoUnbindMatchesEye() const
 {
-    if (bmvr::TryFlashlightGbMatch())
+    if (bmvr::UseGbMatchViewLock())
         return false;
     const int dw = static_cast<int>(m_LastStereoBlitWidth) - static_cast<int>(m_RenderWidth);
     const int dh = static_cast<int>(m_LastStereoBlitHeight) - static_cast<int>(m_RenderHeight);
@@ -3938,6 +4244,10 @@ void VR::CaptureGameColorOnUnbind(IDirect3DSurface9* oldRt, uint32_t vpX, uint32
     // callOriginal is the wrong aspect (near fusion only at distance).
     if (!m_StereoEyeBlitActive || !m_StereoEyeBlitDest || !oldRt || m_CaptureReentry)
         return;
+    // Native offscreen paints LDR onto the eyes via SetRT redirect. Copying
+    // A2R10 FullFrame here is the ff_hmdfit white HMD.
+    if (bmvr::OffscreenWorldMatchesEyes())
+        return;
     if (oldRt == m_StereoEyeBlitDest || oldRt == m_D9LeftEyeSurface || oldRt == m_D9RightEyeSurface
         || oldRt == m_D9FrameColorSurface || oldRt == m_D9BlankSurface)
         return;
@@ -3968,7 +4278,15 @@ void VR::CaptureGameColorOnUnbind(IDirect3DSurface9* oldRt, uint32_t vpX, uint32
         return;
 
     m_CaptureReentry = true;
-    const HRESULT hr = device->StretchRect(oldRt, nullptr, m_StereoEyeBlitDest, nullptr, D3DTEXF_NONE);
+    HRESULT hr = device->StretchRect(oldRt, nullptr, m_StereoEyeBlitDest, nullptr, D3DTEXF_NONE);
+    if (FAILED(hr))
+    {
+        IDirect3DSurface9* submit = SubmitSurfaceForEye(m_StereoEyeBlitDest);
+        if (submit && submit != m_StereoEyeBlitDest)
+            hr = device->StretchRect(oldRt, nullptr, submit, nullptr, D3DTEXF_NONE);
+    }
+    else
+        NoteMsaaEyeScene(m_StereoEyeBlitDest, true);
     m_CaptureReentry = false;
     device->Release();
 
@@ -4046,7 +4364,15 @@ bool VR::BlitCurrentGameColorTo(IDirect3DSurface9* dst, bool flushGpu)
             srcPtr = &srcRect;
         }
         m_CaptureReentry = true;
-        const HRESULT hr = device->StretchRect(src, srcPtr, dst, nullptr, D3DTEXF_NONE);
+        HRESULT hr = device->StretchRect(src, srcPtr, dst, nullptr, D3DTEXF_NONE);
+        if (FAILED(hr))
+        {
+            IDirect3DSurface9* submit = SubmitSurfaceForEye(dst);
+            if (submit && submit != dst)
+                hr = device->StretchRect(src, srcPtr, submit, nullptr, D3DTEXF_NONE);
+        }
+        else
+            NoteMsaaEyeScene(dst, true);
         m_CaptureReentry = false;
         ok = SUCCEEDED(hr);
         static int s_blitLog;
@@ -4287,6 +4613,14 @@ void VR::SubmitVRTextures()
                 RECT rightSrc{ 0, 0, (LONG)srcDesc.Width - useOff, (LONG)srcDesc.Height };
                 hrL = device->StretchRect(m_D9FrameColorSurface, &leftSrc, m_D9LeftEyeSurface, nullptr, D3DTEXF_LINEAR);
                 hrR = device->StretchRect(m_D9FrameColorSurface, &rightSrc, m_D9RightEyeSurface, nullptr, D3DTEXF_LINEAR);
+                if (SUCCEEDED(hrL))
+                    NoteMsaaEyeScene(m_D9LeftEyeSurface, true);
+                else if (m_D9LeftEyeSubmitSurface)
+                    hrL = device->StretchRect(m_D9FrameColorSurface, &leftSrc, m_D9LeftEyeSubmitSurface, nullptr, D3DTEXF_LINEAR);
+                if (SUCCEEDED(hrR))
+                    NoteMsaaEyeScene(m_D9RightEyeSurface, true);
+                else if (m_D9RightEyeSubmitSurface)
+                    hrR = device->StretchRect(m_D9FrameColorSurface, &rightSrc, m_D9RightEyeSubmitSurface, nullptr, D3DTEXF_LINEAR);
             }
             else
             {
@@ -4294,6 +4628,14 @@ void VR::SubmitVRTextures()
                 hrR = m_D9RightEyeSurface
                     ? device->StretchRect(m_D9FrameColorSurface, nullptr, m_D9RightEyeSurface, nullptr, D3DTEXF_LINEAR)
                     : hrL;
+                if (SUCCEEDED(hrL))
+                    NoteMsaaEyeScene(m_D9LeftEyeSurface, true);
+                else if (m_D9LeftEyeSubmitSurface)
+                    hrL = device->StretchRect(m_D9FrameColorSurface, nullptr, m_D9LeftEyeSubmitSurface, nullptr, D3DTEXF_LINEAR);
+                if (m_D9RightEyeSurface && SUCCEEDED(hrR))
+                    NoteMsaaEyeScene(m_D9RightEyeSurface, true);
+                else if (m_D9RightEyeSubmitSurface)
+                    hrR = device->StretchRect(m_D9FrameColorSurface, nullptr, m_D9RightEyeSubmitSurface, nullptr, D3DTEXF_LINEAR);
             }
             m_CaptureReentry = false;
         }
@@ -4315,13 +4657,17 @@ void VR::SubmitVRTextures()
     }
 
     g_D3DVR9->LockDevice();
+    ResolveMsaaEyesToSubmit(device);
+    IDirect3DSurface9* leftSubmit = m_D9LeftEyeSubmitSurface ? m_D9LeftEyeSubmitSurface : m_D9LeftEyeSurface;
+    IDirect3DSurface9* rightSubmit = m_D9RightEyeSubmitSurface ? m_D9RightEyeSubmitSurface : m_D9RightEyeSurface;
     const BOOL waitGpu = bmvr::TryWaitDeviceIdle() ? TRUE : FALSE;
     if (bmvr::TryWaitDeviceIdle())
         bmvr::BeginRisky(L"wait_idle");
-    const bool okL = SUCCEEDED(g_D3DVR9->TransferSurface(m_D9LeftEyeSurface, waitGpu)) && FillSharedTexture(m_D9LeftEyeSurface, m_VKLeftEye);
+    const bool okL = leftSubmit && SUCCEEDED(g_D3DVR9->TransferSurface(leftSubmit, waitGpu))
+        && FillSharedTexture(leftSubmit, m_VKLeftEye);
     bool okR = false;
-    if (m_D9RightEyeSurface && SUCCEEDED(hrR))
-        okR = SUCCEEDED(g_D3DVR9->TransferSurface(m_D9RightEyeSurface, waitGpu)) && FillSharedTexture(m_D9RightEyeSurface, m_VKRightEye);
+    if (rightSubmit && SUCCEEDED(hrR))
+        okR = SUCCEEDED(g_D3DVR9->TransferSurface(rightSubmit, waitGpu)) && FillSharedTexture(rightSubmit, m_VKRightEye);
     if (m_HudOverlayReady && m_D9HUDSurface
         && m_HudPaintedThisFrame.load(std::memory_order_acquire))
     {
@@ -4460,9 +4806,11 @@ void VR::UpdateTracking()
             Game::logMsg("WaitGetPoses DoNotHaveFocus (SteamVR waiting room still owns the compositor)");
             ++s_focusLog;
         }
-        return;
+        // Still apply the pose OpenVR returned. Skipping here freezes the
+        // game camera at 10Hz while the compositor reprojects — rubberband
+        // after one alt-tab.
     }
-    if (err != vr::VRCompositorError_None)
+    else if (err != vr::VRCompositorError_None)
         return;
 
     if (!hmd.bPoseIsValid || !hmd.bDeviceIsConnected)
@@ -4522,7 +4870,10 @@ void VR::Update()
     if (m_GameplayEligible && !inGame)
         return;
 
-    ApplyVrQualityOfLifeCvars();
+    TickCompositorFocus();
+
+    // QoL cvars go through ICvar from RenderView (game thread). FindVar/SetValue
+    // from this Present/DXVK path crashed ~13s after init (2026-08-26).
     // Do not UpdateAutoMatQueueMode from Present. GetThreadMode nested
     // materialsystem after the first stereo frame (x32dbg 2026-08-18).
 

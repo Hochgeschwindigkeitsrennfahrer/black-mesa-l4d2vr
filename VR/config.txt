@@ -1,16 +1,17 @@
-# Black Mesa VR — restart the game after changing RenderScale
-# (eye size is picked at CreateDevice).
+# Black Mesa VR — RenderScale is a multiplier on SteamVR's recommended
+# per-eye size. The SteamVR overlay SS / resolution slider applies live
+# (eye textures recreate after ~300ms). RenderScale itself is still read
+# at DLL load; restart after editing this file.
 
-# Multiplier on the fitted HMD-aspect size. 1.0 is the verified fused path.
+# Multiplier on SteamVR's recommended per-eye size (OpenVR
+# GetRecommendedRenderTargetSize). Independent of the desktop window.
+# 16-aligned, cap 4096.
 #
-# RenderScale cannot invent pixels taller than the engine scene buffer.
-# The HWND is 2560x1440; the HMD-aspect crop inside it is ~1584x1440, so
-# values above 1.0 were fitted back to the window and looked like a no-op.
-# L4D2VR uses GetRecommendedRenderTargetSize() as the *scene* size (offscreen),
-# not the HWND. BMVR now sizes stereo from `_rt_FullFrameFB` when
-# SetRenderTargetFrameBufferSizeOverrides actually grows that RT (crash-sticky
-# ff_stereo). If FullFrame stays window-sized, the HMD stays ~1584x1440.
-# Do not retry hmd_swap / hmd_native / steamvr_rt SetRT redirect.
+# 1.0 = full SteamVR recommended (can be taller than the HWND).
+# 0.5–0.75 if GPU bound. Above 1.0 is extra supersampling on top of SteamVR SS.
+#
+# Dragging SteamVR's resolution / SS slider recreates the eye textures after a
+# short settle (no game restart). World G-buffers still need a map load to grow.
 # VRRenderScale=1.25
 RenderScale=1.0
 
@@ -55,15 +56,24 @@ HudDisplayRatio=0.82
 IPDScale=1.0
 HeightOffset=0.0
 
-# L4D2VR AutoMatQueueMode: menu/load/pause uses single-thread (0), gameplay
-# uses queued (2) via IMaterialSystem::SetThreadMode — not ClientCmd.
-# Crash-sticky: bmvr_in_mat_queue.flag (skip-file mat_queue is ignored).
-AutoMatQueueMode=true
+# Stereo copies blit the shared backbuffer after each RenderView. Queued
+# mode 2 (2026-08-26) made that mono, flicker, and ~180fps stutter. Keep 0
+# until named per-eye RTs work. Do not ClientCmd mat_queue_mode.
+AutoMatQueueMode=false
+
+# L4D2VR VR-menu MSAA on the private eye RTs (not mat_antialias). 0 / 2 / 4 / 8 / 16.
+# Restart required. OpenVR submits a non-MSAA resolve copy. This is GPU cost,
+# not a performance win. On the HMD-fb blit path the world is already resolved
+# into the window, so geometry edges stay aliased; gloves drawn into the eyes
+# still get MSAA. Named per-eye RTs would AA the scene like L4D2VR.
+AntiAliasing=0
 
 # Motion / comfort
 Haptics=true
 HideCrosshair=true
-MatchHmdHz=true
+# MatchHmdHz no longer caps fps_max at the headset rate (that was 90 on G2).
+# fps_max is 0 (uncapped); SteamVR WaitGetPoses still paces compositor submit.
+MatchHmdHz=false
 DisableViewBob=true
 LeftHanded=false
 RecenterResetsYaw=true

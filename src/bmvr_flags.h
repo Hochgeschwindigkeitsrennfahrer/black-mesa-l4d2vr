@@ -31,6 +31,14 @@ namespace bmvr
     bool TryStereoFov();
     bool TryMatQueue();
     bool TrySteamVrEyeRt();
+    bool TryOffscreenHmd();
+    // LITERAL FullFrame/G-buffer at SteamVR rec. Verified miss 2026-08-26:
+    // worldMatch+redirect still drew HWND 2560x1440 into 2544x2480 (warp).
+    bool TryOffscreenWorldGrow();
+    // gbmatch keeps CViewSetup at HWND/G-buffer size unless FullFrame and
+    // G-buffers actually allocated at offscreen eye size (native HMD pixels).
+    bool UseGbMatchViewLock();
+    bool OffscreenWorldMatchesEyes();
 
     void DisableNamedRenderTargets(const char* reason);
     void DisableStereoRenderView(const char* reason);
@@ -46,13 +54,17 @@ namespace bmvr
     // return the same values or HUD composite uses 16:9 CViewSetup on HMD RTs.
     void ComputeHmdFramebufferSize(uint32_t recW, uint32_t recH, uint32_t winW, uint32_t winH, float projAspect);
     void FitHmdAspectInWindow(uint32_t winW, uint32_t winH, float aspect, uint32_t& eyeW, uint32_t& eyeH);
-    // Offscreen FullFrame/G-buffer size: max(HWND, OpenVR recommended), 16-aligned.
-    // HWND width stays so 16:9 pass-through still fits. Height can exceed the window.
+    // GMod/L4D2VR: OpenVR recommended * RenderScale, 16-aligned, cap 4096.
+    // Independent of HWND. False if offscreen path is skipped or rec is unknown.
+    bool ComputeOffscreenEyeSize(uint32_t& width, uint32_t& height);
+    // Gameplay G-buffers to ComputeOffscreenEyeSize. Always false after
+    // hmd_world persist-skip (viewport stays HWND).
     bool ComputeGrownWorldFramebuffer(uint32_t& width, uint32_t& height);
     bool HaveHmdFramebufferSize(uint32_t& width, uint32_t& height);
     bool QueryWindowClientSize(uint32_t& width, uint32_t& height);
     bool ApplyHmdAspectBackbuffer(uint32_t& width, uint32_t& height);
     void InstallEarlyFramebufferHook();
+    void SetGameplayWorldRts(bool gameplayMap);
 
     extern uint32_t g_RecommendedEyeWidth;
     extern uint32_t g_RecommendedEyeHeight;
@@ -75,6 +87,9 @@ namespace bmvr
     extern float g_IPDScale;
     extern float g_HeightOffset;
     extern bool g_AutoMatQueueMode;
+    // L4D2VR overlay AntiAliasing: 0 / 2 / 4 / 8 / 16. DXVK MSAA on the
+    // private eye RTs, resolved into non-MSAA submit textures. Restart.
+    extern uint32_t g_AntiAliasing;
     extern bool g_Haptics;
     extern bool g_HideCrosshair;
     extern bool g_MatchHmdHz;
@@ -154,6 +169,8 @@ namespace bmvr
 
     extern uint32_t g_FullFrameActualWidth;
     extern uint32_t g_FullFrameActualHeight;
+    extern uint32_t g_GbActualWidth;
+    extern uint32_t g_GbActualHeight;
     // false (default) skips the leftover 16:9 desktop scene after stereo.
     extern bool g_DesktopLeftoverRender;
 }

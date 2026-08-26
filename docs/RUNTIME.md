@@ -186,7 +186,15 @@ Log issues on that session (addressed in the following build, not re-verified):
 
 ## RenderScale (`VR\config.txt`)
 
-L4D2VR/Portal2 use OpenVR recommended size. On BM that size died on first stereo (`hmd_native`). Default `RenderScale=1.0` keeps the verified window-fit. Values above 1.0 multiply that fit, 16-align, and cap at recommended. Restart after edits. `hmd_native` remains skip-file disabled.
+`1.0` is OpenVR `GetRecommendedRenderTargetSize` (SteamVR overlay SS), 16-aligned, cap 4096. **Not** clamped to the HWND. Eyes use that size (`hmd_offscreen`). World `_rt_FullFrameFB` / `_rt_gb*` stay at the window (`hmd_world` persist-skip). `GetScreenSize` and the swapchain stay at the window. gbmatch squash-blits the window scene into the eyes.
+
+Restart after edits. `hmd_native` / `hmd_swap` remain skip-file disabled.
+
+## AntiAliasing (`VR\config.txt`)
+
+L4D2VR overlay key, not `mat_antialias`. `0` / `2` / `4` / `8` / `16`. Restart after edits. DXVK stamps D3D9 MSAA on `CreateTexture` for `Texture_LeftEye` / `Texture_RightEye`, then `StretchRect` resolves into non-MSAA submit textures that OpenVR can consume. Engine video AA stays off.
+
+On the current HMD-fb **blit** path the world is rasterized into the window backbuffer first, so MSAA on the eye copy does not anti-alias geometry. Gloves drawn into the eye RTs still get MSAA. Named per-eye RTs (verified fail here) are what made L4D2VR's world MSAA real.
 
 ## SteamVR controllers (L4D2VR/Portal2 actions)
 
@@ -276,7 +284,7 @@ User-verified the next day: fusion only at arm's length, world giant, camera abo
 
 - L4D2VR `GetViewAngle` includes HMD roll. We had been zeroing `ang.z` and clamping pitch to ±89, so a head tilt rotated the compositor pose against an unrolled image. Camera copies now use `HmdMatrixToSourceAnglesWithRoll`. CreateMove still writes roll=0 so the body does not roll.
 - Viewmodel used `controller - hmdZero` on the engine eye input, which after recenter put the gun at the player's feet. L4D2VR 1:1 is camera + `(controller - current HMD)`. Same here, with a 80hu reach clamp (Portal 2 prototype).
-- `steamvr_rt` (SteamVR recommended 3296×3216 private eyes + `SetRenderTarget`/`SetDepthStencil` redirect, skip backbuffer blit) is **verified black**. Process stayed at ~90 FPS, audio played, Escape menu drew, world was pitch black on desktop and HMD. Engine G-buffers stayed 2560×1440; `redirected=1` stole the composite off the window backbuffer. Persist-skip `steamvr_rt`. Eyes stay the window-fit HMD-aspect blit (~1584×1440). Do not retry an eye RT larger than the HWND until there is a real offscreen G-buffer path.
+- `steamvr_rt` (SteamVR recommended 3296×3216 private eyes + `SetRenderTarget`/`SetDepthStencil` redirect, skip backbuffer blit) is **verified black**. Process stayed at ~90 FPS, audio played, Escape menu drew, world was pitch black on desktop and HMD. Engine G-buffers stayed 2560×1440; `redirected=1` stole the composite off the window backbuffer. Persist-skip `steamvr_rt`. Do not retry redirect unless FullFrame **and** G-buffer actual size match the eyes (`hmd_offscreen`).
 
 ## Verified fail: `ff_gbfit` (2026-08-22)
 
@@ -289,7 +297,8 @@ Overnight port of the L4D2VR `main2` multicore **subset** plus remaining safe Qo
 - `GetMatQueueMode` returns 0 until gameplay is eligible, then calls vfunc 11. DXVK's queued Present exclusive lock stays off during load.
 - `AutoMatQueueMode` uses `SetThreadMode`, not `ClientCmd`. First switch to mode 2 writes `bmvr_in_mat_queue.flag`. If that launch dies, next launch skips auto-queue (`mat_queue` in `bmvr_skip.txt`).
 - Per-weapon viewmodel offsets from `v_` model names; haptics; `IPDScale` / `HeightOffset`; `LeftHanded`; recenter zeros yaw. `DrawModelExecute` stays unhooked (overnight createHook coincided with the load freeze; ABI unverified).
-- ICvar probe disabled: overnight FindVar/SetValue slot scan ran just before the load freeze. Crosshair is forced off via `bms/cfg/bmvr.cfg` (`crosshair 0` / `hud_crosshair_enable 0`) exec'd from autoexec — not Present ClientCmd.
+- ICvar: BM exports `VEngineCvar004` with the 2013 vtable. `FindVar` is slot **15**. ConVar `GetName` is slot **4**. Do not call virtual `SetValue` — `FCVAR_MATERIAL_THREAD` queues through `IMaterialSystem` vt+0x88 and crashed on `mat_vsync` (first RenderView, 2026-08-26). Console value is the xor'd int at `+0x30` and the string at `+0x24`. Never scan ICvar slots (2026-08-18 hang). Crosshair stays in `bmvr.cfg`.
+- **Verified fail (2026-08-26):** `mat_queue_mode` 2 + HMD-fb backbuffer blit = **mono, permanent shake, flicker, ~180fps stutter**. Both eyes StretchRect the same 2560×1440 window after queued RenderViews. L4D2VR survives queue 2 because named per-eye RTs run on the material thread; those RTs are skipped here. `AutoMatQueueMode=false`, `bmvr.cfg` `mat_queue_mode 0`. Do not retry 2 until each eye has its own RT or ExecuteQueued-after-eye is proven on this blit path.
 
 ## HUD / pause / sprint / viewmodel scale / crowbar melee (compiled 2026-08-18)
 
@@ -297,4 +306,5 @@ Overnight port of the L4D2VR `main2` multicore **subset** plus remaining safe Qo
 - Left menu/system button posts `VK_ESCAPE` to the game window (not `gameui_activate`). Trigger aims a VGUI cursor at that inset while paused.
 - Sprint is `IN_SPEED` on left X (G2/Touch). Crowbar swing synthesizes `IN_ATTACK` from controller speed (BM has no L4D2 `TestMeleeSwing`).
 - Viewmodels write `C_BaseAnimating::m_flModelScale` at +0x7C0 (Ghidra DT_BaseAnimating). Default `ViewmodelScale=0.5`.
-- SteamVR overlay SS still cannot enlarge BM G-buffers past the HWND.
+- **SteamVR overlay SS still cannot enlarge BM G-buffers past the HWND.** `hmd_world` persist-skip. Eyes can still be the recommended size; unmatched G-buffers upscale from the window blit.
+- **Verified miss (2026-08-26, user):** FullFrame + G-buffer + eyes all 2544×2480 (`worldMatch=1 redirected=1`). Engine PushRT/Viewport stayed **2560×1440** (rewrite never logged). HMD: warped top strip + garbage/black below. Desktop letterbox copied that broken eye. Persist-skip `hmd_world` — do not LITERAL-grow world RTs taller than the HWND. Eyes can still be SteamVR rec; gbmatch squash-blit from the window. Native pixels above the window need `hmd_swap` (already persist-skipped, black desktop) or a larger game window.

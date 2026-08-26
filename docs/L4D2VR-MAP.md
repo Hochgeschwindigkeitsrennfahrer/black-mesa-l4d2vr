@@ -33,9 +33,11 @@ Look: HMD yaw/pitch on stereo `CViewSetup` copies after LevelInit gate (reject `
 
 ## Getting the game image
 
-L4D2VR: `CreateNamedRenderTargetTextureEx` (`leftEye0` / `rightEye0`) with `m_CreatingTextureID`.
+L4D2VR: `CreateNamedRenderTargetTextureEx` (`leftEye0` / `rightEye0`) with `m_CreatingTextureID`. Overlay `AntiAliasing` is DXVK MSAA on those named eyes, resolved into `leftEyeSubmit0` / `rightEyeSubmit0`.
 
-BMVR: retry that **without** poking L4D2’s `isGameRunning` offset (wrong on BM and a likely prototype crash). If it returns null or AVs (SEH), private `CreateTexture` + unbind/pre-Present capture.
+BMVR: retry that **without** poking L4D2’s `isGameRunning` offset (wrong on BM and a likely prototype crash). If it returns null or AVs (SEH), private `CreateTexture` + unbind/pre-Present capture. `AntiAliasing` in `VR/config.txt` is the same DXVK MSAA + submit-resolve pair on those private eyes (restart). World MSAA still needs named per-eye RTs.
+
+Eye size is OpenVR recommended × `RenderScale` (`hmd_offscreen`), not HWND-clamped. Gameplay `_rt_FullFrameFB` / `_rt_gb*` stay at the window (`hmd_world` persist-skip): LITERAL grow to 2544×2480 still PushRT'd 2560×1440, so the HMD showed a warped top strip and garbage below. SetRT redirect only if those RTs actually match the eyes. `steamvr_rt` (redirect without a matching G-buffer) stays persist-skipped.
 
 ## Sync
 
@@ -48,8 +50,8 @@ L4D2VR AutoMatQueueMode issues `ClientCmd_Unrestricted("mat_queue_mode N")` from
 Ported instead:
 
 - Real `GetMatQueueMode` = vfunc **11** `GetThreadMode` **only after a gameplay map is in-game**. Load/menu/`!IsInGame` return 0 without calling into `IMaterialSystem`. Present may call it; **DXVK `SetViewport` / `SetRenderTarget` must not**.
-- `SetThreadMode` vfunc **10**, then ICvar `mat_queue_mode` if the probe works.
-- Menu/load/pause/first 8 in-game pass-through RenderViews → 0, then gameplay → 2. Crash-sticky `mat_queue`. Do not `SetThreadMode(2)` on the first spawn Present (that hung after pass-through 2/8, 2026-08-18). Windowed swapchain stays at the HWND size while `hmd_swap` is skipped.
+- `SetThreadMode` vfunc **10**, then ICvar `FindVar` slot **15** and a field write of `mat_queue_mode` (`+0x30` xor / string `+0x24`). Never `ClientCmd("mat_queue_mode")` and never virtual `SetValue` (material-thread queue crash).
+- Menu/load/pause/first 8 in-game pass-through RenderViews → 0. Gameplay **stays 0** until named per-eye RTs work. **Verified 2026-08-26:** mode 2 + HMD-fb blit = mono/flicker/~180fps. `AutoMatQueueMode` default false. `bmvr.cfg` `mat_queue_mode 0` (ARCHIVE from the cvar write would otherwise reload 2). Do not `SetThreadMode(2)` on the first spawn Present (that hung after pass-through 2/8, 2026-08-18). Windowed swapchain stays at the HWND size while `hmd_swap` is skipped.
 - DXVK `SetViewport` only rewrites when RT0 is a private eye/HUD surface. No `IsInGame` / `GetMatQueueMode` from that call (those nested stdshader until Present died, 2026-08-18).
 - `GetScreenSize` / `GetBackBufferDimensions` / `CreateNamedRT` keep the HMD size lie whenever the G-buffer exists, including map load. Skipping the lie during `eligible && !IsInGame` made shaders query 2560 while `SetRT` reset the viewport to 2384.
 - `SourceRenderQueueBuildScope` around outer `RenderView` when queued (`m_SourceRenderQueueBuildCount`).

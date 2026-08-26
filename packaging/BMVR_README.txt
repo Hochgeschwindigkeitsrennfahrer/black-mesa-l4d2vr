@@ -68,20 +68,29 @@ Edit:
 Then fully quit and restart the game. Eye size is chosen at CreateDevice; changing
 the file while the game is running does nothing.
 
-RenderScale multiplies the working HMD-aspect fit, then aligns to 16 pixels.
-Sizes taller than the game window are fitted back into the HWND. SteamVR's
-full recommended eye size (~3296x3216 on a G2) blacked the world when used as
-an offscreen RT; that path is skipped.
+RenderScale multiplies SteamVR's recommended per-eye size (not the window),
+then aligns to 16 pixels (cap 4096). The headset copies are that size; the
+game still renders at the window (G-buffers stay 2560x1440 on a 1440p
+window) and is scaled into the eyes. Growing the world buffers to SteamVR
+size left a warped strip and garbage in the HMD. Add `hmd_offscreen` to
+bmvr_skip.txt to force window-fit eyes. To get more *source* pixels, raise
+the game's own resolution (window/fullscreen size).
 
-  RenderScale=1.0     ~1584 x 1440 on a 1440p window
-                      Verified fused gameplay. Start here.
+  RenderScale=1.0     SteamVR recommended (typical Index/G2 is taller than 1080p)
+  RenderScale=0.75    cheaper if GPU bound
+  RenderScale=1.25    extra SS on top of SteamVR
 
-  RenderScale=1.25 / 1.50
-                      Tried a larger G-buffer, then fitted back into the window
-                      so it is not taller than the HWND.
+A 1080p window with a headset recommended height above 1080 is supported.
+This zip renders at the window and scales into SteamVR-sized eyes. An older
+zip that logged "HMD native G-buffer 1456x1808" and "Eye/G-buffer size
+1456x1808 (CreateDevice HMD-aspect" on a 1920x1080 window treated that as
+the engine framebuffer and could not run. Confirm this zip with:
+  offscreen=1 hmd_world=0
+  Eye RT ... window 1920x1080
+  Skip hmd_native size ... over window ...
 
 After launch, bmvr_log.txt reports the size actually used, for example:
-  Eye/G-buffer size 1584x1440 (CreateDevice HMD-aspect, window 2560x1440)
+  Eye RT 2016x2240 (offscreen rec=2016x2240 RenderScale=1.00 window 1920x1080)
 
 
 5) Controllers (HP Reverb G2 / WMR / Touch)
@@ -114,7 +123,8 @@ Also in VR\config.txt (defaults):
   AutoMatQueueMode=false  leave engine mat_queue_mode alone (menu still 0)
   IPDScale=1.0            HeightOffset=0.0
   Haptics=true            HideCrosshair=true
-  MatchHmdHz=true         DisableViewBob=true
+  MatchHmdHz=false        (unused for fps; fps_max is 0 / uncapped)
+  DisableViewBob=true
   LeftHanded=false        RecenterResetsYaw=true
   HideLocalPlayerModel=true
 

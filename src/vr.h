@@ -63,6 +63,11 @@ public:
     uint32_t m_RenderWidth = 0;
     uint32_t m_RenderHeight = 0;
     uint32_t m_AntiAliasing = 0;
+    bool UseVrMsaa() const
+    {
+        return m_AntiAliasing == 2 || m_AntiAliasing == 4
+            || m_AntiAliasing == 8 || m_AntiAliasing == 16;
+    }
     float m_Aspect = 1.f;
     float m_Fov = 90.f;
     float m_VRScale = 39.37f;
@@ -177,6 +182,8 @@ public:
     IDirect3DSurface9* m_D9FrameColorSurface = nullptr;
     IDirect3DTexture9* m_D9LeftEyeTexture = nullptr;
     IDirect3DTexture9* m_D9RightEyeTexture = nullptr;
+    IDirect3DTexture9* m_D9LeftEyeSubmitTexture = nullptr;
+    IDirect3DTexture9* m_D9RightEyeSubmitTexture = nullptr;
     IDirect3DTexture9* m_D9FrameColorTexture = nullptr;
 
     SharedTextureHolder m_VKLeftEye;
@@ -404,6 +411,7 @@ public:
     void CaptureFrameBeforePresent();
     bool BlitCurrentGameColorTo(IDirect3DSurface9* dst, bool flushGpu = true);
     bool BlitHmdViewFromBackbuffer(IDirect3DSurface9* dst, bool flushGpu = true);
+    IDirect3DSurface9* ColorTargetForStereoEye(int stereoEye) const;
     void BeginStereoEyeBlit(IDirect3DSurface9* dst);
     bool EndStereoEyeBlit();
     bool StereoUnbindMatchesEye() const;
@@ -508,11 +516,17 @@ private:
     bool EnsurePrivateEyeSurfaces(IDirect3DDevice9* device);
     bool EnsureFrameCopySurface(IDirect3DDevice9* device, uint32_t width, uint32_t height);
     bool FillSharedTexture(IDirect3DSurface9* surface, SharedTextureHolder& holder);
+    IDirect3DSurface9* SubmitSurfaceForEye(IDirect3DSurface9* eye) const;
+    void NoteMsaaEyeScene(IDirect3DSurface9* dst, bool copied);
+    void ResolveMsaaEyesToSubmit(IDirect3DDevice9* device);
     void ApplyVulkanYFlip(vr::VRTextureBounds_t& bounds);
     void RefreshIpdFromHmd();
     void UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose);
     void UpdateAutoMatQueueMode();
     void ApplyVrQualityOfLifeCvars();
+    void PollSteamVrRecommendedSize();
+    void TickCompositorFocus();
+    void ReclaimCompositorFocus(const char* reason);
     void PulseAimHaptic(unsigned short durationUs = 2500);
     void ResolveWeaponViewmodelPose(float& ox, float& oy, float& oz, float& ax, float& ay, float& az) const;
     void DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
@@ -526,7 +540,10 @@ private:
     std::chrono::steady_clock::time_point m_AutoMatQueueModeLastCmdTime{};
     bool m_VrCvarsApplied = false;
     bool m_MenuFpsMaxSent = false;
-    int m_MenuFpsMaxLastHz = 0;
+    int m_MenuFpsMaxLastHz = -1;
+    bool m_LastCanRenderScene = true;
+    DWORD m_EyeResizeSettleMs = 0;
+    DWORD m_LastCompositorReclaimMs = 0;
     uint32_t m_MatQueueOkPresents = 0;
     IDirect3DQuery9* m_BlitEventQuery = nullptr;
     void FlushStereoBlitGpu();
@@ -536,6 +553,8 @@ private:
 
     IDirect3DSurface9* m_StereoEyeBlitDest = nullptr;
     bool m_StereoEyeBlitActive = false;
+    bool m_LeftEyeMsaaHasScene = false;
+    bool m_RightEyeMsaaHasScene = false;
     bool m_StereoRedirectedToEye = false;
     bool m_HudPaintActive = false;
     bool m_EngineHudRtPushed = false;
