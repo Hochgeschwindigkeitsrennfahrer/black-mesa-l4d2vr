@@ -506,6 +506,7 @@ private:
     bool PressedDigitalAction(vr::VRActionHandle_t handle, bool onChanged = false) const;
     void ApplyTurnStick(float stickX, float deltaMs);
     static bool IsGameplayMapName(const char* map);
+    static bool IsXenMapName(const char* map);
     void PollMapFromEngine();
     bool InitOpenVR();
     void UpdateTracking();
@@ -524,6 +525,7 @@ private:
     void UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose);
     void UpdateAutoMatQueueMode();
     void ApplyVrQualityOfLifeCvars();
+    void ApplyMapLodCvars();
     void PollSteamVrRecommendedSize();
     void TickCompositorFocus();
     void ReclaimCompositorFocus(const char* reason);

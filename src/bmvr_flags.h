@@ -143,6 +143,10 @@ namespace bmvr
     // CPU-wait the GPU after the left-eye StretchRect. Needed only if both
     // eyes show the same image (DXVK missed the BB copy hazard). Default off.
     extern bool g_StereoBlitGpuFlush;
+    // When world RTs stay at the HWND, do not StretchRect 1080p into SteamVR
+    // rec-sized eyes (2544x2480). Keep HMD aspect, cap the long edge to the
+    // window. false = full recommended eye size (softer GPU, sharper submit).
+    extern bool g_CapEyesToWindow;
     // World-space v_ models vs world props. Applied in DrawModelExecute around
     // the controller (not m_flModelScale at entity origin). Range 0.2–1.5.
     extern float g_ViewmodelScale;

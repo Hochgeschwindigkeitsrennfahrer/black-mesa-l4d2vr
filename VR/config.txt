@@ -28,6 +28,11 @@ ForceOpenVis=false
 # pipeline the right eye. true only if both eyes show the same image.
 StereoBlitGpuFlush=false
 
+# When the world stays at the HWND (hmd_world skip), do not allocate SteamVR
+# rec-sized eyes just to upscale 1080p into them. Keeps HMD aspect. false =
+# full recommended submit size (more GPU).
+CapEyesToWindow=true
+
 # Portal 2 VR / L4D2VR right-stick look. Degrees per ms at full deflection.
 TurnSpeed=0.25
 SnapTurning=false
