@@ -2983,13 +2983,36 @@ void VR::ApplyVrQualityOfLifeCvars()
         setf("cl_viewmodel_lag", 0.f);
         seti("r_jiggle_bones", 0);
     }
-    // Two stereo RenderViews reuse Source occlusion queries / areaportals from
-    // the previous eye. That latches empty vis (skybox only) until look/walk
-    // back. r_novis would draw the whole map and make wide-open worse.
-    seti("r_occlusion", 0);
-    seti("r_fastzreject", 0);
-    seti("r_visocclusion", 0);
-    seti("r_portalsopenall", 1);
+    // Stereo used to force r_occlusion 0 + r_portalsopenall 1 because two
+    // RenderViews reused HW occlusion / areaportals and could latch empty vis.
+    // That pair draws every leaf and tanks open/complex maps. Default: restore
+    // PVS + occlusion. ForceOpenVis=true in config.txt brings the old path back.
+    if (bmvr::g_ForceOpenVis)
+    {
+        seti("r_occlusion", 0);
+        seti("r_fastzreject", 0);
+        seti("r_visocclusion", 0);
+        seti("r_portalsopenall", 1);
+    }
+    else
+    {
+        seti("r_occlusion", 1);
+        seti("r_fastzreject", 1);
+        seti("r_visocclusion", 1);
+        seti("r_portalsopenall", 0);
+    }
+    // BM new-renderer CSM logged 8192x8192 (_rt_gbshadowmaprt) inside each
+    // stereo RenderView. L4D2VR ShadowTweaks uses RTT off + half-rate; BM has
+    // cl_csm_qualitymode / nr_shadow_* instead (materialsystem.dll strings).
+    // Do not touch r_flashlightdepthtexture — that broke deferred flashlight.
+    seti("cl_csm_qualitymode", 0);
+    seti("nr_shadow_quality", 0);
+    seti("nr_shadow_filter_quality", 0);
+    seti("nr_shadow_max_passes_per_frame", 1);
+    seti("nr_shadow_res", 2048);
+    seti("nr_lights_quality", 0);
+    seti("r_shadowrendertotexture", 0);
+    seti("r_shadowlod", 2);
     // Planar water used the HMD camera inside ViewDrawScene (not a nested
     // RenderView). Aux GetScreenSize skip was not enough. Cheap water instead
     // of a view-locked ghost world. BM new-renderer planar glass uses
@@ -2998,8 +3021,9 @@ void VR::ApplyVrQualityOfLifeCvars()
     seti("r_waterforcereflectentities", 0);
     seti("r_waterforceexpensive", 0);
     seti("nr_gbuffer_for_reflection_enabled", 0);
-    Game::logMsg("VR QoL cvars applied (%d ok) icvar=%p hideCrosshair=%d bobOff=%d vis=occlusion0 portalsopenall waterrefl0 nrgbuf0",
-        n, m_Game->m_Cvar, bmvr::g_HideCrosshair ? 1 : 0, bmvr::g_DisableViewBob ? 1 : 0);
+    Game::logMsg("VR QoL cvars applied (%d ok) icvar=%p hideCrosshair=%d bobOff=%d forceOpenVis=%d blitFlush=%d csmQ=0 nrShadowRes=2048 waterrefl0",
+        n, m_Game->m_Cvar, bmvr::g_HideCrosshair ? 1 : 0, bmvr::g_DisableViewBob ? 1 : 0,
+        bmvr::g_ForceOpenVis ? 1 : 0, bmvr::g_StereoBlitGpuFlush ? 1 : 0);
 }
 
 void VR::TickMatQueueFromRenderView()
@@ -4195,6 +4219,9 @@ void VR::FlushStereoBlitGpu()
     // RenderView overwrites that RT before the left copy lands, so both eyes
     // submit the same image and near field cannot fuse. Event-query flush is
     // not WaitDeviceIdle (that crash-skipped during load).
+    // One GetData(FLUSH) waits for the whole left eye. 64 FLUSH polls serialized
+    // complex scenes (~2x GPU time). Off by default (g_StereoBlitGpuFlush);
+    // DXVK StretchRect hazards should keep the BB copy coherent.
     if (!g_D3DVR9)
         return;
     IDirect3DDevice9* device = nullptr;
@@ -4215,13 +4242,7 @@ void VR::FlushStereoBlitGpu()
         }
     }
     m_BlitEventQuery->Issue(D3DISSUE_END);
-    HRESULT hr = S_FALSE;
-    for (int i = 0; i < 64; ++i)
-    {
-        hr = m_BlitEventQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH);
-        if (hr != S_FALSE)
-            break;
-    }
+    const HRESULT hr = m_BlitEventQuery->GetData(nullptr, 0, D3DGETDATA_FLUSH);
     static int s_qok;
     if (s_qok < 2)
     {

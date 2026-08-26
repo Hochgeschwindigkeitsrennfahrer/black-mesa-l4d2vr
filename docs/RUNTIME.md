@@ -190,6 +190,10 @@ Log issues on that session (addressed in the following build, not re-verified):
 
 Restart after edits. `hmd_native` / `hmd_swap` remain skip-file disabled.
 
+## Frame time (2026-08-26)
+
+Open/complex maps were drawing the whole vis set: QoL forced `r_occlusion 0` + `r_portalsopenall 1` after a stereo areaportal latch. Default is PVS + occlusion again (`ForceOpenVis=true` restores the old pair). Each stereo eye also ran BM new-renderer CSM (`cl_csm_qualitymode` / `nr_shadow_*` in materialsystem.dll; logs showed `_rt_gbshadowmaprt` 8192²). Lowest quality + `nr_shadow_res 2048` + `nr_shadow_max_passes_per_frame 1`. Left-eye `D3DQUERYTYPE_EVENT` `GetData(FLUSH)` ×64 serialized both eyes; blit flush is off (`StereoBlitGpuFlush=true` if both eyes go identical). L4D2VR ShadowTweaks `r_flashlightdepthtexture` is **not** copied — that broke BM deferred flashlight. Multicore still off.
+
 ## AntiAliasing (`VR\config.txt`)
 
 L4D2VR overlay key, not `mat_antialias`. `0` / `2` / `4` / `8` / `16`. Restart after edits. DXVK stamps D3D9 MSAA on `CreateTexture` for `Texture_LeftEye` / `Texture_RightEye`, then `StretchRect` resolves into non-MSAA submit textures that OpenVR can consume. Engine video AA stays off.

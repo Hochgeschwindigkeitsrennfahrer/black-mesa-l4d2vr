@@ -348,6 +348,28 @@ namespace
             || std::strstr(name, "\\V_") != nullptr;
     }
 
+    bool CachedModelIsViewmodel(void* pModel)
+    {
+        struct Entry { void* model; bool isVm; };
+        static Entry cache[64]{};
+        static unsigned n = 0;
+        if (!pModel)
+            return false;
+        const unsigned count = n < 64 ? n : 64u;
+        for (unsigned i = 0; i < count; ++i)
+        {
+            if (cache[i].model == pModel)
+                return cache[i].isVm;
+        }
+        const char* name = nullptr;
+        if (Hooks::m_Game && Hooks::m_Game->m_ModelInfo)
+            name = SafeModelName(Hooks::m_Game->m_ModelInfo, pModel);
+        const bool vm = ModelNameIsViewmodel(name);
+        cache[n % 64] = { pModel, vm };
+        ++n;
+        return vm;
+    }
+
     // Source DrawModelState_t (x86). CModelRender::DrawModelExecute
     // (engine 0x113E80) reads studiohdr flags at state[0]+0x98 and
     // drawFlags at state+0x14 — first pointer is studiohdr_t*, not CStudioHdr.
@@ -1832,9 +1854,11 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 && m_VR->StereoRedirectedToEye();
             if (!keepNative)
             {
-                const bool leftBb = m_VR->BlitHmdViewFromBackbuffer(m_VR->m_D9LeftEyeSurface);
+                const bool leftBb = m_VR->BlitHmdViewFromBackbuffer(
+                    m_VR->m_D9LeftEyeSurface, bmvr::g_StereoBlitGpuFlush);
                 if (!leftBb)
-                    m_VR->BlitCurrentGameColorTo(m_VR->m_D9LeftEyeSurface);
+                    m_VR->BlitCurrentGameColorTo(
+                        m_VR->m_D9LeftEyeSurface, bmvr::g_StereoBlitGpuFlush);
             }
             if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud)
                 m_VR->DrawIndependentHandMarkers(m_VR->ColorTargetForStereoEye(1), 1);
@@ -1858,9 +1882,10 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 && m_VR->StereoRedirectedToEye();
             if (!keepNative)
             {
-                const bool rightBb = m_VR->BlitHmdViewFromBackbuffer(m_VR->m_D9RightEyeSurface);
+                const bool rightBb = m_VR->BlitHmdViewFromBackbuffer(
+                    m_VR->m_D9RightEyeSurface, false);
                 if (!rightBb)
-                    m_VR->BlitCurrentGameColorTo(m_VR->m_D9RightEyeSurface);
+                    m_VR->BlitCurrentGameColorTo(m_VR->m_D9RightEyeSurface, false);
             }
             if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud)
                 m_VR->DrawIndependentHandMarkers(m_VR->ColorTargetForStereoEye(2), 2);
@@ -2141,14 +2166,26 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
         entityIndex = info.entity_index;
         body = info.body;
         skin = info.skin;
-        if (m_Game && m_Game->m_ModelInfo)
-            modelName = SafeModelName(m_Game->m_ModelInfo, pModel);
-        if (modelName && modelName[0])
+        if (bmvr::g_HideLocalPlayerModel
+            && m_VR
+            && m_VR->IsGameplayEligible())
         {
-            strncpy_s(modelNameBuf, modelName, _TRUNCATE);
-            modelName = modelNameBuf;
+            const int local = SafeLocalPlayerIndex();
+            if (local > 0 && entityIndex == local)
+                skipLocal = true;
         }
-        isViewmodel = ModelNameIsViewmodel(modelName);
+        // World props: skip GetModelName. Open maps call DME thousands of times
+        // per eye; the name string was the hot cost next to the draw itself.
+        isViewmodel = CachedModelIsViewmodel(pModel);
+        if (isViewmodel && m_Game && m_Game->m_ModelInfo)
+        {
+            modelName = SafeModelName(m_Game->m_ModelInfo, pModel);
+            if (modelName && modelName[0])
+            {
+                strncpy_s(modelNameBuf, modelName, _TRUNCATE);
+                modelName = modelNameBuf;
+            }
+        }
         static int s_dmeEnter;
         if (s_dmeEnter < 6)
         {
@@ -2157,15 +2194,6 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
                 (m_VR && m_VR->IsGameplayEligible()) ? 1 : 0,
                 body, skin, entityIndex, pCustomBoneToWorld ? 1 : 0);
             ++s_dmeEnter;
-        }
-        if (bmvr::g_HideLocalPlayerModel
-            && m_VR
-            && m_VR->IsGameplayEligible()
-            && !isViewmodel)
-        {
-            const int local = SafeLocalPlayerIndex();
-            if (local > 0 && entityIndex == local)
-                skipLocal = true;
         }
         hideArms = bmvr::g_HideViewmodelArms
             && isViewmodel

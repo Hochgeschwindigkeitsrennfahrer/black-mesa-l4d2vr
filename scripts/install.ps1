@@ -108,6 +108,8 @@ if (-not (Test-Path $CfgDst)) {
   if ($cfgText -notmatch '(?m)^VrHandsDebugBoxes=') { $cfgText += "`r`nVrHandsDebugBoxes=false`r`n" }
   if ($cfgText -notmatch '(?m)^VrHandHud=') { $cfgText += "`r`nVrHandHud=true`r`n" }
   if ($cfgText -notmatch '(?m)^DesktopLeftoverRender=') { $cfgText += "`r`nDesktopLeftoverRender=false`r`n" }
+  if ($cfgText -notmatch '(?m)^ForceOpenVis=') { $cfgText += "`r`nForceOpenVis=false`r`n" }
+  if ($cfgText -notmatch '(?m)^StereoBlitGpuFlush=') { $cfgText += "`r`nStereoBlitGpuFlush=false`r`n" }
   Set-Content -LiteralPath $CfgDst -Value $cfgText -Encoding ASCII -NoNewline
   Write-Host "Updated HudDistance/HudSize/ViewmodelScale/CompositorPostPresentHandoff/gloves/wrist HUD in $CfgDst"
 }
@@ -119,7 +121,7 @@ if (-not (Test-Path $CfgGame)) { throw "Missing $CfgGame" }
 $BmvrCfgSrc = Join-Path $VrSrc "bmvr.cfg"
 $BmvrCfgDst = Join-Path $CfgGame "bmvr.cfg"
 Copy-Item -Force $BmvrCfgSrc $BmvrCfgDst
-Write-Host "Installed $BmvrCfgDst (crosshair off only; no flashlight cvars)"
+Write-Host "Installed $BmvrCfgDst (vis restored, CSM low, no flashlight cvars)"
 $Autoexec = Join-Path $CfgGame "autoexec.cfg"
 if (Test-Path $Autoexec) {
   $autoText = Get-Content -LiteralPath $Autoexec -Raw

@@ -20,6 +20,14 @@ RenderScale=1.0
 # true = proper 16:9 desktop at extra cost.
 DesktopLeftoverRender=false
 
+# Stereo vis: false (default) keeps PVS + r_occlusion. true restores the old
+# r_portalsopenall + r_occlusion 0 workaround if an eye latches skybox-only.
+ForceOpenVis=false
+
+# CPU-wait GPU after the left-eye StretchRect. false (default) lets DXVK
+# pipeline the right eye. true only if both eyes show the same image.
+StereoBlitGpuFlush=false
+
 # Portal 2 VR / L4D2VR right-stick look. Degrees per ms at full deflection.
 TurnSpeed=0.25
 SnapTurning=false

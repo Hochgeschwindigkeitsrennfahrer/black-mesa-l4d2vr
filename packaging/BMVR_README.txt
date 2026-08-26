@@ -121,6 +121,8 @@ Those take effect on the next launch (config is read at DLL load).
 Also in VR\config.txt (defaults):
 
   AutoMatQueueMode=false  leave engine mat_queue_mode alone (menu still 0)
+  ForceOpenVis=false      keep PVS/occlusion (true = old whole-map vis)
+  StereoBlitGpuFlush=false  do not CPU-wait GPU between stereo eyes
   IPDScale=1.0            HeightOffset=0.0
   Haptics=true            HideCrosshair=true
   MatchHmdHz=false        (unused for fps; fps_max is 0 / uncapped)

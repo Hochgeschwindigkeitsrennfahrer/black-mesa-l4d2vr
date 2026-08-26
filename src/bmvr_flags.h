@@ -137,6 +137,12 @@ namespace bmvr
     extern bool g_VrHandsUseHevGloves;
     // false = runtime PostPresentHandoff. true = L4D2VR app handoff (default).
     extern bool g_CompositorPostPresentHandoff;
+    // Old stereo vis workaround: r_portalsopenall + r_occlusion 0. Default
+    // off — that pair draws the whole map and tanks open/complex areas.
+    extern bool g_ForceOpenVis;
+    // CPU-wait the GPU after the left-eye StretchRect. Needed only if both
+    // eyes show the same image (DXVK missed the BB copy hazard). Default off.
+    extern bool g_StereoBlitGpuFlush;
     // World-space v_ models vs world props. Applied in DrawModelExecute around
     // the controller (not m_flModelScale at entity origin). Range 0.2–1.5.
     extern float g_ViewmodelScale;

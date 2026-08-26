@@ -409,8 +409,8 @@ public:
     QAngle GetRecommendedViewmodelAbsAngle() const;
     float HorizontalFovForAspect(float targetAspect) const;
     void CaptureFrameBeforePresent();
-    bool BlitCurrentGameColorTo(IDirect3DSurface9* dst, bool flushGpu = true);
-    bool BlitHmdViewFromBackbuffer(IDirect3DSurface9* dst, bool flushGpu = true);
+    bool BlitCurrentGameColorTo(IDirect3DSurface9* dst, bool flushGpu = false);
+    bool BlitHmdViewFromBackbuffer(IDirect3DSurface9* dst, bool flushGpu = false);
     IDirect3DSurface9* ColorTargetForStereoEye(int stereoEye) const;
     void BeginStereoEyeBlit(IDirect3DSurface9* dst);
     bool EndStereoEyeBlit();

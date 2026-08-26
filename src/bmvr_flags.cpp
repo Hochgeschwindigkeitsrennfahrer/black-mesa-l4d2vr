@@ -78,6 +78,8 @@ namespace bmvr
     // stall ~110ms (~20fps). App mode is the 90fps path. First-shot PostPresentHandoff
     // hitch is separate; do not put WaitGetPoses on the RenderView thread.
     bool g_CompositorPostPresentHandoff = true;
+    bool g_ForceOpenVis = false;
+    bool g_StereoBlitGpuFlush = false;
     // Match L4D2VR weapon tables (designed for VRScale 43.2) to BM 39.37:
     // 0.91 was the 39.37/43.2 ratio; user 2026-08-25: ~25% smaller than that
     // (0.91 x 0.75 = 0.68). Crowbar forced to 1.0 in DME. Hands slightly larger.
@@ -368,6 +370,10 @@ namespace bmvr
                 g_CompositorPostPresentHandoff = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "DesktopLeftoverRender") == 0)
                 g_DesktopLeftoverRender = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ForceOpenVis") == 0)
+                g_ForceOpenVis = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "StereoBlitGpuFlush") == 0)
+                g_StereoBlitGpuFlush = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "ViewmodelScale") == 0)
             {
                 const float s = static_cast<float>(atof(val));
