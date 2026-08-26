@@ -22,6 +22,17 @@ Do not copy d3d9.dll into only one of those. Native Direct3D 9 never loads this 
 
 If you already tuned VR\config.txt, keep your copy (do not overwrite it).
 
+This zip also includes:
+
+  Black Mesa\VR\hands\          HEV glove meshes
+  Black Mesa\bms\cfg\bmvr.cfg   crosshair off / VR QoL cvars
+
+If bms\cfg\autoexec.cfg exists, add this line (once):
+
+  exec bmvr
+
+If it does not exist, create it with that single line.
+
 
 2) Steam launch options
 -----------------------
@@ -86,7 +97,8 @@ If sticks or the new pause/sprint bindings do nothing, open SteamVR Bindings for
 this app and reset the layout to the default in VR\SteamVRActionManifest.
 
 The first-person weapon follows the right controller (uncoupled viewmodel).
-HL2 v_ models are oversized in world-space VR; ViewmodelScale=0.5 is the default.
+HL2 v_ models are oversized in world-space VR; ViewmodelScale=0.68 is the default
+(~25% smaller than the L4D2VR-matched 0.91). Crowbar stays full size.
 Shooting aims with that controller; walking still follows where you look.
 If the gun sits too far forward/back, edit VR\config.txt:
 
@@ -99,7 +111,7 @@ Those take effect on the next launch (config is read at DLL load).
 
 Also in VR\config.txt (defaults):
 
-  AutoMatQueueMode=true   menu/load = single-thread, gameplay = queued
+  AutoMatQueueMode=false  leave engine mat_queue_mode alone (menu still 0)
   IPDScale=1.0            HeightOffset=0.0
   Haptics=true            HideCrosshair=true
   MatchHmdHz=true         DisableViewBob=true

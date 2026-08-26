@@ -53,6 +53,11 @@ public:
     bool m_SwitchedWeapons = false;
     // Present/DXVK must not call IMaterialSystem. Refresh only from RenderView.
     mutable std::atomic<int> m_CachedMatQueueMode{ 0 };
+    mutable int m_MatSetThreadSlot = -1;
+    mutable int m_MatGetThreadSlot = -1;
+    mutable int m_MatExecuteQueuedSlot = -1;
+    mutable int m_MatEndFrameSlot = -1;
+    mutable bool m_MatSlotsValid = false;
 
     float m_AnalogForward = 0.f;
     float m_AnalogSide = 0.f;
@@ -62,13 +67,19 @@ public:
     void* GetInterface(const char* dllname, const char* interfacename);
     C_BaseEntity* GetClientEntity(int entityIndex);
     C_BaseEntity* GetActiveWeaponEntity();
+    void ScanWristHudNetVars();
+    bool ReadWristHudValues(int& health, int& armor, int& clip, int& reserve);
     const char* GetActiveWeaponModelName();
     int CycleWeaponSelect(int direction);
     bool ClientCmd(const char* szCmdString);
     bool ClientCmd_Unrestricted(const char* szCmdString);
     int GetMatQueueMode() const;
+    void ResolveMaterialThreadSlots() const;
+    bool MaterialThreadSlotsValid() const { return m_MatSlotsValid; }
+    int EndFrameVTableSlot() const { return m_MatEndFrameSlot; }
     void ProbeMatQueueModeFromRenderView();
     bool SetMatQueueMode(int mode) const;
+    void ExecuteQueuedMaterials() const;
     bool SetConVarInt(const char* name, int value) const;
     bool SetConVarFloat(const char* name, float value) const;
     bool MaterialVTableMatchesDump() const;

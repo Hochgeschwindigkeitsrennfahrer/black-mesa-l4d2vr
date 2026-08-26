@@ -70,6 +70,13 @@ if (Test-Path $ManifestDst) {
   Remove-Item -Recurse -Force $ManifestDst
 }
 Copy-Item -Recurse -Force $ManifestSrc $ManifestDst
+$HandsSrc = Join-Path $VrSrc "hands"
+$HandsDst = Join-Path $VrDst "hands"
+if (Test-Path $HandsSrc) {
+  New-Item -ItemType Directory -Force -Path $HandsDst | Out-Null
+  Copy-Item -Force (Join-Path $HandsSrc "*.glb") $HandsDst
+  Write-Host "Installed HEV glove GLBs to $HandsDst"
+}
 $CfgSrc = Join-Path $VrSrc "config.txt"
 $CfgDst = Join-Path $VrDst "config.txt"
 if (-not (Test-Path $CfgDst)) {
@@ -80,14 +87,28 @@ if (-not (Test-Path $CfgDst)) {
   $cfgText = Get-Content -LiteralPath $CfgDst -Raw
   $cfgText = [regex]::Replace($cfgText, '(?m)^HudDistance=.*$', 'HudDistance=1.05')
   $cfgText = [regex]::Replace($cfgText, '(?m)^HudSize=.*$', 'HudSize=0.70')
-  $cfgText = [regex]::Replace($cfgText, '(?m)^ViewmodelScale=.*$', 'ViewmodelScale=1.0')
+  $cfgText = [regex]::Replace($cfgText, '(?m)^ViewmodelScale=.*$', 'ViewmodelScale=0.68')
   $cfgText = [regex]::Replace($cfgText, '(?m)^CompositorPostPresentHandoff=.*$', 'CompositorPostPresentHandoff=true')
+  $cfgText = [regex]::Replace($cfgText, '(?m)^VrHandsDebugBoxes=.*$', 'VrHandsDebugBoxes=false')
   if ($cfgText -notmatch '(?m)^HudDistance=') { $cfgText += "`r`nHudDistance=1.05`r`n" }
   if ($cfgText -notmatch '(?m)^HudSize=') { $cfgText += "`r`nHudSize=0.70`r`n" }
-  if ($cfgText -notmatch '(?m)^ViewmodelScale=') { $cfgText += "`r`nViewmodelScale=1.0`r`n" }
+  if ($cfgText -notmatch '(?m)^ViewmodelScale=') { $cfgText += "`r`nViewmodelScale=0.68`r`n" }
   if ($cfgText -notmatch '(?m)^CompositorPostPresentHandoff=') { $cfgText += "`r`nCompositorPostPresentHandoff=true`r`n" }
+  if ($cfgText -notmatch '(?m)^VrHandsGlovesEnabled=') { $cfgText += "`r`nVrHandsGlovesEnabled=true`r`n" }
+  if ($cfgText -notmatch '(?m)^VrHandsModelScale=') { $cfgText += "`r`nVrHandsModelScale=0.85`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^VrHandsModelScale=.*$', 'VrHandsModelScale=0.85')
+  if ($cfgText -notmatch '(?m)^VrHandsPoseRotationOffset=') { $cfgText += "`r`nVrHandsPoseRotationOffset=0,180,0`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^VrHandsPoseRotationOffset=.*$', 'VrHandsPoseRotationOffset=0,180,0')
+  if ($cfgText -notmatch '(?m)^VrHandsPoseOffsetMeters=') { $cfgText += "`r`nVrHandsPoseOffsetMeters=0,-0.035,0`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^VrHandsPoseOffsetMeters=.*$', 'VrHandsPoseOffsetMeters=0,-0.035,0')
+  if ($cfgText -notmatch '(?m)^AutoMatQueueMode=') { $cfgText += "`r`nAutoMatQueueMode=true`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^AutoMatQueueMode=.*$', 'AutoMatQueueMode=true')
+  if ($cfgText -notmatch '(?m)^VrHandsUseHevGloves=') { $cfgText += "`r`nVrHandsUseHevGloves=true`r`n" }
+  if ($cfgText -notmatch '(?m)^VrHandsDebugBoxes=') { $cfgText += "`r`nVrHandsDebugBoxes=false`r`n" }
+  if ($cfgText -notmatch '(?m)^VrHandHud=') { $cfgText += "`r`nVrHandHud=true`r`n" }
+  if ($cfgText -notmatch '(?m)^DesktopLeftoverRender=') { $cfgText += "`r`nDesktopLeftoverRender=false`r`n" }
   Set-Content -LiteralPath $CfgDst -Value $cfgText -Encoding ASCII -NoNewline
-  Write-Host "Updated HudDistance/HudSize/ViewmodelScale/CompositorPostPresentHandoff in $CfgDst"
+  Write-Host "Updated HudDistance/HudSize/ViewmodelScale/CompositorPostPresentHandoff/gloves/wrist HUD in $CfgDst"
 }
 Write-Host "Installed SteamVR bindings to $ManifestDst"
 Write-Host "If SteamVR still has X=Flashlight or old jump/crouch, restore BMVR defaults (v3: Y=next, X=prev, right grip=flashlight)."

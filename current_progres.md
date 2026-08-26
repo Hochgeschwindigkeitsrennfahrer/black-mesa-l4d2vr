@@ -1,4 +1,4 @@
-# Current progress (2026-08-19 late evening)
+﻿# Current progress (2026-08-21)
 
 Read this file at the start of every session. Do not rediscover items below.
 
@@ -9,87 +9,56 @@ Read this file at the start of every session. Do not rediscover items below.
 - Desktop HUD visible (do not steal `_rt_gui` destination).
 - Crosshair off via `bmvr.cfg`.
 - **FP arms hidden in HMD** — bodypart `arms` `nummeshes=0` sticky patch. User confirmed gone.
-- Independent left/right controller tracking in-game: **cyan left**, **magenta right**, each follows its own controller.
+- Independent left/right controller tracking in-game: **cyan left**, **magenta right**, each follows its own controller (debug boxes; superseded by GLB gloves below).
 - **Weapon proportions in HMD** — view-Y unstretch; upright vs flat controller matches desktop Glock shape (user-verified 2026-08-19).
-- Do **not** re-enable `steamvr_rt`, `hmd_swap`, `hmd_native`, named-RT wrap, `abs_view`, EyePosition, Y-flip, CreateMove ClientCmd, flashlight cvars.
-- Do **not** hook `engine.dll` `0xF6A20`. That is **not** `DrawModelExecute`.
-- Do **not** `FindMaterial` from DrawModelExecute.
-- Do **not** try another `MATERIAL_VAR_NO_DRAW` variation to hide FP arms.
+- **Walk jump/ghost of the gun** — user-verified 2026-08-19. Velocity bob-kill at RecvTable `+0xF8`; DME rigid bone snap + 4-slot ring; `cl_viewmodel_lag` / `r_jiggle_bones` off with `DisableViewBob`.
+- HEV gloves work in HMD. Do **not** enable `VrHandsRightUseViewmodelPose`.
 
-## Plan order (research/implementation-plan.md)
+## Why 47777b5 looked identical on desktop and HMD
 
-1. DME ABI — **done** (`engine.dll` `0x113E80`, slot 19, thiscall `ret 0xC`).
-2. Hide FP `arms` bodypart — **HMD confirmed gone**.
-3. Scale/pivot §7 — **HMD proportions user-verified 2026-08-19** (view-Y unstretch). Walk jump/ghost still open.
-4. Independent hand mesh §4 — **v1 proxy compiled** (palm + finger stubs at controller pose; not Source entities). GLB later.
-5. Native IK only if hybrid fails. Two-hand aim later. Crowbar melee polish later.
-6. Never intercept `SendWeaponAnim`.
+`47777b5` (~30–40 FPS) coupled the engine G-buffer and the HMD eyes: they were the same pixels. Multicore is not what made later builds worse on this machine: it is already off (`AutoMatQueueMode=false`, skip `mat_queue`), and L4D2VR’s own default is also queue-off. Do **not** re-enable `SetThreadMode(2)`.
 
-## §7 Weapon transform (this pass)
+The first break is the immediate child **`d24bc07`** (no commits in between). It stopped sizing FullFrame to the HMD, always crop-blit 16:9 → eyes, and skipped leftover 16:9 `RenderView`s. Later `bad197a` flashlight ImpulseCommands is **not** the original break.
 
-**Root cause of invisible/off-screen weapon (2026-08-19 HMD report):** last build used raw OpenVR tracking coords as `P0` (`~−17,−17,48`) instead of Source world space (`~130,43,72`). Log showed `Viewmodel pose p0=(−16.7,−17.0,47.6)` while `eye=(129.8,42.9,72.0)` — weapon drawn near tracking origin, off-screen.
+| Topic | `47777b5` (known-good) | `d24bc07` (first break) | This pass (restore same-buffer) |
+|---|---|---|---|
+| FullFrame | LITERAL HMD-fit (~1584×1440 in 2560×1440 HWND) | Engine 16:9 window size | LITERAL HMD-fit again (`ff_hmdfit`; **not** `ff_stereo` grow) |
+| GetScreenSize / BB dims | Report HMD-fit | Keep window size except during eye blit | HMD-fit for non-nested, non-aux (HUD inset kept) |
+| Leftover `RenderView` | Skip **same-size** duplicates only | Also skip leftover 16:9 mains | Same-size only (`windowed169` skip reverted) |
+| Eye blit | 1:1 when sizes match | Always top-left crop of 16:9 BB | 1:1 unbind when FullFrame == eyes; crop is fallback |
+| Multicore | `GetMatQueueMode` stub 0 | `AutoMatQueueMode` + `SetThreadMode(2)` | Queue **off** (already skipped; do not re-enable) |
+| Flashlight | Same stereo pair feeds desktop + HMD | Deferred apply stayed on leftover 16:9 | HMD `FlashlightState` retarget kept; apply should run in eye RV |
 
-**Fix:** `P0 = engine eye/setup + PivotYaw(controllerTracking − hmdTracking)`. Bake offsets unchanged. Same conversion as hand-proxy `toWorld()`.
+Named `leftEye0` / `steamvr_rt` / `hmd_native` / FullFrame **grow** (`ff_stereo`) stay crash-sticky. Do **not** retry those.
 
-**Prior displacement bug (before tracking-space regression):** inverted bake sign (`ox=restX` vs `ox=−restX`) pushed gun forward/left when P0 was correct.
+## Flashlight vs fused stereo (2026-08-22; do not retry)
 
-**Corrected architecture (L4D2VR §2.3 + live bake):**
+Fused stereo (1584×1440 HMD FOV + IPD + `GetProjectionRaw` UVs, G-buffers stay 2560) is the known-good HMD path. Desktop leftover 16:9 after stereo still applies flashlight on the monitor. Eyes blit **before** that leftover, so the HMD beam is missing.
 
-| Step | Implementation |
-|---|---|
-| P0 | `eye/setup + (aimCtrl − hmd)` in world space — **not** raw `m_RightControllerPosAbs` |
-| P0 | `ControllerTrackingToWorld()` = `GetViewOrigin(setup) + (ctrl−hmd)` — same frame as stereo RenderView |
-| Position offsets | **L4D2 empirical tables** (glock `20.5, 5, −2`; crowbar `19.5, 6, −13.5`). DME bake logged for diagnosis only |
-| Position | `p0 − ox·F − oy·R − oz·U` |
-| Angles | L4D2 per-weapon table (crowbar `−24.5, −6.5, −6`) |
-**Warp vs scale (2026-08-19 screenshots):** desktop (16:9 HUD pass) gun looks correct; HMD gun stretches along **view-up** as the controller turns (upright → long barrel, flat → long grip) and looks oversized vs the same crate. That is view-space aspect, not `m_flModelScale`. Pink squares on the slide are `VrHandsDebugBoxes`, not missing textures.
+Tried and rejected:
 
-**Fix:** L4D2VR CalcViewModelView (controller pose as eye + hard-lock). DME unstretch along HMD up by `eyeAspect/windowAspect` on the **eye pass only** (do not squash the desktop HUD pass). `ViewmodelScale` still 1.0 until warp is gone; then retune.
+| Attempt | Result | Retry |
+|---|---|---|
+| Overlay hide / BB-size lie during stereo | Flashlight still missing | no |
+| Stereo at 2560 16:9 + center crop + Submit 0..1 | Flashlight works; **stretched, stereo broken** | **no** |
+| `ff_hmdfit` LITERAL FullFrame 1584, GB still 2560 | White HMD (A2R10 unbind) | **no** |
+| `ff_gbfit` LITERAL FullFrame **and** `_rt_gb*` 1584 | Alloc 1584; process died on `background04` before stereo; user miss | **no** |
 
-| Scale | DME around controller when `ViewmodelScale≠1`. Default **1.0**. |
+Keep fused 1584 eyes + 2560 world RTs. Leftover 16:9 after stereo stays (desktop beam). HMD flashlight still needs a different approach — not RT resize, not 16:9 stereo.
 
-**HMD pass 2 fix (2026-08-19):** weapon was in wrong world frame (setup.origin vs GetViewOrigin); bake oy=18.54 on glock pulled gun far from controller; hand markers used wrong projection FOV.
+## Pass 2026-08-22 `fl_gbmatch` (compiled; not HMD-verified)
 
-**HMD verify:** markers on controller; glock position good enough; **warp/size in HMD still the open item.**
+Stereo `CViewSetup` stays **2560×1440** (G-buffer size) with **HMD fov/aspect/IPD**. Viewport is not clamped to 1584. Squash-blit the full 2560 BB into 1584 eyes. Leftover 16:9 still runs for the desktop. Do **not** resize RTs. If the headset stretches or fusion breaks, persist-skip `fl_gbmatch` — that is the 16:9 stereo failure mode. Log: `gbmatch=1`, `left RenderView 2560x1440`, `HMD BB blit … squash=1`, `Flashlight PushRT inside eye RV`.
 
-**Finger flex:** OpenVR skeletal summary on hand proxy — **user confirmed working**.
+## Pass 2026-08-21 same-buffer restore (compiled + installed; **not HMD-verified**)
 
-**Known:** bullet traces still spawn from engine eye + `cmd->viewangles` (no `Weapon_ShootPosition` hook yet) — may appear offset from visible gun until that hook exists.
+- Restore `47777b5` same-buffer: CreateNamedRT `_rt_FullFrameFB*` only (not `_rt_gbDepth2`/`_rt_gbNormal2` 1024 PICMIP). Sticky `ff_hmdfit`. Never grow. **2026-08-21 HMD white textures:** log showed unbind of A2R10 FullFrame (`fmt=35`) while desktop was 2560 composite; HMD-fit had also LITERAL-resized G-buffer *2 downsamples 1024→1584 (deferred albedo broken, flashlight still applied). Do not HMD-fit PICMIP/explicit-size `_rt_gb*`.
+- Leftover skip: only same-as-stereo duplicates. Unbind StretchRect is 1:1 when sizes match. `m_DesktopMirrorEnabled` stays false (A2R10 black stretch).
+- Flashlight: keep `dUpdateFlashlightState` HMD origin/forward. Log `Flashlight PushRT inside eye RV` if `_rt_gbShadowMapFlashLight` happens during an eye `RenderView`.
+- Hands: right glove **off** (`VrHandsRightEnabled=false`). Left stays on. Grip `Rz=-180`. Scales unchanged.
+- Anims: never rewrite `m_nSequence`. Freeze cycle/rate only sprint/swim/walk/run/bob/idle/fidget. Restore `playbackRate=1` on draw/holster/reload/fire/attack.
+- Melee: `|vel|>1.1` new-swing edge; 10 Rodrigues +50° about controller right; hull ±16; range 56; origin = **viewmodel abs origin**. `dTraceRay` rewrite **removed**. CreateMove viewangles stay controller. `IN_ATTACK` 120 ms. `playbackRate=0` only on hit/miss/attack labels while melee.
 
-## §4 Independent hand mesh (v1 — HMD good enough on weapon)
+Log tags to confirm: `CreateNamedRT … LITERAL` HMD-fit (not 2144 grow), no `Skip leftover … 2560x1440`, `FlashlightState -> HMD`, `Crowbar swing` without TraceRay rewrite.
 
-Parallel proxy at each controller (palm + skeletal finger stubs via `GetSkeletalSummaryData`), not Source entities. Left mirrored. Uses `ControllerTrackingToWorld()` same as gun. **Next:** port L4D2VR `VrHandSystem` + SteamVR `vr_glove_*.glb` (plan §4 step 3.2).
-
-## Compositor FPS stalls (investigation)
-
-See `docs/compositor-performance.md`. Rubber-band feel: stale background poses + runtime handoff experiment. **Fix:** L4D2VR app handoff default; synchronous `WaitGetPoses` on render thread when pose age > 16 ms.
-
-## Unresolved (document only — do not derail hands/weapons)
-
-| Issue | Status |
-|---|---|
-| Flashlight beam in HMD | **Still broken** (impulse hook remains) |
-| HUD in HMD | Still wrong |
-| Pause/menu in HMD | Still wrong |
-| SteamVR resolution → VR quality | No visible improvement |
-| Full-window 2560×1440 | Stable |
-
-## User checklist
-
-| Item | Status |
-|---|---|
-| Stereo / 6DoF / save-load / pause activation | Working. Do not rewrite. |
-| FP arms hidden | **HMD confirmed** |
-| Weapon grip on aim controller | Position **good enough**; scale default **0.55** — HMD verify proportions |
-| Finger flex on hand proxy | **Confirmed** |
-| Compositor stalls | Runtime handoff default; HMD verify smoothness |
-
-Log: `C:\Program Files (x86)\Steam\steamapps\common\Black Mesa\bmvr_log.txt`
-
-Look for: `HideViewmodelArms … arms='arms' … zeroed=7`, `Viewmodel bake bone=crowbar_new`, `Viewmodel pose p0=`, `Hand proxy eye=`, `First IN_ATTACK`, `First-shot present spike`.
-
-### Do not retry
-
-`steamvr_rt`, `hmd_swap`, `hmd_native`, named stereo wrap, stealing `_rt_gui`, `PushRT(NULL)` onto an eye, flashlight cvars, CreateMove ClientCmd, **`engine.dll` `0xF6A20` as DrawModelExecute**, **`FindMaterial` from DME**, **`MATERIAL_VAR_NO_DRAW` for FP arms**, debug-marker-only polish, `v_hands.mdl`, whole-VM `ForcedMaterialOverride`, `NativeViewmodelHandsOnly`, zeroing `mstudiobodyparts_t::nummodels`.
-
-Build: `build\Release\d3d9.dll` installed to all three paths via `scripts/install.ps1`.
+**Do not claim HMD success.** User should confirm: desktop≈HMD, flashlight in HMD, FPS vs 47777b5, no warp.

@@ -335,6 +335,11 @@ public:
     vr::VRActionHandle_t m_ActionSkeletonRight = vr::k_ulInvalidActionHandle;
     bool m_CompositorAppHandoff = false;
     uint32_t m_CompositorHandoffSlowCount = 0;
+    // Adaptive app-handoff suspension (OpenCode stutter death-spiral fix).
+    std::atomic<bool> m_HandoffSuspended{ false };
+    std::atomic<int> m_HandoffSlowRun{ 0 };
+    std::atomic<DWORD> m_HandoffResumeAtMs{ 0 };
+    std::atomic<int> m_HandoffFastFrames{ 0 };
     std::atomic<float> m_WalkForward{ 0.f };
     std::atomic<float> m_WalkSide{ 0.f };
     std::atomic<uint32_t> m_HeldButtons{ 0 };
@@ -397,10 +402,11 @@ public:
     QAngle GetRecommendedViewmodelAbsAngle() const;
     float HorizontalFovForAspect(float targetAspect) const;
     void CaptureFrameBeforePresent();
-    bool BlitCurrentGameColorTo(IDirect3DSurface9* dst);
-    bool BlitHmdViewFromBackbuffer(IDirect3DSurface9* dst);
+    bool BlitCurrentGameColorTo(IDirect3DSurface9* dst, bool flushGpu = true);
+    bool BlitHmdViewFromBackbuffer(IDirect3DSurface9* dst, bool flushGpu = true);
     void BeginStereoEyeBlit(IDirect3DSurface9* dst);
     bool EndStereoEyeBlit();
+    bool StereoUnbindMatchesEye() const;
     void CaptureGameColorOnUnbind(IDirect3DSurface9* oldRt, uint32_t vpX, uint32_t vpY, uint32_t vpW, uint32_t vpH);
     void MirrorStereoToDesktopWindow();
     void ReleaseVRRenderTargetsForDeviceReset();
@@ -417,7 +423,7 @@ public:
     bool IsQueuedHudFresh() const { return false; }
     void OnLevelInit(const char* newmap);
     void OnLevelShutdown();
-    void ApplyRenderTargetFramebufferOverride();
+    void ApplyRenderTargetFramebufferOverride(void* materialSystem = nullptr);
     void LogFullFrameSizeIfReady();
     bool IsGameplayEligible() const { return m_GameplayEligible; }
     bool HasEngineMap() const { return !m_CurrentMapName.empty(); }
@@ -456,11 +462,19 @@ public:
     void QueueGameUiToggle(bool currentlyPaused);
     void FlushPendingGameUi();
     bool GameUiVisible() const { return m_GameUiVisible; }
+    // True when the pause/GameUI overlay should exist. Extra VGui_Paint of
+    // PAINT_UIPANELS during gameplay is GameUI glass, not HEV HUD.
+    bool PauseUiActive() const;
     void NoteHudPainted() { m_HudPaintedThisFrame.store(true, std::memory_order_release); }
     bool HudPaintedThisFrame() const { return m_HudPaintedThisFrame.load(std::memory_order_acquire); }
     void UpdateCrowbarMelee();
     bool IsPerformingMelee() const { return m_PerformingMelee; }
+    bool TryGetMeleeBladeViewAngles(QAngle& out) const;
     bool TryGetMeleeTraceOrigin(Vector& origin) const;
+    // True while VR should keep fire/reload/equip sequences running.
+    bool WantsWeaponActionAnim() const;
+    void GetRightGlovePalmOffsetMeters(Vector& meters) const;
+    bool WantsRightGloveWeaponGripCurl() const;
     bool HudOverlayReady() const { return m_HudOverlayReady; }
     void EnsureHudOverlay();
     void SubmitHudOverlay();
@@ -473,6 +487,7 @@ public:
     void NoteViewmodelWeaponBake(const char* modelName, const char* boneName, float restX, float restY, float restZ);
     vr::ETrackedControllerRole AimControllerRole() const;
     void DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye);
+    void DrawIndependentHandsOnDesktop();
     bool GetFingerCurls(vr::VRActionHandle_t skeletonAction, float outCurls[5]) const;
     void TryCompositorPostPresentHandoff(DWORD nowMs, DWORD poseAgeMs);
 
@@ -500,8 +515,13 @@ private:
     void ApplyVrQualityOfLifeCvars();
     void PulseAimHaptic(unsigned short durationUs = 2500);
     void ResolveWeaponViewmodelPose(float& ox, float& oy, float& oz, float& ax, float& ay, float& az) const;
+    void DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
+        bool leftOk, const Vector& leftWrist, bool rightOk, const Vector& rightWrist,
+        const Vector& eyeOrig, const Vector& fwd, const Vector& right, const Vector& up);
     void RefreshActiveWeaponModel();
     void ApplyViewmodelBasisOffsets();
+    void ApplyTwoHandShotgunAim();
+    bool m_TwoHandShotgunActive = false;
     int m_AutoMatQueueModeLastRequested = -999;
     std::chrono::steady_clock::time_point m_AutoMatQueueModeLastCmdTime{};
     bool m_VrCvarsApplied = false;
@@ -533,6 +553,10 @@ private:
     bool m_MeleeNewSwing = true;
     void* m_MeleeHitEntity = nullptr;
     Vector m_MeleeTraceOrigin{};
+    QAngle m_MeleeBladeAngles{};
+    bool m_MeleeBladeAnglesValid = false;
+    DWORD m_WeaponActionAnimUntilMs = 0;
+    int m_LatchedViewmodelIdleSeq = -1;
     bool m_CrouchToggled = false;
     bool m_HudOverlayReady = false;
     bool m_HudOverlayCreateAttempted = false;
@@ -542,4 +566,5 @@ private:
     int m_StereoEyeBlitRank = 0;
     uint32_t m_LastStereoBlitWidth = 0;
     uint32_t m_LastStereoBlitHeight = 0;
+    bool m_LastEyeBlitWasWindowCrop = false;
 };

@@ -32,8 +32,11 @@ set(BMVR_SOURCES
   src/game.cpp
   src/hooks.cpp
   src/vr.cpp
+  src/vr_hands.cpp
+  src/vr_hand_renderer_d3d9.cpp
   src/bmvr_flags.cpp
   src/sdk/checksum_crc.cpp
+  third_party/l4d2vr/L4D2VR/vr_hands/vr_hand_asset_loader.cpp
   third_party/minhook/src/buffer.c
   third_party/minhook/src/hook.c
   third_party/minhook/src/trampoline.c
@@ -62,11 +65,15 @@ target_include_directories(d3d9 PRIVATE
   "${ROOT}/src"
   "${ROOT}/src/sdk"
   "${ROOT}/L4D2VR"
+  "${ROOT}/third_party/l4d2vr/L4D2VR/vr_hands"
+  "${ROOT}/third_party/l4d2vr/thirdparty/cgltf"
   "${DXVK}"
   "${DXVK}/include"
   "${DXVK}/include/vulkan/include"
   "${DXVK}/include/spirv/include"
   "${DXVK}/include/shaders"
+  "${DXVK}/src"
+  "${DXVK}/src/dxvk"
   "${DXVK}/src/d3d9"
   "${DXVK}/src/d3d9/shaders"
   "${DXVK}/subprojects/libdisplay-info"
@@ -98,11 +105,13 @@ target_link_directories(d3d9 PRIVATE
 target_link_libraries(d3d9 PRIVATE
   openvr_api
   vulkan-1
+  synchronization
   setupapi
   psapi
   winmm
   shell32
   ole32
+  windowscodecs
   gdi32
   user32
   advapi32

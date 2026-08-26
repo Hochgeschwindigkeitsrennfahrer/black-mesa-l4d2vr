@@ -43,6 +43,18 @@ $VrDst = Join-Path $Stage "VR"
 New-Item -ItemType Directory -Force -Path $VrDst | Out-Null
 Copy-Item -Force (Join-Path $VrSrc "config.txt") (Join-Path $VrDst "config.txt")
 Copy-Item -Recurse -Force (Join-Path $VrSrc "SteamVRActionManifest") (Join-Path $VrDst "SteamVRActionManifest")
+$HandsSrc = Join-Path $VrSrc "hands"
+if (Test-Path $HandsSrc) {
+  $HandsDst = Join-Path $VrDst "hands"
+  New-Item -ItemType Directory -Force -Path $HandsDst | Out-Null
+  Copy-Item -Force (Join-Path $HandsSrc "*.glb") $HandsDst
+}
+$BmvrCfgSrc = Join-Path $VrSrc "bmvr.cfg"
+if (Test-Path $BmvrCfgSrc) {
+  $CfgGame = Join-Path $Stage "bms\cfg"
+  New-Item -ItemType Directory -Force -Path $CfgGame | Out-Null
+  Copy-Item -Force $BmvrCfgSrc (Join-Path $CfgGame "bmvr.cfg")
+}
 
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [System.IO.Compression.ZipFile]::CreateFromDirectory($Stage, $Zip, [System.IO.Compression.CompressionLevel]::Optimal, $true)

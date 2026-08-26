@@ -17,6 +17,8 @@ struct IDirect3DTexture9;
 enum class VrHandDrawPass
 {
     WorldDepth,
+    // Desktop backbuffer: no matching eye depth. Draw on top of the 16:9 view.
+    OverlayNoDepth,
     WorldVisibilityMask,
     ViewmodelComposite,
     // Standalone magazine anchored to Source viewmodel bones. It uses the
@@ -42,6 +44,14 @@ public:
         const VrHandMatrix4& worldViewProjection,
         VrHandDrawPass drawPass,
         float sceneLightScale,
+        std::string& outError);
+
+    // Upload VB/IB/texture before the eye RT is bound. D3D9Ex rejects
+    // D3DPOOL_MANAGED, so this must use DEFAULT-pool resources.
+    bool EnsureHandMesh(
+        IDirect3DDevice9* device,
+        int handIndex,
+        const VrHandMeshAsset& asset,
         std::string& outError);
 
     bool ClearViewmodelOcclusionStencil(IDirect3DDevice9* device, std::string& outError);

@@ -4,6 +4,7 @@
 #include "vector.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace VrHandMath

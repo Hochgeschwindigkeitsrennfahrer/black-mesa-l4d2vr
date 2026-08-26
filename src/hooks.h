@@ -65,6 +65,7 @@ typedef float(__thiscall* tGetViewModelFOV)(void* thisptr);
 typedef void(__thiscall* tEndFrame)(void* thisptr);
 typedef void(__thiscall* tTraceRay)(void* thisptr, const Ray_t& ray, unsigned int fMask, CTraceFilter* filter, CGameTrace* pTrace);
 typedef void(__thiscall* tImpulseCommands)(void* thisptr);
+typedef void(__thiscall* tUpdateFlashlightState)(void* thisptr, void* flashlightState);
 
 class Hooks
 {
@@ -92,6 +93,7 @@ public:
     static inline Hook<tEndFrame> hkEndFrame;
     static inline Hook<tTraceRay> hkTraceRay;
     static inline Hook<tImpulseCommands> hkImpulseCommands;
+    static inline Hook<tUpdateFlashlightState> hkUpdateFlashlightState;
 
     Hooks() = default;
     explicit Hooks(Game* game);
@@ -119,6 +121,8 @@ public:
     static void __fastcall dEndFrame(void* ecx, void* edx);
     static void __fastcall dTraceRay(void* ecx, void* edx, const Ray_t& ray, unsigned int fMask, CTraceFilter* filter, CGameTrace* pTrace);
     static void __fastcall dImpulseCommands(void* ecx, void* edx);
+    static void __fastcall dUpdateFlashlightState(void* ecx, void* edx, void* flashlightState);
     static void EnsureServerFlashlightHook();
+    static void EnsureClientFlashlightHook();
     static void RestoreViewmodelArmHides();
 };

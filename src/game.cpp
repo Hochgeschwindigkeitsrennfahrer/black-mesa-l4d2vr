@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <initializer_list>
 #include <cstdarg>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -107,20 +108,31 @@ Game::Game()
     // Do not bind ISurface until IsCursorVisible's vtable slot is verified on BM.
     // DXVK Present helpers call it when m_VguiSurface is non-null.
     m_VguiSurface = nullptr;
-    m_Cvar = GetInterfaceAny("vstdlib.dll", { "VEngineCvar007", "VEngineCvar004", "VEngineCvar002" });
+    // BM vstdlib only exports VEngineCvar004 (not 007). 007 FindVar slots
+    // were what the 2026-08-18 probe called into until load hung.
+    m_Cvar = GetInterfaceSafe("vstdlib.dll", "VEngineCvar004");
+    const char* cvarIface = m_Cvar ? "VEngineCvar004" : nullptr;
     if (!m_Cvar)
-        m_Cvar = GetInterfaceAny("engine.dll", { "VEngineCvar007", "VEngineCvar004" });
+    {
+        m_Cvar = GetInterfaceSafe("vstdlib.dll", "VEngineCvar007");
+        cvarIface = m_Cvar ? "VEngineCvar007" : nullptr;
+    }
+    if (!m_Cvar)
+        m_Cvar = GetInterfaceAny("engine.dll", { "VEngineCvar004", "VEngineCvar007" });
 
-    Game::logMsg("Interfaces: engine=%p matsys=%p clientent=%p icvar=%p",
-        m_EngineClient, m_MaterialSystem, m_ClientEntityList, m_Cvar);
+    Game::logMsg("Interfaces: engine=%p matsys=%p clientent=%p icvar=%p %s",
+        m_EngineClient, m_MaterialSystem, m_ClientEntityList, m_Cvar,
+        cvarIface ? cvarIface : "none");
     Game::logMsg("IEngineClient vtbl ClientCmd7=%p slot107=%p slot108=%p",
         SehVtableSlot(m_EngineClient, 7),
         SehVtableSlot(m_EngineClient, 107),
         SehVtableSlot(m_EngineClient, 108));
 
     m_Offsets = new Offsets();
+    ResolveMaterialThreadSlots();
     m_VR = new VR(this);
     m_Hooks = new Hooks(this);
+    ScanWristHudNetVars();
 
     // Install D3D Present/SetRT hooks from this thread, not from inside Present.
     auto tryInstallD3DHooks = [this]() {
@@ -216,6 +228,176 @@ const char* Game::GetActiveWeaponModelName()
     if (!model)
         return nullptr;
     return m_ModelInfo->GetModelName(model);
+}
+
+// Wrist HUD netvars.
+// BM RecvProp in client.dll .data is { char* name; int offset; } at +0/+4
+// (not Source 2013's offset-at-+44). Only trust that +4 dword — scanning
+// +8..+56 picked C_PlayerResource junk (m_iHealth "136" / 0x88 → HUD stuck
+// at 01, which was m_nModelIndex-adjacent). m_ArmorValue has no RecvProp;
+// datamap is `push offset; push "m_ArmorValue"`: C_BasePlayer 0x134C (stale)
+// and C_BlackMesaPlayer 0x17C0 (live HEV).
+namespace
+{
+    int g_nvHealth = -1;
+    int g_nvArmor = -1;
+    int g_nvClip1 = -1;
+    int g_nvAmmoBase = -1;
+    int g_nvPrimaryAmmoType = -1;
+    bool g_nvScanned = false;
+
+    const char* FindStringInImage(const unsigned char* base, size_t size, const char* s)
+    {
+        const size_t len = strlen(s);
+        for (size_t i = 0; i + len < size; ++i)
+        {
+            if (base[i] == static_cast<unsigned char>(s[0]) && memcmp(base + i, s, len) == 0
+                && base[i + len] == 0)
+                return reinterpret_cast<const char*>(base + i);
+        }
+        return nullptr;
+    }
+
+    // RecvProp offset at +4 from a pointer to the property-name string.
+    int FindRecvPropOffsetPlus4(const unsigned char* base, size_t size, const char* propName,
+        int minOff, int maxOff)
+    {
+        const char* s = FindStringInImage(base, size, propName);
+        if (!s)
+        {
+            Game::logMsg("WristHUD RecvProp '%s': string not found", propName);
+            return -1;
+        }
+        const uintptr_t nameVA = reinterpret_cast<uintptr_t>(s);
+        int best = -1;
+        int hits = 0;
+        int plus4Hits = 0;
+        for (size_t i = 0; i + 8 < size; i += 4)
+        {
+            uintptr_t v = 0;
+            memcpy(&v, base + i, sizeof(v));
+            if (v != nameVA)
+                continue;
+            ++hits;
+            int val = 0;
+            memcpy(&val, base + i + 4, sizeof(val));
+            if (val < minOff || val > maxOff || (val & 3) != 0)
+                continue;
+            ++plus4Hits;
+            if (best < 0 || val < best)
+                best = val;
+        }
+        Game::logMsg("WristHUD RecvProp '%s': hits=%d plus4=%d offset=%d (range %d..%d)",
+            propName, hits, plus4Hits, best, minOff, maxOff);
+        return best;
+    }
+
+    // Datamap DEFINE_FIELD: 68 <offset>  68 <nameVA>. Prefer the largest
+    // offset in range (derived class shadows the HL2 base field).
+    int FindDatamapFieldOffset(const unsigned char* base, size_t size, const char* propName,
+        int minOff, int maxOff)
+    {
+        const char* s = FindStringInImage(base, size, propName);
+        if (!s)
+        {
+            Game::logMsg("WristHUD datamap '%s': string not found", propName);
+            return -1;
+        }
+        const uintptr_t nameVA = reinterpret_cast<uintptr_t>(s);
+        int best = -1;
+        int hits = 0;
+        for (size_t i = 5; i + 4 < size; i += 1)
+        {
+            uintptr_t v = 0;
+            memcpy(&v, base + i, sizeof(v));
+            if (v != nameVA)
+                continue;
+            if (base[i - 5] != 0x68)
+                continue;
+            int val = 0;
+            memcpy(&val, base + i - 4, sizeof(val));
+            ++hits;
+            if (val < minOff || val > maxOff || (val & 3) != 0)
+                continue;
+            if (best < 0 || val > best)
+                best = val;
+        }
+        Game::logMsg("WristHUD datamap '%s': hits=%d offset=%d (range %d..%d)",
+            propName, hits, best, minOff, maxOff);
+        return best;
+    }
+}
+
+void Game::ScanWristHudNetVars()
+{
+    if (g_nvScanned)
+        return;
+    g_nvScanned = true;
+    HMODULE mod = GetModuleHandleA("client.dll");
+    if (!mod)
+        return;
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(mod);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE)
+        return;
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+        reinterpret_cast<const unsigned char*>(mod) + dos->e_lfanew);
+    const size_t imgSize = nt->OptionalHeader.SizeOfImage;
+    const auto* base = reinterpret_cast<const unsigned char*>(mod);
+    // C_BaseEntity RecvProp + datamap m_iHealth = 0x98 (m_lifeState at 0x97).
+    // Do not take C_PlayerResource m_iHealth[MAX_PLAYERS] at 0x994.
+    g_nvHealth = FindRecvPropOffsetPlus4(base, imgSize, "m_iHealth", 0x80, 0x200);
+    if (g_nvHealth < 0)
+        g_nvHealth = 0x98;
+    // Live HEV is C_BlackMesaPlayer::m_ArmorValue 0x17C0, not C_BasePlayer 0x134C.
+    g_nvArmor = FindDatamapFieldOffset(base, imgSize, "m_ArmorValue", 0x1000, 0x4000);
+    if (g_nvArmor < 0)
+        g_nvArmor = 0x17C0;
+    g_nvClip1 = FindRecvPropOffsetPlus4(base, imgSize, "m_iClip1", 0x800, 0x3000);
+    g_nvAmmoBase = FindRecvPropOffsetPlus4(base, imgSize, "m_iAmmo", 0x800, 0x3000);
+    g_nvPrimaryAmmoType = FindRecvPropOffsetPlus4(base, imgSize, "m_iPrimaryAmmoType", 0x400, 0x3000);
+    Game::logMsg("Wrist HUD netvars health=%d armor=%d clip1=%d ammo=%d primType=%d",
+        g_nvHealth, g_nvArmor, g_nvClip1, g_nvAmmoBase, g_nvPrimaryAmmoType);
+}
+
+bool Game::ReadWristHudValues(int& health, int& armor, int& clip, int& reserve)
+{
+    ScanWristHudNetVars();
+    health = armor = clip = reserve = -1;
+    if (!m_EngineClient || !m_ClientEntityList)
+        return false;
+    const int local = m_EngineClient->GetLocalPlayer();
+    if (local <= 0)
+        return false;
+    void* player = m_ClientEntityList->GetClientEntity(local);
+    if (!player)
+        return false;
+    auto rdInt = [](void* ent, int off) -> int {
+        if (!ent || off < 0)
+            return -1;
+        __try
+        {
+            return *reinterpret_cast<volatile int*>(reinterpret_cast<unsigned char*>(ent) + off);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return -1;
+        }
+    };
+    health = rdInt(player, g_nvHealth);
+    armor = rdInt(player, g_nvArmor);
+    void* weapon = GetActiveWeaponEntity();
+    clip = rdInt(weapon, g_nvClip1);
+    const int ammoType = rdInt(weapon, g_nvPrimaryAmmoType);
+    if (player && g_nvAmmoBase >= 0 && ammoType >= 0 && ammoType < 32)
+        reserve = rdInt(player, g_nvAmmoBase + 4 * ammoType);
+    static int s_hudLog;
+    if (s_hudLog < 4)
+    {
+        Game::logMsg("WristHUD values health=%d armor=%d clip=%d reserve=%d (off h=%d a=%d)",
+            health, armor, clip, reserve, g_nvHealth, g_nvArmor);
+        ++s_hudLog;
+    }
+    return true;
 }
 
 int Game::CycleWeaponSelect(int direction)
@@ -321,6 +503,88 @@ bool Game::ClientCmd_Unrestricted(const char* szCmdString)
     return ok;
 }
 
+void Game::ResolveMaterialThreadSlots() const
+{
+    m_MatSetThreadSlot = -1;
+    m_MatGetThreadSlot = -1;
+    m_MatExecuteQueuedSlot = -1;
+    m_MatEndFrameSlot = -1;
+    m_MatSlotsValid = false;
+
+    if (!m_MaterialSystem)
+    {
+        logMsg("IMaterialSystem thread slots: no MaterialSystem");
+        return;
+    }
+
+    void** vtbl = nullptr;
+    __try
+    {
+        vtbl = *reinterpret_cast<void***>(m_MaterialSystem);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        vtbl = nullptr;
+    }
+    if (!vtbl)
+    {
+        logMsg("IMaterialSystem thread slots: no vtable");
+        return;
+    }
+
+    uintptr_t gbdAddr = 0;
+    if (m_Offsets && m_Offsets->GetBackBufferDimensions.valid)
+        gbdAddr = static_cast<uintptr_t>(m_Offsets->GetBackBufferDimensions.address);
+    if (!gbdAddr)
+    {
+        HMODULE mat = GetModuleHandleA("materialsystem.dll");
+        if (!mat)
+            mat = GetModuleHandleA("MaterialSystem.dll");
+        if (mat)
+            gbdAddr = reinterpret_cast<uintptr_t>(mat) + 0x52d20;
+    }
+    if (!gbdAddr)
+    {
+        logMsg("IMaterialSystem thread slots: no GetBackBufferDimensions address");
+        return;
+    }
+
+    const void* gbd = reinterpret_cast<void*>(gbdAddr);
+    int gbdSlot = -1;
+    __try
+    {
+        for (int i = 0; i < 96; ++i)
+        {
+            if (vtbl[i] == gbd)
+            {
+                gbdSlot = i;
+                break;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        gbdSlot = -1;
+    }
+    if (gbdSlot < 0)
+    {
+        logMsg("IMaterialSystem GBD %p not in vtbl[0..95]; skip Get/SetThreadMode and EndFrame", gbd);
+        return;
+    }
+
+    const int delta = gbdSlot - Offsets::kDumpGetBackBufferDimensionsVt;
+    m_MatSetThreadSlot = Offsets::kDumpSetThreadModeVt + delta;
+    m_MatGetThreadSlot = Offsets::kDumpGetThreadModeVt + delta;
+    m_MatExecuteQueuedSlot = Offsets::kDumpExecuteQueuedVt + delta;
+    m_MatEndFrameSlot = Offsets::kDumpEndFrameVt + delta;
+    m_MatSlotsValid = (m_MatSetThreadSlot >= 0 && m_MatGetThreadSlot >= 0
+        && m_MatExecuteQueuedSlot >= 0 && vtbl[m_MatSetThreadSlot]
+        && vtbl[m_MatGetThreadSlot] && vtbl[m_MatExecuteQueuedSlot]);
+    logMsg("IMaterialSystem vtable GBD slot=%d delta=%d SetThreadMode=%d GetThreadMode=%d ExecuteQueued=%d EndFrame=%d valid=%d",
+        gbdSlot, delta, m_MatSetThreadSlot, m_MatGetThreadSlot,
+        m_MatExecuteQueuedSlot, m_MatEndFrameSlot, m_MatSlotsValid ? 1 : 0);
+}
+
 int Game::GetMatQueueMode() const
 {
     // Cache only. DXVK Present calls this with the device lock held
@@ -331,7 +595,7 @@ int Game::GetMatQueueMode() const
 
 void Game::ProbeMatQueueModeFromRenderView()
 {
-    if (!bmvr::TryMatQueue() || !m_MaterialSystem
+    if (!bmvr::TryMatQueue() || !m_MaterialSystem || !m_MatSlotsValid
         || !m_VR || !m_VR->IsGameplayEligible()
         || !m_EngineClient || !m_EngineClient->IsInGame()
         || !m_VR->PassThroughWarmupDone())
@@ -339,26 +603,10 @@ void Game::ProbeMatQueueModeFromRenderView()
         m_CachedMatQueueMode.store(0, std::memory_order_release);
         return;
     }
-    int mode = 0;
-    __try
-    {
-        void** vtbl = *reinterpret_cast<void***>(m_MaterialSystem);
-        if (!vtbl || !vtbl[11])
-        {
-            m_CachedMatQueueMode.store(0, std::memory_order_release);
-            return;
-        }
-        using tGetThreadMode = int(__thiscall*)(IMaterialSystem*);
-        mode = reinterpret_cast<tGetThreadMode>(vtbl[11])(m_MaterialSystem);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        m_CachedMatQueueMode.store(0, std::memory_order_release);
-        return;
-    }
-    if (mode < 0 || mode > 2)
-        mode = 0;
-    m_CachedMatQueueMode.store(mode, std::memory_order_release);
+    // Do not call GetThreadMode here. GBD is dump slot 30 so slot 11 is the
+    // real GetThreadMode, but the first stereo RenderView probe stalled
+    // ~9s/frame (2026-08-26). Present must not call it either (device lock,
+    // 2026-08-18). Trust SetThreadMode + cache.
 }
 
 bool Game::MaterialVTableMatchesDump() const
@@ -380,7 +628,7 @@ bool Game::MaterialVTableMatchesDump() const
 
 bool Game::SetMatQueueMode(int mode) const
 {
-    if (!m_MaterialSystem || mode < 0 || mode > 2)
+    if (!m_MaterialSystem || mode < 0 || mode > 2 || !m_MatSlotsValid)
         return false;
     if (!m_VR || !m_VR->IsGameplayEligible())
         return false;
@@ -391,86 +639,244 @@ bool Game::SetMatQueueMode(int mode) const
     __try
     {
         void** vtbl = *reinterpret_cast<void***>(m_MaterialSystem);
-        if (!vtbl || !vtbl[10])
+        if (!vtbl || m_MatSetThreadSlot < 0 || !vtbl[m_MatSetThreadSlot])
             return false;
         using tSetThreadMode = void(__thiscall*)(IMaterialSystem*, int, int);
-        reinterpret_cast<tSetThreadMode>(vtbl[10])(m_MaterialSystem, mode, -1);
+        reinterpret_cast<tSetThreadMode>(vtbl[m_MatSetThreadSlot])(m_MaterialSystem, mode, -1);
     }
     __except (EXCEPTION_EXECUTE_HANDLER)
     {
         return false;
     }
-    SetConVarInt("mat_queue_mode", mode);
+    m_CachedMatQueueMode.store(mode, std::memory_order_release);
+    const bool cvarOk = SetConVarInt("mat_queue_mode", mode);
+    static int s_cvarLog;
+    if (s_cvarLog < 8)
+    {
+        logMsg("mat_queue_mode cvar write %d ok=%d (console reads this; SetThreadMode is separate)",
+            mode, cvarOk ? 1 : 0);
+        ++s_cvarLog;
+    }
     return true;
+}
+
+void Game::ExecuteQueuedMaterials() const
+{
+    if (!m_MaterialSystem)
+        return;
+    if (!m_MatSlotsValid || m_CachedMatQueueMode.load(std::memory_order_acquire) == 0)
+        return;
+    bool ran = false;
+    __try
+    {
+        void** vtbl = *reinterpret_cast<void***>(m_MaterialSystem);
+        if (vtbl && m_MatExecuteQueuedSlot >= 0 && vtbl[m_MatExecuteQueuedSlot])
+        {
+            using tExecuteQueued = void(__thiscall*)(IMaterialSystem*);
+            reinterpret_cast<tExecuteQueued>(vtbl[m_MatExecuteQueuedSlot])(m_MaterialSystem);
+            ran = true;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        ran = false;
+    }
+    static int s_eqLog;
+    if (ran && s_eqLog < 4)
+    {
+        logMsg("ExecuteQueued after stereo eye (cachedMode=%d)",
+            m_CachedMatQueueMode.load(std::memory_order_acquire));
+        ++s_eqLog;
+    }
 }
 
 namespace
 {
+    const char* SehCStringAt(void* obj, int offset)
+    {
+        const char* s = nullptr;
+        __try
+        {
+            s = *reinterpret_cast<const char**>(reinterpret_cast<uint8_t*>(obj) + offset);
+            if (s && s[0] == '\0')
+                s = nullptr;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            s = nullptr;
+        }
+        return s;
+    }
+
+    const char* ConVarGetName(void* cvar, int& nameSlot)
+    {
+        nameSlot = -1;
+        if (!cvar)
+            return nullptr;
+        void** vt = nullptr;
+        __try { vt = *reinterpret_cast<void***>(cvar); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+        if (!vt)
+            return nullptr;
+        // 2007 ConCommandBase::GetName is slot 4; 2013 is slot 6.
+        const int slots[] = { 4, 6 };
+        for (int slot : slots)
+        {
+            const char* n = nullptr;
+            __try
+            {
+                if (!vt[slot])
+                    continue;
+                using tGetName = const char*(__thiscall*)(void*);
+                n = reinterpret_cast<tGetName>(vt[slot])(cvar);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                n = nullptr;
+            }
+            if (n && n[0])
+            {
+                nameSlot = slot;
+                return n;
+            }
+        }
+        for (int off : { 0x0C, 0x10, 0x14 })
+        {
+            if (const char* n = SehCStringAt(cvar, off))
+            {
+                nameSlot = -off;
+                return n;
+            }
+        }
+        return nullptr;
+    }
+
+    bool ConVarNameIs(void* cvar, const char* name)
+    {
+        int slot = -1;
+        const char* got = ConVarGetName(cvar, slot);
+        return got && name && std::strcmp(got, name) == 0;
+    }
+
+    void* FindConVarAtSlot(void* icvar, const char* name, int slot)
+    {
+        if (!icvar || !name || slot < 0)
+            return nullptr;
+        void* found = nullptr;
+        __try
+        {
+            void** vt = *reinterpret_cast<void***>(icvar);
+            if (!vt || !vt[slot])
+                return nullptr;
+            using tFindVar = void*(__thiscall*)(void*, const char*);
+            found = reinterpret_cast<tFindVar>(vt[slot])(icvar, name);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            found = nullptr;
+        }
+        if (found && !ConVarNameIs(found, name))
+            return nullptr;
+        return found;
+    }
+
     void* FindConVarProbe(void* icvar, const char* name)
     {
-        (void)icvar;
-        (void)name;
-        // 2026-08-18: calling ICvar vtbl[8..22] as FindVar then ConVar
-        // vtbl[7..14] as SetValue ran just before load-to-menu stuck in
-        // nested stdshader_dx9 / DXVK SetRenderTarget. Do not probe slots
-        // until the BM ICvar FindVar index is confirmed in Ghidra.
-        return nullptr;
+        if (!icvar || !name)
+            return nullptr;
+        static void* s_icvar;
+        static char s_name[64];
+        static void* s_found;
+        static int s_slot = -1;
+        if (s_icvar == icvar && s_found && std::strcmp(s_name, name) == 0)
+            return s_found;
+        // VEngineCvar004 (BM): IAppSystem 0-4, Register 5, GetCommandLineValue 6,
+        // FindCommandBase 7/8, FindVar 9. Slot 12 is FindVar if IAppSystem has
+        // the extra 3 methods. Never scan a range (2026-08-18 hang).
+        const int slots[] = { 9, 12 };
+        void* found = nullptr;
+        int used = -1;
+        for (int slot : slots)
+        {
+            found = FindConVarAtSlot(icvar, name, slot);
+            if (found)
+            {
+                used = slot;
+                break;
+            }
+        }
+        static int s_log;
+        if (s_log < 8)
+        {
+            int nameSlot = -1;
+            const char* got = found ? ConVarGetName(found, nameSlot) : "";
+            Game::logMsg("ICvar FindVar '%s' slot=%d ptr=%p name='%s' nameSlot=%d",
+                name, used, found, got ? got : "", nameSlot);
+            ++s_log;
+        }
+        if (!found)
+            return nullptr;
+        s_icvar = icvar;
+        std::strncpy(s_name, name, sizeof(s_name) - 1);
+        s_found = found;
+        s_slot = used;
+        (void)s_slot;
+        return found;
     }
 
     bool ConVarSetInt(void* cvar, int value)
     {
         if (!cvar)
             return false;
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%d", value);
+        int nameSlot = -1;
+        if (!ConVarGetName(cvar, nameSlot) || nameSlot < 0)
+            return false;
         void** vt = nullptr;
         __try { vt = *reinterpret_cast<void***>(cvar); }
         __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
         if (!vt)
             return false;
-        for (int slot = 7; slot <= 14; ++slot)
+        // GetName 4 → SetValue(int) 12; GetName 6 → SetValue(int) 14.
+        const int setSlot = nameSlot + 8;
+        __try
         {
-            __try
-            {
-                using tSetStr = void(__thiscall*)(void*, const char*);
-                if (!vt[slot])
-                    continue;
-                reinterpret_cast<tSetStr>(vt[slot])(cvar, buf);
-                return true;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-            }
+            if (!vt[setSlot])
+                return false;
+            using tSetInt = void(__thiscall*)(void*, int);
+            reinterpret_cast<tSetInt>(vt[setSlot])(cvar, value);
+            return true;
         }
-        return false;
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
     }
 
     bool ConVarSetFloat(void* cvar, float value)
     {
         if (!cvar)
             return false;
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%.9g", static_cast<double>(value));
+        int nameSlot = -1;
+        if (!ConVarGetName(cvar, nameSlot) || nameSlot < 0)
+            return false;
         void** vt = nullptr;
         __try { vt = *reinterpret_cast<void***>(cvar); }
         __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
         if (!vt)
             return false;
-        for (int slot = 7; slot <= 14; ++slot)
+        const int setSlot = nameSlot + 7;
+        __try
         {
-            __try
-            {
-                using tSetStr = void(__thiscall*)(void*, const char*);
-                if (!vt[slot])
-                    continue;
-                reinterpret_cast<tSetStr>(vt[slot])(cvar, buf);
-                return true;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER)
-            {
-            }
+            if (!vt[setSlot])
+                return false;
+            using tSetFloat = void(__thiscall*)(void*, float);
+            reinterpret_cast<tSetFloat>(vt[setSlot])(cvar, value);
+            return true;
         }
-        return false;
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
     }
 }
 

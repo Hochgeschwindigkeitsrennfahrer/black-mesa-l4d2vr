@@ -278,6 +278,10 @@ User-verified the next day: fusion only at arm's length, world giant, camera abo
 - Viewmodel used `controller - hmdZero` on the engine eye input, which after recenter put the gun at the player's feet. L4D2VR 1:1 is camera + `(controller - current HMD)`. Same here, with a 80hu reach clamp (Portal 2 prototype).
 - `steamvr_rt` (SteamVR recommended 3296×3216 private eyes + `SetRenderTarget`/`SetDepthStencil` redirect, skip backbuffer blit) is **verified black**. Process stayed at ~90 FPS, audio played, Escape menu drew, world was pitch black on desktop and HMD. Engine G-buffers stayed 2560×1440; `redirected=1` stole the composite off the window backbuffer. Persist-skip `steamvr_rt`. Eyes stay the window-fit HMD-aspect blit (~1584×1440). Do not retry an eye RT larger than the HWND until there is a real offscreen G-buffer path.
 
+## Verified fail: `ff_gbfit` (2026-08-22)
+
+LITERAL `_rt_FullFrameFB*` and `_rt_gb*` at 1584×1440 (PICMIP 1024 downsamples left alone). Alloc logged `actual 1584x1440`. Process died on `background04` before any stereo pair (`BeginRisky` still set). User: miss. Persist-skip `ff_gbfit`. Same class of failure as `ff_hmdfit` (do not resize world RTs to eye size). Also do not retry 16:9 stereo at 2560 — flashlight returned but fusion/stretch broke.
+
 ## Multicore / QoL / motion polish (compiled 2026-08-18, not user-verified)
 
 Overnight port of the L4D2VR `main2` multicore **subset** plus remaining safe QoL. Do not treat as headset-verified.

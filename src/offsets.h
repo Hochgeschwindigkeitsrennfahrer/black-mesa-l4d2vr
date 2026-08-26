@@ -151,6 +151,16 @@ public:
     // Hooked lazily once server.dll is loaded (not at Offset() time).
     static constexpr int kCBasePlayer_ImpulseCommands = 0x22DD40;
 
+    // L4D2 IMaterialSystem dump slots. BM is +7 (FindTexture 77→84,
+    // GetRenderContext 96→103). Runtime ResolveMaterialThreadSlots confirms
+    // by locating GetBackBufferDimensions in the live vtable.
+    static constexpr int kDumpSetThreadModeVt = 10;
+    static constexpr int kDumpGetThreadModeVt = 11;
+    static constexpr int kDumpExecuteQueuedVt = 13;
+    static constexpr int kDumpGetBackBufferDimensionsVt = 30;
+    static constexpr int kDumpEndFrameVt = 37;
+    static constexpr int kIMaterialSystemVTableShift = 7;
+
     // IMaterialSystem vtable (Ghidra materialsystem.dll, GetRenderContext slot 103).
     static constexpr int kIMaterialSystem_FindTextureVt = 84; // +0x150
     // Dump slot 71 + 7 (same shift as FindTexture 77→84 / GetRenderContext 96→103).
@@ -163,6 +173,10 @@ public:
     static constexpr int kCBasePlayer_FlashlightIsOnVt = 0x5D4 / 4;
     static constexpr int kCBasePlayer_FlashlightTurnOnVt = 0x5D8 / 4;
     static constexpr int kCBasePlayer_FlashlightTurnOffVt = 0x5DC / 4;
+
+    // client.dll CClientShadowMgr::UpdateFlashlightState (research/resolution-hud-flashlight.md).
+    // FlashlightState_t: origin float[0..2], forward float[3..5], fov float[9].
+    static constexpr int kUpdateFlashlightState = 0x11BB20;
 
     // L4D2 leftover referenced by copied sdk.h melee helpers. Unused on Black Mesa.
     struct { int address = 0; } GetMeleeWeaponInfoClient;
