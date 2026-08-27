@@ -428,10 +428,10 @@ VR::VR(Game* game)
     m_IsInitialized = InitOpenVR();
 }
 
-static std::string MapBaseLower(const char* map)
+bool VR::IsGameplayMapName(const char* map)
 {
     if (!map || !map[0])
-        return {};
+        return false;
     const char* slash = strrchr(map, '/');
     const char* bslash = strrchr(map, '\\');
     if (bslash && (!slash || bslash > slash))
@@ -443,28 +443,9 @@ static std::string MapBaseLower(const char* map)
         name = name.substr(0, dot);
     for (char& c : name)
         c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-    return name;
-}
-
-bool VR::IsGameplayMapName(const char* map)
-{
-    const std::string name = MapBaseLower(map);
-    if (name.empty())
-        return false;
     if (name == "dedicated" || name.rfind("background", 0) == 0)
         return false;
     return true;
-}
-
-bool VR::IsXenMapName(const char* map)
-{
-    const std::string name = MapBaseLower(map);
-    if (name.empty())
-        return false;
-    // Black Mesa Xen chapter is bm_c4* (Interloper / Gonarch / Nihilanth).
-    if (name.rfind("bm_c4", 0) == 0)
-        return true;
-    return name.find("xen") != std::string::npos;
 }
 
 void VR::PollMapFromEngine()
@@ -507,9 +488,7 @@ void VR::OnLevelInit(const char* newmap)
     m_HmdOriginLatched = false;
     m_PassThroughMainViews = 0;
     m_AutoMatQueueModeLastRequested = -999;
-    Game::logMsg("LevelInit map=%s eligible=%d xen=%d",
-        m_CurrentMapName.c_str(), m_GameplayEligible ? 1 : 0, IsXenMapName(newmap) ? 1 : 0);
-    ApplyMapLodCvars();
+    Game::logMsg("LevelInit map=%s eligible=%d", m_CurrentMapName.c_str(), m_GameplayEligible ? 1 : 0);
     ApplyRenderTargetFramebufferOverride();
 }
 
@@ -3023,35 +3002,17 @@ void VR::ApplyVrQualityOfLifeCvars()
         seti("r_portalsopenall", 0);
     }
     // BM new-renderer CSM logged 8192x8192 (_rt_gbshadowmaprt) inside each
-    // stereo RenderView; quality 0 still allocated _rt_CSMShadowBuffer per eye.
-    // Present-thread ClientCmd("cl_csm_enabled 0") during load crashed
-    // (2026-08-17). ICvar field write from this RenderView path is the same
-    // mechanism as the other working QoL cvars. Do not ClientCmd. Do not
-    // touch r_flashlightdepthtexture — that broke deferred flashlight.
-    seti("cl_csm_enabled", 0);
-    seti("nr_shadow_active", 0);
+    // stereo RenderView. L4D2VR ShadowTweaks uses RTT off + half-rate; BM has
+    // cl_csm_qualitymode / nr_shadow_* instead (materialsystem.dll strings).
+    // Do not touch r_flashlightdepthtexture — that broke deferred flashlight.
     seti("cl_csm_qualitymode", 0);
     seti("nr_shadow_quality", 0);
     seti("nr_shadow_filter_quality", 0);
     seti("nr_shadow_max_passes_per_frame", 1);
-    seti("nr_shadow_res", 1024);
+    seti("nr_shadow_res", 2048);
     seti("nr_lights_quality", 0);
     seti("r_shadowrendertotexture", 0);
     seti("r_shadowlod", 2);
-    seti("r_shadows", 0);
-    // Open/Xen fillrate: two 1080p views already. LOD + no 3D sky + no
-    // detail sprites + no dlights. Flashlight is deferred GBLightSpot, not
-    // r_dynamic. r_3dsky / r_drawdetailprops live in client (VPK); FindVar
-    // miss is counted as not-ok and is harmless.
-    seti("r_lod", 2);
-    seti("r_rootlod", 2);
-    seti("r_dynamic", 0);
-    seti("r_dynamiclighting", 0);
-    seti("r_maxdlights", 0);
-    seti("r_3dsky", 0);
-    seti("r_drawdetailprops", 0);
-    setf("cl_detaildist", 0.f);
-    setf("cl_detailfade", 0.f);
     // Planar water used the HMD camera inside ViewDrawScene (not a nested
     // RenderView). Aux GetScreenSize skip was not enough. Cheap water instead
     // of a view-locked ghost world. BM new-renderer planar glass uses
@@ -3060,23 +3021,9 @@ void VR::ApplyVrQualityOfLifeCvars()
     seti("r_waterforcereflectentities", 0);
     seti("r_waterforceexpensive", 0);
     seti("nr_gbuffer_for_reflection_enabled", 0);
-    seti("r_WaterDrawRefraction", 0);
-    ApplyMapLodCvars();
-    Game::logMsg("VR QoL cvars applied (%d ok) icvar=%p hideCrosshair=%d bobOff=%d forceOpenVis=%d blitFlush=%d csmOff nrShadowRes=1024 xen=%d eyeCap=%d waterrefl0",
+    Game::logMsg("VR QoL cvars applied (%d ok) icvar=%p hideCrosshair=%d bobOff=%d forceOpenVis=%d blitFlush=%d csmQ=0 nrShadowRes=2048 waterrefl0",
         n, m_Game->m_Cvar, bmvr::g_HideCrosshair ? 1 : 0, bmvr::g_DisableViewBob ? 1 : 0,
-        bmvr::g_ForceOpenVis ? 1 : 0, bmvr::g_StereoBlitGpuFlush ? 1 : 0,
-        IsXenMapName(m_CurrentMapName.c_str()) ? 1 : 0, bmvr::g_CapEyesToWindow ? 1 : 0);
-}
-
-void VR::ApplyMapLodCvars()
-{
-    if (!m_Game)
-        return;
-    const bool xen = IsXenMapName(m_CurrentMapName.c_str());
-    m_Game->SetConVarInt("r_lod", xen ? 3 : 2);
-    m_Game->SetConVarInt("r_rootlod", 2);
-    if (xen)
-        Game::logMsg("Xen perf LOD r_lod=3 r_rootlod=2 map=%s", m_CurrentMapName.c_str());
+        bmvr::g_ForceOpenVis ? 1 : 0, bmvr::g_StereoBlitGpuFlush ? 1 : 0);
 }
 
 void VR::TickMatQueueFromRenderView()

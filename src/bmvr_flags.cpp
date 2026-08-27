@@ -80,7 +80,6 @@ namespace bmvr
     bool g_CompositorPostPresentHandoff = true;
     bool g_ForceOpenVis = false;
     bool g_StereoBlitGpuFlush = false;
-    bool g_CapEyesToWindow = true;
     // Match L4D2VR weapon tables (designed for VRScale 43.2) to BM 39.37:
     // 0.91 was the 39.37/43.2 ratio; user 2026-08-25: ~25% smaller than that
     // (0.91 x 0.75 = 0.68). Crowbar forced to 1.0 in DME. Hands slightly larger.
@@ -375,8 +374,6 @@ namespace bmvr
                 g_ForceOpenVis = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "StereoBlitGpuFlush") == 0)
                 g_StereoBlitGpuFlush = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
-            else if (std::strcmp(n, "CapEyesToWindow") == 0)
-                g_CapEyesToWindow = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "ViewmodelScale") == 0)
             {
                 const float s = static_cast<float>(atof(val));
@@ -1124,32 +1121,6 @@ namespace bmvr
             w = (recW + 15u) & ~15u;
         if (h < 360)
             h = (recH + 15u) & ~15u;
-        // hmd_world skipped: the engine rasterizes at HWND size. Submitting
-        // rec-sized empties only StretchRects the window into a larger RT.
-        if (g_CapEyesToWindow && !g_TryOffscreenWorldGrow)
-        {
-            uint32_t winW = 0, winH = 0;
-            if (QueryWindowClientSize(winW, winH))
-            {
-                const uint32_t cap = winW > winH ? winW : winH;
-                if (w > cap + 16 && cap >= 640)
-                {
-                    const float aspect = static_cast<float>(w) / static_cast<float>(h);
-                    const uint32_t beforeW = w, beforeH = h;
-                    w = (cap + 15u) & ~15u;
-                    h = (static_cast<uint32_t>(static_cast<float>(w) / aspect + 0.5f) + 15u) & ~15u;
-                    if (h < 360)
-                        h = 360;
-                    static bool s_capped;
-                    if (!s_capped)
-                    {
-                        s_capped = true;
-                        Log("Cap offscreen eyes %ux%u -> %ux%u (window long-edge %u; rec %ux%u; world is HWND)",
-                            beforeW, beforeH, w, h, cap, recW, recH);
-                    }
-                }
-            }
-        }
         width = w;
         height = h;
         return w >= 640 && h >= 360;
