@@ -3279,34 +3279,6 @@ namespace
     const unsigned short kSegDigit[10] = {
         0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F
     };
-    const unsigned short kLabelFont[26] = {
-        0b111101101101111,
-        0b111110100100111,
-        0b111100100100111,
-        0b110101101101111,
-        0b111110110100111,
-        0b111110110100100,
-        0b111100101101111,
-        0b101101111101101,
-        0b111010010010111,
-        0b001001001101010,
-        0b101101110101101,
-        0b100100100100111,
-        0b101111111101101,
-        0b101111111111101,
-        0b111101101101111,
-        0b111110110100100,
-        0b111101101111001,
-        0b111110110101101,
-        0b111110010010111,
-        0b111010010010010,
-        0b101101101101111,
-        0b101101101101010,
-        0b101101111111101,
-        0b101101010101101,
-        0b101101010010010,
-        0b111110010100111
-    };
 
     struct HudVert
     {
@@ -3321,6 +3293,24 @@ namespace
             { x + w, y, 0.f, 1.f, color },
             { x, y + h, 0.f, 1.f, color },
             { x + w, y + h, 0.f, 1.f, color }
+        };
+        device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(HudVert));
+    }
+
+    void HudLine(IDirect3DDevice9* device, float x0, float y0, float x1, float y1, float t, D3DCOLOR color)
+    {
+        const float dx = x1 - x0;
+        const float dy = y1 - y0;
+        const float len = sqrtf(dx * dx + dy * dy);
+        if (len < 0.01f)
+            return;
+        const float nx = -dy / len * (t * 0.5f);
+        const float ny = dx / len * (t * 0.5f);
+        HudVert v[4] = {
+            { x0 + nx, y0 + ny, 0.f, 1.f, color },
+            { x0 - nx, y0 - ny, 0.f, 1.f, color },
+            { x1 + nx, y1 + ny, 0.f, 1.f, color },
+            { x1 - nx, y1 - ny, 0.f, 1.f, color }
         };
         device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(HudVert));
     }
@@ -3359,25 +3349,106 @@ namespace
         }
     }
 
-    void HudLabel(IDirect3DDevice9* device, float x, float y, float px, const char* text, D3DCOLOR color)
+    void HudLetter(IDirect3DDevice9* device, float x, float y, float cw, float ch, float t, char c, D3DCOLOR color)
+    {
+        const float xR = x + cw - t;
+        const float yM = y + ch * 0.5f - t * 0.5f;
+        const float yB = y + ch - t;
+        const float hU = ch * 0.5f - t * 1.5f;
+        const float xC = x + cw * 0.5f - t * 0.5f;
+        auto barH = [&](float bx, float by, float bw) { HudQuad(device, bx, by, bw, t, color); };
+        auto barV = [&](float bx, float by, float bh) { HudQuad(device, bx, by, t, bh, color); };
+        switch (c)
+        {
+        case 'A':
+            barV(x, y + t, ch - t);
+            barV(xR, y + t, ch - t);
+            barH(x + t, y, cw - 2 * t);
+            barH(x + t, yM, cw - 2 * t);
+            break;
+        case 'C':
+            barH(x + t, y, cw - 2 * t);
+            barV(x, y + t, ch - 2 * t);
+            barH(x + t, yB, cw - 2 * t);
+            break;
+        case 'E':
+            barH(x + t, y, cw - 2 * t);
+            barH(x + t, yM, cw - 2 * t);
+            barH(x + t, yB, cw - 2 * t);
+            barV(x, y + t, ch - 2 * t);
+            break;
+        case 'H':
+            barV(x, y, ch);
+            barV(xR, y, ch);
+            barH(x + t, yM, cw - 2 * t);
+            break;
+        case 'I':
+            barH(x + t, y, cw - 2 * t);
+            barV(xC, y + t, ch - 2 * t);
+            barH(x + t, yB, cw - 2 * t);
+            break;
+        case 'L':
+            barV(x, y, ch - t);
+            barH(x, yB, cw);
+            break;
+        case 'M':
+            barV(x, y, ch);
+            barV(xR, y, ch);
+            HudLine(device, x + t * 0.5f, y + t, xC + t * 0.5f, y + ch * 0.58f, t, color);
+            HudLine(device, xR + t * 0.5f, y + t, xC + t * 0.5f, y + ch * 0.58f, t, color);
+            break;
+        case 'O':
+            barH(x + t, y, cw - 2 * t);
+            barH(x + t, yB, cw - 2 * t);
+            barV(x, y + t, ch - 2 * t);
+            barV(xR, y + t, ch - 2 * t);
+            break;
+        case 'R':
+            barV(x, y, ch);
+            barH(x + t, y, cw - 2 * t);
+            barV(xR, y + t, hU);
+            barH(x + t, yM, cw - 2 * t);
+            HudLine(device, x + cw * 0.42f, y + ch * 0.5f, x + cw, y + ch, t, color);
+            break;
+        case 'S':
+            barH(x + t, y, cw - 2 * t);
+            barV(x, y + t, hU);
+            barH(x + t, yM, cw - 2 * t);
+            barV(xR, y + ch * 0.5f + t * 0.5f, hU);
+            barH(x + t, yB, cw - 2 * t);
+            break;
+        case 'T':
+            barH(x, y, cw);
+            barV(xC, y + t, ch - t);
+            break;
+        case 'U':
+            barV(x, y, ch - t);
+            barV(xR, y, ch - t);
+            barH(x + t, yB, cw - 2 * t);
+            break;
+        default:
+            break;
+        }
+    }
+
+    float HudLabelWidth(const char* text, float cw, float t)
+    {
+        int n = 0;
+        for (const char* p = text; p && *p; ++p)
+            ++n;
+        if (n <= 0)
+            return 0.f;
+        return n * cw + (n - 1) * t * 1.2f;
+    }
+
+    void HudLabel(IDirect3DDevice9* device, float x, float y, float cw, float ch, float t, const char* text, D3DCOLOR color)
     {
         float cx = x;
-        for (const char* p = text; *p; ++p)
+        for (const char* p = text; p && *p; ++p)
         {
-            const char c = *p;
-            if (c >= 'A' && c <= 'Z')
-            {
-                const unsigned short rows = kLabelFont[c - 'A'];
-                for (int row = 0; row < 5; ++row)
-                {
-                    for (int col = 0; col < 3; ++col)
-                    {
-                        if (rows & (1 << (14 - row * 3 - col)))
-                            HudQuad(device, cx + col * px, y + row * px, px * 1.35f, px * 1.35f, color);
-                    }
-                }
-            }
-            cx += 4 * px;
+            if (*p >= 'A' && *p <= 'Z')
+                HudLetter(device, cx, y, cw, ch, t, *p, color);
+            cx += cw + t * 1.2f;
         }
     }
 }
@@ -3414,23 +3485,39 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
     const float s = static_cast<float>(h) / 1440.f * 1.44f;
     const float tMain = 4.8f * s;
     const float tSmall = 3.4f * s;
+    const float labW = 8.f * s;
+    const float labH = 12.f * s;
+    const float labT = 2.6f * s;
+    const float labSmallW = 6.5f * s;
+    const float labSmallH = 10.f * s;
+    const float labSmallT = 2.2f * s;
+    const float mainNumH = 26.f * s;
+    const float smallNumH = 17.f * s;
+    const float smallPitch = 9.f * s + tSmall * 1.5f;
     const D3DCOLOR amber = D3DCOLOR_RGBA(255, 176, 0, 230);
     const D3DCOLOR dim = D3DCOLOR_RGBA(255, 176, 0, 160);
 
-    // Pixel size is a fraction of the eye RT, not world depth. 1.44 is
-    // 2× the compact 0.72 scale. Segments are thicker than a uniform scale.
+    auto drawLabeledNumber = [&](float xRight, float yNum, int value, int minDigits,
+        const char* label, bool compact) {
+        const float cw = compact ? 9.f * s : 14.f * s;
+        const float ch = compact ? smallNumH : mainNumH;
+        const float t = compact ? tSmall : tMain;
+        const float lw = compact ? labSmallW : labW;
+        const float lh = compact ? labSmallH : labH;
+        const float lt = compact ? labSmallT : labT;
+        HudNumber(device, xRight, yNum, cw, ch, t, value, minDigits, compact ? dim : amber);
+        const float labWidth = HudLabelWidth(label, lw, lt);
+        HudLabel(device, xRight - labWidth, yNum + ch + 3.f * s, lw, lh, lt, label, compact ? dim : amber);
+    };
+
     if (leftOk && health >= 0 && health <= 200)
     {
         float px = 0.f, py = 0.f;
         if (project(leftWrist, px, py))
         {
-            HudNumber(device, px + 33.f * s, py - 22.f * s, 14.f * s, 26.f * s, tMain, health, 2, amber);
-            HudLabel(device, px - 32.f * s, py + 9.f * s, 1.9f * s, "HEALTH", amber);
+            drawLabeledNumber(px + 33.f * s, py - 22.f * s, health, 2, "HEALTH", false);
             if (armor >= 0 && armor <= 200)
-            {
-                HudNumber(device, px + 22.f * s, py + 24.f * s, 9.f * s, 17.f * s, tSmall, armor, 2, dim);
-                HudLabel(device, px - 32.f * s, py + 30.f * s, 1.6f * s, "SUIT", dim);
-            }
+                drawLabeledNumber(px + 22.f * s, py + 24.f * s, armor, 2, "SUIT", true);
         }
     }
     if (rightOk && clip >= 0 && clip <= 255)
@@ -3438,20 +3525,16 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         float px = 0.f, py = 0.f;
         if (project(rightWrist, px, py))
         {
-            // World point is already left of the grip. Draw the cluster
-            // growing further left so SEC's right edge sits at the controller.
-            const float ox = px - 58.f * s;
-            HudNumber(device, ox + 33.f * s, py - 22.f * s, 14.f * s, 26.f * s, tMain, clip, 2, amber);
-            HudLabel(device, ox - 32.f * s, py + 9.f * s, 1.9f * s, "AMMO", amber);
+            const float ox = px - 68.f * s;
+            drawLabeledNumber(ox + 33.f * s, py - 22.f * s, clip, 2, "AMMO", false);
+            const float rowY = py + 24.f * s;
+            const float resRight = ox + 22.f * s;
             if (reserve >= 0 && reserve <= 999)
-            {
-                HudNumber(device, ox + 22.f * s, py + 24.f * s, 9.f * s, 17.f * s, tSmall, reserve, 2, dim);
-                HudLabel(device, ox - 32.f * s, py + 30.f * s, 1.6f * s, "RES", dim);
-            }
+                drawLabeledNumber(resRight, rowY, reserve, 2, "RES", true);
             if (secondary >= 0 && secondary <= 255)
             {
-                HudNumber(device, ox + 58.f * s, py + 24.f * s, 9.f * s, 17.f * s, tSmall, secondary, 2, dim);
-                HudLabel(device, ox + 36.f * s, py + 30.f * s, 1.6f * s, "SEC", dim);
+                const float secRight = resRight + 16.f * s + 2.f * smallPitch;
+                drawLabeledNumber(secRight, rowY, secondary, 2, "SEC", true);
             }
         }
     }
