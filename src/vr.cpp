@@ -1644,7 +1644,7 @@ void VR::ProcessInput()
     {
         UpdateWeaponFireHaptics();
         if (m_PendingFireHaptic.exchange(0, std::memory_order_acq_rel))
-            PulseAimHaptic(3999);
+            PulseHandHaptic(vr::TrackedControllerRole_RightHand, 2500, 0.85f);
     }
 
     uint32_t buttons = 0;
@@ -1779,11 +1779,6 @@ void VR::ProcessInput()
     {
         if (!melee)
             m_WeaponActionAnimUntilMs = GetTickCount() + 450;
-        if (!melee && !m_EmptyHands && !m_WeaponMenuOpen)
-        {
-            PulseHandHaptic(vr::TrackedControllerRole_RightHand, 3999, 1.0f);
-            PulseHandHaptic(vr::TrackedControllerRole_LeftHand, 3999, 1.0f);
-        }
     }
     if (atk2 && !s_atk2)
     {
@@ -3227,15 +3222,20 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
         Vector lhf, lhr, lhu, rhf, rhr, rhu;
         QAngle::AngleVectors(leftAng, &lhf, &lhr, &lhu);
         QAngle::AngleVectors(rightAng, &rhf, &rhr, &rhu);
-        // Watch on the forearm, past the HEV gauntlet. After yaw 180 the
-        // fingers aim along controller forward; behind the wrist is -forward.
-        constexpr float kWristBehindHu = 7.f;
-        constexpr float kWristInnerHu = 2.f;
+        // Left: watch on the forearm, past the HEV gauntlet. After yaw 180
+        // the fingers aim along controller forward; behind the wrist is
+        // -forward. Right ammo sits beside the gun, not down the forearm:
+        // controller -right is the inner / left side of the grip.
+        constexpr float kLeftWristBehindHu = 7.f;
+        constexpr float kLeftWristInnerHu = 2.f;
+        constexpr float kRightHudLeftHu = 4.5f;
+        constexpr float kRightHudBehindHu = 0.8f;
+        constexpr float kRightHudDownHu = 1.2f;
         const Vector leftWrist = leftOk
-            ? toWorld(leftPos) - lhf * kWristBehindHu - lhu * kWristInnerHu
+            ? toWorld(leftPos) - lhf * kLeftWristBehindHu - lhu * kLeftWristInnerHu
             : Vector{};
         const Vector rightWrist = rightOk
-            ? toWorld(rightPos) - rhf * kWristBehindHu - rhu * kWristInnerHu
+            ? toWorld(rightPos) - rhr * kRightHudLeftHu - rhf * kRightHudBehindHu - rhu * kRightHudDownHu
             : Vector{};
         DrawHandHud(device, stereoEye, w, h,
             leftOk, leftWrist, rightOk, rightWrist, eyeOrig, fwd, right, up);
@@ -3373,7 +3373,7 @@ namespace
                     for (int col = 0; col < 3; ++col)
                     {
                         if (rows & (1 << (14 - row * 3 - col)))
-                            HudQuad(device, cx + col * px, y + row * px, px, px, color);
+                            HudQuad(device, cx + col * px, y + row * px, px * 1.35f, px * 1.35f, color);
                     }
                 }
             }
@@ -3411,22 +3411,24 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         return sx > -80.f && sy > -80.f && sx < static_cast<float>(w) + 80.f && sy < static_cast<float>(h) + 80.f;
     };
 
-    const float s = static_cast<float>(h) / 1440.f * 0.72f;
+    const float s = static_cast<float>(h) / 1440.f * 1.44f;
+    const float tMain = 4.8f * s;
+    const float tSmall = 3.4f * s;
     const D3DCOLOR amber = D3DCOLOR_RGBA(255, 176, 0, 230);
     const D3DCOLOR dim = D3DCOLOR_RGBA(255, 176, 0, 160);
 
-    // Pixel size is a fraction of the eye RT, not world depth. 0.72 of the
-    // original 1440p scale — the world-HU path made digits fill the glove.
+    // Pixel size is a fraction of the eye RT, not world depth. 1.44 is
+    // 2× the compact 0.72 scale. Segments are thicker than a uniform scale.
     if (leftOk && health >= 0 && health <= 200)
     {
         float px = 0.f, py = 0.f;
         if (project(leftWrist, px, py))
         {
-            HudNumber(device, px + 33.f * s, py - 22.f * s, 14.f * s, 26.f * s, 3.6f * s, health, 2, amber);
+            HudNumber(device, px + 33.f * s, py - 22.f * s, 14.f * s, 26.f * s, tMain, health, 2, amber);
             HudLabel(device, px - 32.f * s, py + 9.f * s, 1.9f * s, "HEALTH", amber);
             if (armor >= 0 && armor <= 200)
             {
-                HudNumber(device, px + 22.f * s, py + 24.f * s, 9.f * s, 17.f * s, 2.5f * s, armor, 2, dim);
+                HudNumber(device, px + 22.f * s, py + 24.f * s, 9.f * s, 17.f * s, tSmall, armor, 2, dim);
                 HudLabel(device, px - 32.f * s, py + 30.f * s, 1.6f * s, "SUIT", dim);
             }
         }
@@ -3436,17 +3438,20 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         float px = 0.f, py = 0.f;
         if (project(rightWrist, px, py))
         {
-            HudNumber(device, px + 33.f * s, py - 22.f * s, 14.f * s, 26.f * s, 3.6f * s, clip, 2, amber);
-            HudLabel(device, px - 32.f * s, py + 9.f * s, 1.9f * s, "AMMO", amber);
+            // World point is already left of the grip. Draw the cluster
+            // growing further left so SEC's right edge sits at the controller.
+            const float ox = px - 58.f * s;
+            HudNumber(device, ox + 33.f * s, py - 22.f * s, 14.f * s, 26.f * s, tMain, clip, 2, amber);
+            HudLabel(device, ox - 32.f * s, py + 9.f * s, 1.9f * s, "AMMO", amber);
             if (reserve >= 0 && reserve <= 999)
             {
-                HudNumber(device, px + 22.f * s, py + 24.f * s, 9.f * s, 17.f * s, 2.5f * s, reserve, 2, dim);
-                HudLabel(device, px - 32.f * s, py + 30.f * s, 1.6f * s, "RES", dim);
+                HudNumber(device, ox + 22.f * s, py + 24.f * s, 9.f * s, 17.f * s, tSmall, reserve, 2, dim);
+                HudLabel(device, ox - 32.f * s, py + 30.f * s, 1.6f * s, "RES", dim);
             }
             if (secondary >= 0 && secondary <= 255)
             {
-                HudNumber(device, px + 58.f * s, py + 24.f * s, 9.f * s, 17.f * s, 2.5f * s, secondary, 2, dim);
-                HudLabel(device, px + 36.f * s, py + 30.f * s, 1.6f * s, "SEC", dim);
+                HudNumber(device, ox + 58.f * s, py + 24.f * s, 9.f * s, 17.f * s, tSmall, secondary, 2, dim);
+                HudLabel(device, ox + 36.f * s, py + 30.f * s, 1.6f * s, "SEC", dim);
             }
         }
     }

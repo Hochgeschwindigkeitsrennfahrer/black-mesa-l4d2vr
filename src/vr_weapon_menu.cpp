@@ -54,8 +54,8 @@ namespace
         up = CrossProduct(fwd, right);
         VectorNormalize(up);
     }
-    constexpr float kHexRadiusPxAt1440 = 34.f;
-    constexpr float kHexPackScale = 1.16f;
+    constexpr float kHexRadiusPxAt1440 = 76.f;
+    constexpr float kHexPackScale = 1.20f;
     constexpr float kHexWorldHu = 3.55f;
     constexpr float kSqrt3 = 1.73205078f;
 
@@ -354,17 +354,21 @@ namespace
         device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 6, v, sizeof(MenuVert));
     }
 
-    void DrawHexOutline(IDirect3DDevice9* device, float cx, float cy, float r, float t, D3DCOLOR color)
+    // Continuous hex ring (triangle strip), not six separate quads that gap at vertices.
+    void DrawHexRing(IDirect3DDevice9* device, float cx, float cy, float rOuter, float rInner, D3DCOLOR color)
     {
-        float px[6]{}, py[6]{};
-        for (int i = 0; i < 6; ++i)
+        if (!(rOuter > rInner + 0.5f))
+            return;
+        MenuVert v[14]{};
+        for (int i = 0; i <= 6; ++i)
         {
             const float a = (static_cast<float>(i) * 60.f - 90.f) * 3.14159265f / 180.f;
-            px[i] = cx + cosf(a) * r;
-            py[i] = cy + sinf(a) * r;
+            const float c = cosf(a);
+            const float s = sinf(a);
+            v[i * 2] = { cx + c * rOuter, cy + s * rOuter, 0.f, 1.f, color };
+            v[i * 2 + 1] = { cx + c * rInner, cy + s * rInner, 0.f, 1.f, color };
         }
-        for (int i = 0; i < 6; ++i)
-            MenuLine(device, px[i], py[i], px[(i + 1) % 6], py[(i + 1) % 6], t, color);
+        device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 12, v, sizeof(MenuVert));
     }
 
     bool ReadFileBytes(const wchar_t* path, std::vector<unsigned char>& out)
@@ -1329,18 +1333,20 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
         const bool hover = (i == m_WeaponMenuHover);
         float cx = 0.f, cy = 0.f;
         HexScreenCenter(ocx, ocy, slot.axialQ, slot.axialR, packR, cx, cy);
+        // ~8% of hex width (pointy-top width = R√3). Ring stays inside R so
+        // packing ×1.20 leaves a visible gap.
         const float radius = drawR;
-        const float edge = radius * 0.22f;
+        const float edge = radius * 0.08f;
         const D3DCOLOR fill = hover
             ? D3DCOLOR_ARGB(210, 48, 36, 10)
             : D3DCOLOR_ARGB(170, 14, 12, 8);
         const D3DCOLOR frame = hover
             ? D3DCOLOR_XRGB(255, 240, 140)
             : (slot.equipped ? D3DCOLOR_XRGB(255, 176, 0) : D3DCOLOR_ARGB(220, 200, 140, 30));
-        DrawHexFill(device, cx, cy, radius, fill);
-        DrawHexOutline(device, cx, cy, radius, hover ? edge * 1.15f : edge, frame);
+        DrawHexFill(device, cx, cy, radius - edge, fill);
+        DrawHexRing(device, cx, cy, radius, radius - edge, frame);
         if (hover)
-            DrawHexOutline(device, cx, cy, radius + edge * 0.45f, edge * 0.4f, D3DCOLOR_ARGB(180, 255, 255, 200));
+            DrawHexRing(device, cx, cy, radius + 1.5f, radius - edge * 0.35f, D3DCOLOR_ARGB(160, 255, 255, 200));
 
         if (slot.emptyHand)
             continue;
@@ -1349,8 +1355,8 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
         IDirect3DTexture9* icon = (kind > 0 && kind < KindCount) ? g_WeaponIconTex[kind] : nullptr;
         if (icon)
         {
-            const float iw = radius * 1.35f;
-            const float ih = radius * 0.85f;
+            const float iw = radius * 1.05f;
+            const float ih = radius * 0.66f;
             const float x0 = cx - iw * 0.5f;
             const float y0 = cy - ih * 0.5f;
             const D3DCOLOR tint = hover ? D3DCOLOR_XRGB(255, 255, 255) : D3DCOLOR_XRGB(255, 230, 180);
@@ -1434,7 +1440,7 @@ bool VR::UpdateWeaponFireHaptics()
     }
     if (melee)
         return false;
-    m_PendingFireHaptic.store(1, std::memory_order_release);
+    PulseHandHaptic(vr::TrackedControllerRole_RightHand, 2500, 0.85f);
     return true;
 }
 
@@ -1443,7 +1449,9 @@ void VR::AfterCreateMoveFireHaptics()
     const uint32_t held = HeldButtons();
     const bool attackEdge = (held & IN_ATTACK) && !(m_PrevHeldButtons & IN_ATTACK);
     m_PrevHeldButtons = held;
-    UpdateWeaponFireHaptics();
+    // Do not consume clip/parity here — ProcessInput on the Present thread
+    // is the path that used to rumble each shot. Only latch energy-weapon
+    // trigger edges that never decrement clip.
     if (!attackEdge || EmptyHands())
         return;
     bool melee = false;
@@ -1468,7 +1476,7 @@ void VR::PulseHandHaptic(vr::ETrackedControllerRole hand, unsigned short duratio
         // OpenXR duration is real vibration time; 2ms is below SteamVR's floor.
         float seconds = durationUs / 1000000.0f;
         if (durationUs <= 3999)
-            seconds = std::clamp(durationUs / 3999.0f * 0.16f, 0.08f, 0.18f);
+            seconds = std::clamp(durationUs / 3999.0f * 0.07f, 0.045f, 0.09f);
         L4D2VR_PublishOpenXrHapticRequest(openXrHand, seconds, 160.0f, amplitude);
         static int s_hapticLog;
         if (s_hapticLog < 8)

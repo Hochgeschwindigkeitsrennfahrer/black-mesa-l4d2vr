@@ -180,5 +180,18 @@ Do not claim HMD success on 28g.
 
 Do not claim HMD success on 28h.
 
+## Pass 2026-08-28i wrist HUD size / right-hand offset / honeycomb ring / fire rumble
+
+**Compiled + packed this pass** (`d3d9.dll` 2739200 bytes, `dist/Black-Mesa-VR-drop-in.zip`). **Not HMD-verified.** Do not claim headset presentation. Honeycomb look was HMD-confirmed good on 28h follow-up; haptics miss was empty batteries.
+
+| Item | Change |
+|---|---|
+| Wrist HUD size | Pixel scale `1.44` at 1440p (2× the compact `0.72`). Segment thickness `4.8` / `3.4` (was `3.6` / `2.5`). Labels use 1.35× pixel fill. |
+| Right ammo HUD | World offset is controller **left** (`-right × 4.5` HU), not down the forearm. Screen cluster is left-aligned so SEC's right edge sits at the grip. Left health HUD stays on the forearm. |
+| Honeycomb | Continuous hex ring, 76px radius at 1440p, packing `×1.20` (shipped in the same zip as the wrist pass). |
+| Fire rumble | Right-hand per-shot pulse from Present clip/parity. No left-hand trigger-press pulse. |
+
+Do not claim HMD success on 28i.
+
 
 
