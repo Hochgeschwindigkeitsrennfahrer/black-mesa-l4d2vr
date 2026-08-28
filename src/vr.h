@@ -669,6 +669,8 @@ private:
     {
         int entityIndex = 0;
         int kind = 0;
+        int axialQ = 0;
+        int axialR = 0;
         Vector center{};
         char label[16]{};
         bool equipped = false;

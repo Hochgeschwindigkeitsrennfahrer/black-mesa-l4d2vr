@@ -1779,6 +1779,11 @@ void VR::ProcessInput()
     {
         if (!melee)
             m_WeaponActionAnimUntilMs = GetTickCount() + 450;
+        if (!melee && !m_EmptyHands && !m_WeaponMenuOpen)
+        {
+            PulseHandHaptic(vr::TrackedControllerRole_RightHand, 3999, 1.0f);
+            PulseHandHaptic(vr::TrackedControllerRole_LeftHand, 3999, 1.0f);
+        }
     }
     if (atk2 && !s_atk2)
     {
@@ -2288,21 +2293,7 @@ void VR::FlushPendingWeaponSounds()
     if (bits & kWeaponSoundHover)
         m_Game->PlayUiSound("common/wpn_moveselect.wav");
     if (bits & kWeaponSoundSelect)
-    {
-        const int kind = m_PendingWeaponSoundKind.exchange(0, std::memory_order_acq_rel);
-        const int ent = m_PendingWeaponSoundEntity.exchange(0, std::memory_order_acq_rel);
-        if (ent <= 0)
-            m_Game->PlayUiSound("common/wpn_hudoff.wav");
-        else
-        {
-            const char* draw = WeaponMenuDrawSoundName(kind);
-            C_BaseEntity* wpn = m_Game->GetClientEntity(ent);
-            if (draw && draw[0] && wpn)
-                m_Game->EmitEntitySound(wpn, draw);
-            else
-                m_Game->PlayUiSound("common/wpn_select.wav");
-        }
-    }
+        m_Game->PlayUiSound("common/wpn_hudoff.wav");
 }
 
 QAngle VR::GetRightControllerAbsAngle() const
@@ -3419,66 +3410,43 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         sy = (-ndcY * 0.5f + 0.5f) * static_cast<float>(h);
         return sx > -80.f && sy > -80.f && sx < static_cast<float>(w) + 80.f && sy < static_cast<float>(h) + 80.f;
     };
-    auto worldPx = [&](const Vector& world, float hu) -> float {
-        const float z = (world - eyeOrig).Dot(fwd);
-        if (z < 4.f)
-            return 0.f;
-        return (hu / z) / tanHalf * (static_cast<float>(w) * 0.5f);
-    };
 
+    const float s = static_cast<float>(h) / 1440.f * 0.72f;
     const D3DCOLOR amber = D3DCOLOR_RGBA(255, 176, 0, 230);
     const D3DCOLOR dim = D3DCOLOR_RGBA(255, 176, 0, 160);
 
-    // Health/suit: C_BaseEntity::m_iHealth 0x98, C_BlackMesaPlayer::m_ArmorValue
-    // 0x17C0. Only draw plausible 0..200 values. Size is world-constant (HU)
-    // so head tilt does not foreshorten the digits relative to the glove.
+    // Pixel size is a fraction of the eye RT, not world depth. 0.72 of the
+    // original 1440p scale — the world-HU path made digits fill the glove.
     if (leftOk && health >= 0 && health <= 200)
     {
         float px = 0.f, py = 0.f;
-        const float ch = worldPx(leftWrist, 2.6f);
-        if (ch > 2.f && project(leftWrist, px, py))
+        if (project(leftWrist, px, py))
         {
-            const float cw = ch * (20.f / 36.f);
-            const float t = ch * (5.f / 36.f);
-            const float label = ch * (2.6f / 36.f);
-            HudNumber(device, px + cw * 2.3f, py - ch * 0.83f, cw, ch, t, health, 2, amber);
-            HudLabel(device, px - cw * 2.2f, py + ch * 0.33f, label, "HEALTH", amber);
+            HudNumber(device, px + 33.f * s, py - 22.f * s, 14.f * s, 26.f * s, 3.6f * s, health, 2, amber);
+            HudLabel(device, px - 32.f * s, py + 9.f * s, 1.9f * s, "HEALTH", amber);
             if (armor >= 0 && armor <= 200)
             {
-                const float ch2 = ch * (24.f / 36.f);
-                const float cw2 = ch2 * (13.f / 24.f);
-                const float t2 = ch2 * (3.5f / 24.f);
-                HudNumber(device, px + cw2 * 2.3f, py + ch * 0.94f, cw2, ch2, t2, armor, 2, dim);
-                HudLabel(device, px - cw * 2.2f, py + ch * 1.17f, label * 0.85f, "SUIT", dim);
+                HudNumber(device, px + 22.f * s, py + 24.f * s, 9.f * s, 17.f * s, 2.5f * s, armor, 2, dim);
+                HudLabel(device, px - 32.f * s, py + 30.f * s, 1.6f * s, "SUIT", dim);
             }
         }
     }
     if (rightOk && clip >= 0 && clip <= 255)
     {
         float px = 0.f, py = 0.f;
-        const float ch = worldPx(rightWrist, 2.6f);
-        if (ch > 2.f && project(rightWrist, px, py))
+        if (project(rightWrist, px, py))
         {
-            const float cw = ch * (20.f / 36.f);
-            const float t = ch * (5.f / 36.f);
-            const float label = ch * (2.6f / 36.f);
-            HudNumber(device, px + cw * 2.3f, py - ch * 0.83f, cw, ch, t, clip, 2, amber);
-            HudLabel(device, px - cw * 2.2f, py + ch * 0.33f, label, "AMMO", amber);
+            HudNumber(device, px + 33.f * s, py - 22.f * s, 14.f * s, 26.f * s, 3.6f * s, clip, 2, amber);
+            HudLabel(device, px - 32.f * s, py + 9.f * s, 1.9f * s, "AMMO", amber);
             if (reserve >= 0 && reserve <= 999)
             {
-                const float ch2 = ch * (24.f / 36.f);
-                const float cw2 = ch2 * (13.f / 24.f);
-                const float t2 = ch2 * (3.5f / 24.f);
-                HudNumber(device, px + cw2 * 2.3f, py + ch * 0.94f, cw2, ch2, t2, reserve, 2, dim);
-                HudLabel(device, px - cw * 2.2f, py + ch * 1.17f, label * 0.85f, "RES", dim);
+                HudNumber(device, px + 22.f * s, py + 24.f * s, 9.f * s, 17.f * s, 2.5f * s, reserve, 2, dim);
+                HudLabel(device, px - 32.f * s, py + 30.f * s, 1.6f * s, "RES", dim);
             }
             if (secondary >= 0 && secondary <= 255)
             {
-                const float ch2 = ch * (24.f / 36.f);
-                const float cw2 = ch2 * (13.f / 24.f);
-                const float t2 = ch2 * (3.5f / 24.f);
-                HudNumber(device, px + cw2 * 6.4f, py + ch * 0.94f, cw2, ch2, t2, secondary, 2, dim);
-                HudLabel(device, px + cw2 * 2.6f, py + ch * 1.17f, label * 0.85f, "SEC", dim);
+                HudNumber(device, px + 58.f * s, py + 24.f * s, 9.f * s, 17.f * s, 2.5f * s, secondary, 2, dim);
+                HudLabel(device, px + 36.f * s, py + 30.f * s, 1.6f * s, "SEC", dim);
             }
         }
     }

@@ -167,5 +167,18 @@ Do not claim HMD success on 28f.
 
 Do not claim HMD success on 28g.
 
+## Pass 2026-08-28h honeycomb gaps / constant size / equip sound / fire rumble / wrist scale
+
+**Compiled + packed this pass** (`d3d9.dll` 2738688 bytes, `dist/Black-Mesa-VR-drop-in.zip`). **Not HMD-verified.** Do not claim headset presentation.
+
+| Item | Change |
+|---|---|
+| Honeycomb | Screen-space layout around the projected menu origin. Pixel radius is `34px` at 1440p (smaller). Packing `×1.16` leaves a gap. Edges are `0.22×` radius. Size does **not** use view-space z, so head tilt/lean no longer scales or overlaps the hexes. Origin still follows body + stick yaw. |
+| Equip sound | Select (gun or empty hands) plays 2D `common/wpn_hudoff.wav` — the empty-hands click. Hover stays `wpn_moveselect`. |
+| Fire rumble | Trigger-press pulse from ProcessInput (same path as reload) on **both** hands, amplitude 1. OpenXR now sends 160 Hz and ≥80 ms (helper no longer treats 0 Hz as a no-op). Clip/parity pending pulse kept for autos. Log: `OpenXR haptic` / helper `xrApplyHapticFeedback ok`. |
+| Wrist HUD | Back to pixel scale at `0.72` of the original 1440p digits (world-HU path was huge). Secondary ammo kept. |
+
+Do not claim HMD success on 28h.
+
 
 

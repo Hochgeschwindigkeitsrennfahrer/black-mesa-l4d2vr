@@ -4774,8 +4774,9 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
             m_LastHapticSequences[hand] = request.sequence;
             XrHapticVibration vibration{ XR_TYPE_HAPTIC_VIBRATION };
-            vibration.duration = static_cast<XrDuration>(std::max(1.0f, request.durationSeconds * 1000000000.0f));
-            vibration.frequency = request.frequency;
+            const float seconds = std::max(0.08f, request.durationSeconds);
+            vibration.duration = static_cast<XrDuration>(seconds * 1000000000.0);
+            vibration.frequency = (request.frequency > 1.0f) ? request.frequency : 160.0f;
             vibration.amplitude = std::clamp(request.amplitude, 0.0f, 1.0f);
 
             XrHapticActionInfo info{ XR_TYPE_HAPTIC_ACTION_INFO };
@@ -4785,6 +4786,14 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 m_Session,
                 &info,
                 reinterpret_cast<const XrHapticBaseHeader*>(&vibration));
+            static int s_hapticOkLog;
+            if (XR_SUCCEEDED(result) && s_hapticOkLog < 6)
+            {
+                log.Print("xrApplyHapticFeedback ok hand=%u durNs=%lld amp=%.2f freq=%.1f",
+                    hand, static_cast<long long>(vibration.duration),
+                    vibration.amplitude, vibration.frequency);
+                ++s_hapticOkLog;
+            }
             if (XR_FAILED(result) && !m_HapticFailureLogged)
             {
                 m_HapticFailureLogged = true;

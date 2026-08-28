@@ -54,8 +54,9 @@ namespace
         up = CrossProduct(fwd, right);
         VectorNormalize(up);
     }
-    constexpr float kHexRadiusHu = 3.55f;
-    constexpr float kHexGutter = 0.97f;
+    constexpr float kHexRadiusPxAt1440 = 34.f;
+    constexpr float kHexPackScale = 1.16f;
+    constexpr float kHexWorldHu = 3.55f;
     constexpr float kSqrt3 = 1.73205078f;
 
     int ReadMuzzleFlashParity(void* vm)
@@ -266,6 +267,37 @@ namespace
     {
         x = radius * (kSqrt3 * (static_cast<float>(q) + static_cast<float>(r) * 0.5f));
         y = radius * (1.5f * static_cast<float>(r));
+    }
+
+    float HexDrawRadiusPx(UINT h)
+    {
+        const float hh = (h > 8) ? static_cast<float>(h) : 1440.f;
+        return kHexRadiusPxAt1440 * (hh / 1440.f);
+    }
+
+    void HexScreenCenter(float ocx, float ocy, int q, int r, float packR, float& cx, float& cy)
+    {
+        float ox = 0.f, oy = 0.f;
+        HexToOffset(q, r, packR, ox, oy);
+        cx = ocx + ox;
+        cy = ocy - oy;
+    }
+
+    bool ProjectWorldToScreen(const Vector& world, const Vector& eye, const Vector& fwd,
+        const Vector& right, const Vector& up, float tanHalf, float aspect, UINT w, UINT h,
+        float& sx, float& sy)
+    {
+        const Vector delta = world - eye;
+        const float z = delta.Dot(fwd);
+        if (z < 3.f)
+            return false;
+        const float x = delta.Dot(right);
+        const float y = delta.Dot(up);
+        const float ndcX = (x / z) / tanHalf;
+        const float ndcY = ((y / z) * aspect) / tanHalf;
+        sx = (ndcX * 0.5f + 0.5f) * static_cast<float>(w);
+        sy = (-ndcY * 0.5f + 0.5f) * static_cast<float>(h);
+        return true;
     }
 
     bool PointInHex(float x, float y, float radius)
@@ -1049,6 +1081,8 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
         };
         occupy(0, 0);
         m_WeaponMenuSlots[0].emptyHand = true;
+        m_WeaponMenuSlots[0].axialQ = 0;
+        m_WeaponMenuSlots[0].axialR = 0;
         m_WeaponMenuSlots[0].center = m_WeaponMenuOrigin;
         m_WeaponMenuSlots[0].equipped = m_EmptyHands;
         strncpy_s(m_WeaponMenuSlots[0].label, "HAND", _TRUNCATE);
@@ -1058,9 +1092,11 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             if (placed >= kMaxMenuSlots)
                 return;
             float ox = 0.f, oy = 0.f;
-            HexToOffset(q, r, kHexRadiusHu, ox, oy);
+            HexToOffset(q, r, kHexWorldHu, ox, oy);
             m_WeaponMenuSlots[placed].entityIndex = wpn.entityIndex;
             m_WeaponMenuSlots[placed].kind = kind;
+            m_WeaponMenuSlots[placed].axialQ = q;
+            m_WeaponMenuSlots[placed].axialR = r;
             m_WeaponMenuSlots[placed].center = m_WeaponMenuOrigin
                 + m_WeaponMenuRight * ox + m_WeaponMenuUp * oy;
             m_WeaponMenuSlots[placed].equipped = !m_EmptyHands
@@ -1123,18 +1159,55 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
         }
         const int prevHover = m_WeaponMenuHover;
         m_WeaponMenuHover = -1;
-        float bestT = 1.0e9f;
-        for (int i = 0; i < m_WeaponMenuCount; ++i)
+        const UINT hw = m_RenderWidth > 64 ? m_RenderWidth : 1584u;
+        const UINT hh = m_RenderHeight > 64 ? m_RenderHeight : 1440u;
+        const float aspect = static_cast<float>(hw) / static_cast<float>(hh);
+        const float projFov = HorizontalFovForAspect(aspect);
+        const float tanHalf = tanf(projFov * 0.5f * 3.14159265f / 180.f);
+        const Vector eye = GetViewOrigin(MenuPlayerBody(this));
+        Vector vf, vr, vu;
+        GetViewBasis(&vf, &vr, &vu);
+        float ocx = 0.f, ocy = 0.f;
+        const bool haveOrigin = (tanHalf > 0.01f)
+            && ProjectWorldToScreen(m_WeaponMenuOrigin, eye, vf, vr, vu, tanHalf, aspect, hw, hh, ocx, ocy);
+        const float drawR = HexDrawRadiusPx(hh);
+        const float packR = drawR * kHexPackScale;
+        Vector planeHit{};
+        bool haveHit = false;
         {
-            Vector hit{};
-            if (!RayHitHex(rayOrig, rayDir, m_WeaponMenuSlots[i].center,
-                m_WeaponMenuRight, m_WeaponMenuUp, kHexRadiusHu, &hit))
-                continue;
-            const float t = (hit - rayOrig).Length();
-            if (t < bestT)
+            const Vector n = m_WeaponMenuFwd;
+            const float denom = rayDir.Dot(n);
+            if (fabsf(denom) > 0.0001f)
             {
-                bestT = t;
-                m_WeaponMenuHover = i;
+                const float t = (m_WeaponMenuOrigin - rayOrig).Dot(n) / denom;
+                if (t > 0.04f && t < 80.f)
+                {
+                    planeHit = rayOrig + rayDir * t;
+                    haveHit = true;
+                }
+            }
+        }
+        float hx = 0.f, hy = 0.f;
+        if (haveHit && haveOrigin)
+            haveHit = ProjectWorldToScreen(planeHit, eye, vf, vr, vu, tanHalf, aspect, hw, hh, hx, hy);
+        else
+            haveHit = false;
+        if (haveHit)
+        {
+            float bestD = 1.0e9f;
+            for (int i = 0; i < m_WeaponMenuCount; ++i)
+            {
+                float cx = 0.f, cy = 0.f;
+                HexScreenCenter(ocx, ocy, m_WeaponMenuSlots[i].axialQ,
+                    m_WeaponMenuSlots[i].axialR, packR, cx, cy);
+                if (!PointInHex(hx - cx, hy - cy, drawR * 1.08f))
+                    continue;
+                const float d = (hx - cx) * (hx - cx) + (hy - cy) * (hy - cy);
+                if (d < bestD)
+                {
+                    bestD = d;
+                    m_WeaponMenuHover = i;
+                }
             }
         }
         if (m_WeaponMenuHover >= 0 && m_WeaponMenuHover != prevHover)
@@ -1225,28 +1298,29 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
     }
     float lx0 = 0.f, ly0 = 0.f, lx1 = 0.f, ly1 = 0.f;
     const bool haveLaser0 = project(rayOrig, lx0, ly0);
-    Vector laserEnd = rayOrig + rayDir * 40.f;
-    if (m_WeaponMenuHover >= 0 && m_WeaponMenuHover < m_WeaponMenuCount)
-        laserEnd = m_WeaponMenuSlots[m_WeaponMenuHover].center;
-    const bool haveLaser1 = project(laserEnd, lx1, ly1);
+    float ocx = 0.f, ocy = 0.f;
+    const bool haveOrigin = project(m_WeaponMenuOrigin, ocx, ocy);
+    const float drawR = HexDrawRadiusPx(h);
+    const float packR = drawR * kHexPackScale;
+    bool haveLaser1 = false;
+    if (m_WeaponMenuHover >= 0 && m_WeaponMenuHover < m_WeaponMenuCount && haveOrigin)
+    {
+        const WeaponMenuSlot& hs = m_WeaponMenuSlots[m_WeaponMenuHover];
+        HexScreenCenter(ocx, ocy, hs.axialQ, hs.axialR, packR, lx1, ly1);
+        haveLaser1 = true;
+    }
+    else
+    {
+        Vector laserEnd = rayOrig + rayDir * 40.f;
+        haveLaser1 = project(laserEnd, lx1, ly1);
+    }
     if (haveLaser0 && haveLaser1)
         MenuLine(device, lx0, ly0, lx1, ly1, 3.2f, D3DCOLOR_XRGB(255, 220, 80));
 
-    float packedRadius = 0.f;
+    if (!haveOrigin)
     {
-        const float z = (m_WeaponMenuOrigin - eyeOrig).Dot(fwd);
-        if (z > 3.f)
-            packedRadius = (kHexRadiusHu / z) / tanHalf * (static_cast<float>(w) * 0.5f) * kHexGutter;
-        if (!(packedRadius > 4.f))
-        {
-            float c0x = 0.f, c0y = 0.f, n0x = 0.f, n0y = 0.f;
-            if (project(m_WeaponMenuOrigin, c0x, c0y)
-                && project(m_WeaponMenuOrigin + m_WeaponMenuRight * (kHexRadiusHu * kSqrt3), n0x, n0y))
-            {
-                const float neighbor = sqrtf((n0x - c0x) * (n0x - c0x) + (n0y - c0y) * (n0y - c0y));
-                packedRadius = neighbor / kSqrt3 * kHexGutter;
-            }
-        }
+        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        return;
     }
 
     for (int i = 0; i < m_WeaponMenuCount; ++i)
@@ -1254,21 +1328,9 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
         const WeaponMenuSlot& slot = m_WeaponMenuSlots[i];
         const bool hover = (i == m_WeaponMenuHover);
         float cx = 0.f, cy = 0.f;
-        if (!project(slot.center, cx, cy))
-            continue;
-        float radius = packedRadius;
-        if (!(radius > 4.f))
-        {
-            const float z = (slot.center - eyeOrig).Dot(fwd);
-            if (z > 3.f)
-                radius = (kHexRadiusHu / z) / tanHalf * (static_cast<float>(w) * 0.5f) * kHexGutter;
-        }
-        if (!(radius > 4.f))
-        {
-            float ex = 0.f, ey = 0.f;
-            project(slot.center + m_WeaponMenuRight * kHexRadiusHu, ex, ey);
-            radius = sqrtf((ex - cx) * (ex - cx) + (ey - cy) * (ey - cy)) * kHexGutter;
-        }
+        HexScreenCenter(ocx, ocy, slot.axialQ, slot.axialR, packR, cx, cy);
+        const float radius = drawR;
+        const float edge = radius * 0.22f;
         const D3DCOLOR fill = hover
             ? D3DCOLOR_ARGB(210, 48, 36, 10)
             : D3DCOLOR_ARGB(170, 14, 12, 8);
@@ -1276,9 +1338,9 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
             ? D3DCOLOR_XRGB(255, 240, 140)
             : (slot.equipped ? D3DCOLOR_XRGB(255, 176, 0) : D3DCOLOR_ARGB(220, 200, 140, 30));
         DrawHexFill(device, cx, cy, radius, fill);
-        DrawHexOutline(device, cx, cy, radius, hover ? 5.5f : 3.0f, frame);
+        DrawHexOutline(device, cx, cy, radius, hover ? edge * 1.15f : edge, frame);
         if (hover)
-            DrawHexOutline(device, cx, cy, radius + 3.f, 2.0f, D3DCOLOR_ARGB(180, 255, 255, 200));
+            DrawHexOutline(device, cx, cy, radius + edge * 0.45f, edge * 0.4f, D3DCOLOR_ARGB(180, 255, 255, 200));
 
         if (slot.emptyHand)
             continue;
@@ -1406,8 +1468,14 @@ void VR::PulseHandHaptic(vr::ETrackedControllerRole hand, unsigned short duratio
         // OpenXR duration is real vibration time; 2ms is below SteamVR's floor.
         float seconds = durationUs / 1000000.0f;
         if (durationUs <= 3999)
-            seconds = std::clamp(durationUs / 3999.0f * 0.14f, 0.06f, 0.16f);
-        L4D2VR_PublishOpenXrHapticRequest(openXrHand, seconds, 0.0f, amplitude);
+            seconds = std::clamp(durationUs / 3999.0f * 0.16f, 0.08f, 0.18f);
+        L4D2VR_PublishOpenXrHapticRequest(openXrHand, seconds, 160.0f, amplitude);
+        static int s_hapticLog;
+        if (s_hapticLog < 8)
+        {
+            Game::logMsg("OpenXR haptic hand=%u dur=%.3fs amp=%.2f", openXrHand, seconds, amplitude);
+            ++s_hapticLog;
+        }
         return;
     }
     if (!m_System)
