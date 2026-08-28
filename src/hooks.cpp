@@ -206,6 +206,11 @@ namespace
     thread_local RtStackEntry g_RtStack[kRtStackMax]{};
     thread_local int g_RtStackDepth = 0;
     thread_local int g_AuxRtDepth = 0;
+    bool g_CostActive = false;
+    int g_ShadowPush = 0;
+    int g_GbDepthPush = 0;
+    int g_GbLightPush = 0;
+    int g_LsMaskPush = 0;
 
     bool NestedRenderView()
     {
@@ -267,6 +272,18 @@ namespace
         e.aux = smallVp || TextureNameIsAuxSceneRt(e.name);
         if (e.aux)
             ++g_AuxRtDepth;
+        if (g_CostActive && name)
+        {
+            if (std::strstr(name, "shadow") || std::strstr(name, "Shadow")
+                || std::strstr(name, "CSM") || std::strstr(name, "csm"))
+                ++g_ShadowPush;
+            if (std::strstr(name, "gbdepth") || std::strstr(name, "gbDepth") || std::strstr(name, "GBDepth"))
+                ++g_GbDepthPush;
+            if (std::strstr(name, "gblight") || std::strstr(name, "gbLight") || std::strstr(name, "GBLight"))
+                ++g_GbLightPush;
+            if (std::strstr(name, "lsmask") || std::strstr(name, "lsMask") || std::strstr(name, "LSMask"))
+                ++g_LsMaskPush;
+        }
     }
 
     void NotePopRt()
@@ -350,24 +367,135 @@ namespace
 
     bool CachedModelIsViewmodel(void* pModel)
     {
-        struct Entry { void* model; bool isVm; };
-        static Entry cache[64]{};
-        static unsigned n = 0;
+        struct Entry { void* model; bool isVm; bool filled; };
+        static Entry cache[256]{};
         if (!pModel)
             return false;
-        const unsigned count = n < 64 ? n : 64u;
-        for (unsigned i = 0; i < count; ++i)
-        {
-            if (cache[i].model == pModel)
-                return cache[i].isVm;
-        }
+        const unsigned i = (static_cast<unsigned>(reinterpret_cast<uintptr_t>(pModel) >> 4)) & 255u;
+        if (cache[i].filled && cache[i].model == pModel)
+            return cache[i].isVm;
         const char* name = nullptr;
         if (Hooks::m_Game && Hooks::m_Game->m_ModelInfo)
             name = SafeModelName(Hooks::m_Game->m_ModelInfo, pModel);
         const bool vm = ModelNameIsViewmodel(name);
-        cache[n % 64] = { pModel, vm };
-        ++n;
+        cache[i] = { pModel, vm, true };
         return vm;
+    }
+
+    int g_CachedLocalPlayer = 0;
+    bool g_HaveCachedLocalPlayer = false;
+
+    int CachedLocalPlayerIndex()
+    {
+        if (g_HaveCachedLocalPlayer)
+            return g_CachedLocalPlayer;
+        g_CachedLocalPlayer = SafeLocalPlayerIndex();
+        g_HaveCachedLocalPlayer = true;
+        return g_CachedLocalPlayer;
+    }
+
+    long long QpcNow()
+    {
+        LARGE_INTEGER t;
+        QueryPerformanceCounter(&t);
+        return t.QuadPart;
+    }
+
+    double QpcMs(long long ticks)
+    {
+        static double s_ms = 0.0;
+        if (s_ms == 0.0)
+        {
+            LARGE_INTEGER f;
+            QueryPerformanceFrequency(&f);
+            s_ms = 1000.0 / static_cast<double>(f.QuadPart);
+        }
+        return static_cast<double>(ticks) * s_ms;
+    }
+
+    struct StereoCost
+    {
+        long long leftTicks = 0;
+        long long rightTicks = 0;
+        long long blitTicks = 0;
+        long long handsTicks = 0;
+        long long dmeOrigTicks = 0;
+        long long dmeHookTicks = 0;
+        int dme = 0;
+        int dmeL = 0;
+        int dmeR = 0;
+        int dmeEnt = 0;
+        int dmeVm = 0;
+        int dmeShadow = 0;
+        int dmeBones32 = 0;
+        int uniqEnt = 0;
+        uint32_t seenEnt[128]{};
+        void* lastCharModel = nullptr;
+        int eye = 0;
+        bool active = false;
+    };
+    StereoCost g_Cost{};
+
+    void CostMarkEnt(int idx)
+    {
+        if (idx <= 1 || idx >= 4096)
+            return;
+        const unsigned w = static_cast<unsigned>(idx) >> 5;
+        const unsigned b = static_cast<unsigned>(idx) & 31u;
+        const uint32_t bit = 1u << b;
+        if (g_Cost.seenEnt[w] & bit)
+            return;
+        g_Cost.seenEnt[w] |= bit;
+        ++g_Cost.uniqEnt;
+    }
+
+    void StereoCostBegin()
+    {
+        g_Cost = StereoCost{};
+        g_Cost.active = true;
+        g_CostActive = true;
+        g_ShadowPush = 0;
+        g_GbDepthPush = 0;
+        g_GbLightPush = 0;
+        g_LsMaskPush = 0;
+        g_HaveCachedLocalPlayer = false;
+    }
+
+    void StereoCostLog()
+    {
+        if (!g_Cost.active)
+            return;
+        g_Cost.active = false;
+        g_CostActive = false;
+        const double leftMs = QpcMs(g_Cost.leftTicks);
+        const double rightMs = QpcMs(g_Cost.rightTicks);
+        const double pairMs = leftMs + rightMs;
+        const double blitMs = QpcMs(g_Cost.blitTicks);
+        const double handsMs = QpcMs(g_Cost.handsTicks);
+        const double origMs = QpcMs(g_Cost.dmeOrigTicks);
+        const double hookMs = QpcMs(g_Cost.dmeHookTicks);
+        static DWORD s_lastLogMs;
+        const DWORD now = GetTickCount();
+        const bool slow = pairMs >= 20.0;
+        if (!slow && (now - s_lastLogMs) < 1000)
+            return;
+        if (slow && (now - s_lastLogMs) < 200)
+            return;
+        s_lastLogMs = now;
+        const char* charName = "?";
+        if (g_Cost.lastCharModel && Hooks::m_Game && Hooks::m_Game->m_ModelInfo)
+        {
+            const char* n = SafeModelName(Hooks::m_Game->m_ModelInfo, g_Cost.lastCharModel);
+            if (n && n[0])
+                charName = n;
+        }
+        Game::logMsg(
+            "Stereo cost pair=%.1fms L=%.1f R=%.1f blit=%.1f hands=%.1f dme=%d (L=%d R=%d) orig=%.1fms hook=%.1fms ents=%d uniq=%d bones32+=%d shadowDme=%d shadowPush=%d vm=%d gbDepth=%d gbLight=%d lsMask=%d char=%s",
+            pairMs, leftMs, rightMs, blitMs, handsMs,
+            g_Cost.dme, g_Cost.dmeL, g_Cost.dmeR, origMs, hookMs,
+            g_Cost.dmeEnt, g_Cost.uniqEnt, g_Cost.dmeBones32,
+            g_Cost.dmeShadow, g_ShadowPush, g_Cost.dmeVm,
+            g_GbDepthPush, g_GbLightPush, g_LsMaskPush, charName);
     }
 
     // Source DrawModelState_t (x86). CModelRender::DrawModelExecute
@@ -423,6 +551,7 @@ namespace
 
     unsigned char* g_LastViewmodelStudioHdr = nullptr;
     int g_LastViewmodelIdleSeq = -1;
+    const char* StudioSequenceLabel(unsigned char* hdr, int seq);
 
     bool SequenceLabelLooksLikeWeaponAction(const char* label)
     {
@@ -463,6 +592,135 @@ namespace
         if (has("idle") && !has("to") && !has("from"))
             return true;
         return false;
+    }
+
+    bool SequenceLabelLooksLikeEquipOnly(const char* label)
+    {
+        if (!label || !label[0])
+            return false;
+        char buf[96]{};
+        for (int i = 0; i < 95 && label[i]; ++i)
+            buf[i] = static_cast<char>(tolower(static_cast<unsigned char>(label[i])));
+        auto has = [&](const char* s) { return std::strstr(buf, s) != nullptr; };
+        return has("draw") || has("holster") || has("deploy") || has("pickup") || has("admire");
+    }
+
+    int FindIdleSequence(unsigned char* hdr)
+    {
+        if (!hdr)
+            return -1;
+        int numSeq = 0;
+        __try
+        {
+            numSeq = *reinterpret_cast<int*>(hdr + kStudioHdrNumLocalSeq);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return -1;
+        }
+        if (numSeq <= 0 || numSeq > 64)
+            return -1;
+        int best = -1;
+        int bestScore = -1;
+        for (int i = 0; i < numSeq; ++i)
+        {
+            const char* label = StudioSequenceLabel(hdr, i);
+            if (!label || !label[0])
+                continue;
+            char buf[96]{};
+            for (int n = 0; n < 95 && label[n]; ++n)
+                buf[n] = static_cast<char>(tolower(static_cast<unsigned char>(label[n])));
+            auto has = [&](const char* s) { return std::strstr(buf, s) != nullptr; };
+            if (has("draw") || has("holster") || has("deploy") || has("reload")
+                || has("fire") || has("shoot") || has("attack") || has("hit")
+                || has("miss") || has("sprint") || has("low") || has("to") || has("from"))
+                continue;
+            int score = 0;
+            if (std::strcmp(buf, "idle1") == 0)
+                score = 4;
+            else if (std::strcmp(buf, "idle") == 0)
+                score = 3;
+            else if (has("idle") && !has("fidget"))
+                score = 2;
+            else if (has("idle"))
+                score = 1;
+            if (score > bestScore)
+            {
+                bestScore = score;
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    void ForceViewmodelIdlePose(void* viewmodel, unsigned char* hdr)
+    {
+        if (!viewmodel)
+            return;
+        const int idle = FindIdleSequence(hdr);
+        __try
+        {
+            if (idle >= 0)
+                *reinterpret_cast<int*>(static_cast<char*>(viewmodel) + kViewmodelSequence) = idle;
+            *reinterpret_cast<float*>(static_cast<char*>(viewmodel) + kViewmodelCycle) = 0.f;
+            *reinterpret_cast<float*>(static_cast<char*>(viewmodel) + kViewmodelPlaybackRate) = 0.f;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        static int s_idleLog;
+        if (s_idleLog < 8)
+        {
+            const char* label = idle >= 0 ? StudioSequenceLabel(hdr, idle) : "?";
+            Game::logMsg("Viewmodel force idle seq=%d '%s'", idle, label ? label : "?");
+            ++s_idleLog;
+        }
+    }
+
+    bool ViewmodelNameHas(const char* model, const char* token)
+    {
+        return model && token && std::strstr(model, token) != nullptr;
+    }
+
+    bool IsCrowbarViewmodel(const char* model)
+    {
+        return ViewmodelNameHas(model, "crowbar") || ViewmodelNameHas(model, "Crowbar")
+            || ViewmodelNameHas(model, "wrench") || ViewmodelNameHas(model, "Wrench");
+    }
+
+    bool IsMp5Viewmodel(const char* model)
+    {
+        return ViewmodelNameHas(model, "mp5") || ViewmodelNameHas(model, "MP5")
+            || ViewmodelNameHas(model, "smg") || ViewmodelNameHas(model, "mp5k");
+    }
+
+    void ZeroPlayerViewRecoil(void* player)
+    {
+        if (!player)
+            return;
+        // DT_LocalPlayerExclusive m_Local +0x103C. DT_Local m_vecPunchAngle +0x74,
+        // m_vecPunchAngleVel +0xB0 (Ghidra FUN_100b7240 / FUN_100b6d20).
+        // DT_BlackMesaPlayer m_recoilPunchAngles +0x1934, m_recoilPositionOffset +0x1940
+        // (FUN_1025cb60).
+        __try
+        {
+            float* punch = reinterpret_cast<float*>(
+                static_cast<char*>(player) + 0x103C + 0x74);
+            float* punchVel = reinterpret_cast<float*>(
+                static_cast<char*>(player) + 0x103C + 0xB0);
+            float* recoil = reinterpret_cast<float*>(
+                static_cast<char*>(player) + 0x1934);
+            float* recoilPos = reinterpret_cast<float*>(
+                static_cast<char*>(player) + 0x1940);
+            float* recoilStart = reinterpret_cast<float*>(
+                static_cast<char*>(player) + 0x194C);
+            punch[0] = punch[1] = punch[2] = 0.f;
+            punchVel[0] = punchVel[1] = punchVel[2] = 0.f;
+            recoil[0] = recoil[1] = recoil[2] = 0.f;
+            recoilPos[0] = recoilPos[1] = recoilPos[2] = 0.f;
+            *recoilStart = 0.f;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
     }
 
     const char* StudioSequenceLabel(unsigned char* hdr, int seq)
@@ -515,6 +773,43 @@ namespace
         const bool melee = Hooks::m_VR->IsPerformingMelee();
         const bool isAction = SequenceLabelLooksLikeWeaponAction(label);
         const bool isLoco = SequenceLabelLooksLikeLocomotionOnly(label);
+        const char* model = nullptr;
+        if (Hooks::m_Game)
+            model = Hooks::m_Game->GetEntityModelName(static_cast<C_BaseEntity*>(viewmodel));
+        if (!model || !model[0])
+            model = Hooks::m_VR->m_LastViewmodelModel.c_str();
+        const bool crowbar = IsCrowbarViewmodel(model);
+
+        auto restoreRate = [&]() {
+            __try
+            {
+                float* rate = reinterpret_cast<float*>(static_cast<char*>(viewmodel) + kViewmodelPlaybackRate);
+                if (*rate <= 0.01f)
+                    *rate = 1.f;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        };
+        auto freeze = [&]() {
+            __try
+            {
+                *reinterpret_cast<float*>(static_cast<char*>(viewmodel) + kViewmodelCycle) = 0.f;
+                *reinterpret_cast<float*>(static_cast<char*>(viewmodel) + kViewmodelPlaybackRate) = 0.f;
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        };
+
+        // Crowbar: keep only equip/draw. Attack/idle/sprint would otherwise
+        // snap to the first frame of HITCENTER. Force the idle sequence so
+        // the controller is the swing (implementation-plan §9).
+        // Never freeze MP5 (or any other gun) fire/reload/draw here.
+        if (crowbar)
+        {
+            if (SequenceLabelLooksLikeEquipOnly(label))
+                restoreRate();
+            else
+                ForceViewmodelIdlePose(viewmodel, hdr);
+            return;
+        }
 
         // Crowbar VR swing: pin cycle once without thrashing every frame
         // (that made HITCENTER look jerky). Prefer idle hold when possible.
@@ -525,11 +820,7 @@ namespace
                     || std::strstr(label, "miss") || std::strstr(label, "MISS")
                     || std::strstr(label, "attack") || std::strstr(label, "Attack")))
             {
-                __try
-                {
-                    *reinterpret_cast<float*>(static_cast<char*>(viewmodel) + kViewmodelPlaybackRate) = 0.f;
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER) {}
+                ForceViewmodelIdlePose(viewmodel, hdr);
             }
             return;
         }
@@ -538,24 +829,9 @@ namespace
         // sprint/swim/walk/run/bob/idle/fidget. Never freeze draw/holster/
         // reload/fire/attack. If idle zeroed playbackRate, restore 1 on action.
         if (isLoco && !isAction)
-        {
-            __try
-            {
-                *reinterpret_cast<float*>(static_cast<char*>(viewmodel) + kViewmodelCycle) = 0.f;
-                *reinterpret_cast<float*>(static_cast<char*>(viewmodel) + kViewmodelPlaybackRate) = 0.f;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {}
-        }
+            freeze();
         else
-        {
-            __try
-            {
-                float* rate = reinterpret_cast<float*>(static_cast<char*>(viewmodel) + kViewmodelPlaybackRate);
-                if (*rate <= 0.01f)
-                    *rate = 1.f;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {}
-        }
+            restoreRate();
     }
 
     unsigned char* AsStudioHdr(void* p)
@@ -826,7 +1102,8 @@ namespace
             || std::strstr(buf, "v_rpg") || std::strstr(buf, "tau")
             || std::strstr(buf, "egon") || std::strstr(buf, "gauss")
             || std::strstr(buf, "glock") || std::strstr(buf, "shotgun")
-            || std::strstr(buf, "wrench"))
+            || std::strstr(buf, "wrench") || std::strstr(buf, "hgun")
+            || std::strstr(buf, "hive") || std::strcmp(buf, "mainbody") == 0)
             return 10;
         return 1;
     }
@@ -1835,14 +2112,15 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         }
         m_VR->m_StereoBodyOrigin = setup.origin;
         m_VR->m_HasStereoBodyOrigin = true;
+        StereoCostBegin();
+        g_Cost.eye = 1;
         m_VR->m_StereoEye = 1;
         m_VR->BeginStereoEyeBlit(m_VR->m_D9LeftEyeSurface);
         {
-            // HUD in the eyes sits at 16:9 monitor edges of the HMD frustum.
-            // Gameplay HUD is restored in one window-sized DRAWHUD pass after
-            // both eyes. Extra VGui_Paint cannot fill _rt_gui.
             const int eyeDraw = whatToDraw & ~kRenderViewDrawHud;
+            const long long t0 = QpcNow();
             callOriginal(leftEyeView, nClearFlags, eyeDraw);
+            g_Cost.leftTicks += QpcNow() - t0;
         }
         const bool leftUnbind = m_VR->EndStereoEyeBlit();
         {
@@ -1854,14 +2132,21 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 && m_VR->StereoRedirectedToEye();
             if (!keepNative)
             {
+                const long long t0 = QpcNow();
                 const bool leftBb = m_VR->BlitHmdViewFromBackbuffer(
                     m_VR->m_D9LeftEyeSurface, bmvr::g_StereoBlitGpuFlush);
                 if (!leftBb)
                     m_VR->BlitCurrentGameColorTo(
                         m_VR->m_D9LeftEyeSurface, bmvr::g_StereoBlitGpuFlush);
+                g_Cost.blitTicks += QpcNow() - t0;
             }
-            if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud)
+            if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud
+                || m_VR->WeaponMenuOpen())
+            {
+                const long long t0 = QpcNow();
                 m_VR->DrawIndependentHandMarkers(m_VR->ColorTargetForStereoEye(1), 1);
+                g_Cost.handsTicks += QpcNow() - t0;
+            }
         }
         if (s_eyeRvLog < 8)
         {
@@ -1869,11 +2154,15 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 rightEyeView.width, rightEyeView.height);
             ++s_eyeRvLog;
         }
+        g_Cost.eye = 2;
+        g_Cost.eye = 2;
         m_VR->m_StereoEye = 2;
         m_VR->BeginStereoEyeBlit(m_VR->m_D9RightEyeSurface);
         {
             const int eyeDraw = whatToDraw & ~kRenderViewDrawHud;
+            const long long t0 = QpcNow();
             callOriginal(rightEyeView, nClearFlags, eyeDraw);
+            g_Cost.rightTicks += QpcNow() - t0;
         }
         const bool rightUnbind = m_VR->EndStereoEyeBlit();
         {
@@ -1882,13 +2171,20 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 && m_VR->StereoRedirectedToEye();
             if (!keepNative)
             {
+                const long long t0 = QpcNow();
                 const bool rightBb = m_VR->BlitHmdViewFromBackbuffer(
                     m_VR->m_D9RightEyeSurface, false);
                 if (!rightBb)
                     m_VR->BlitCurrentGameColorTo(m_VR->m_D9RightEyeSurface, false);
+                g_Cost.blitTicks += QpcNow() - t0;
             }
-            if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud)
+            if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud
+                || m_VR->WeaponMenuOpen())
+            {
+                const long long t0 = QpcNow();
                 m_VR->DrawIndependentHandMarkers(m_VR->ColorTargetForStereoEye(2), 2);
+                g_Cost.handsTicks += QpcNow() - t0;
+            }
         }
         m_VR->m_StereoEye = 0;
         if (bmvr::OffscreenWorldMatchesEyes())
@@ -1917,6 +2213,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes)
             m_VR->DrawIndependentHandsOnDesktop();
         m_VR->m_HasStereoBodyOrigin = false;
+        StereoCostLog();
         // Do not stretch eyes onto the backbuffer. That overwrote the
         // engine's 1584 tram strip with a black A2R10 copy (2026-08-18).
 
@@ -1969,6 +2266,44 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
     if (!cmd)
         return hkCreateMove.fOriginal(ecx, flInputSampleTime, cmd);
 
+    auto applyControllerAim = [&]() {
+        if (!m_VR || !m_VR->m_IsVREnabled || !cmd->command_number)
+            return;
+        if (!(m_VR->IsGameplayEligible() && EngineInGame() && m_VR->m_HmdPoseValid))
+            return;
+        const Vector hmdVa = m_VR->GetViewAngle();
+        if (m_VR->m_ControllerPoseValid)
+        {
+            QAngle aim = m_VR->GetRightControllerAbsAngle();
+            if (aim.x > 180.f) aim.x -= 360.f;
+            if (aim.x < -180.f) aim.x += 360.f;
+            if (aim.x > 89.f) aim.x = 89.f;
+            if (aim.x < -89.f) aim.x = -89.f;
+            cmd->viewangles.Init(aim.x, aim.y, 0.f);
+        }
+        else
+            cmd->viewangles.Init(hmdVa.x, hmdVa.y, 0.f);
+    };
+
+    void* localPlayer = nullptr;
+    bool mp5 = false;
+    if (m_Game && m_Game->m_EngineClient && m_Game->m_ClientEntityList)
+    {
+        const int local = m_Game->m_EngineClient->GetLocalPlayer();
+        if (local > 0)
+            localPlayer = m_Game->m_ClientEntityList->GetClientEntity(local);
+        mp5 = IsMp5Viewmodel(m_Game->GetActiveWeaponModelName());
+        if (!mp5 && m_VR)
+            mp5 = IsMp5Viewmodel(m_VR->m_LastViewmodelModel.c_str());
+    }
+    if (m_VR && m_VR->EmptyHands())
+        cmd->buttons &= ~(IN_ATTACK | IN_ATTACK2);
+    if (mp5)
+        ZeroPlayerViewRecoil(localPlayer);
+    // FireBullets runs inside original CreateMove. Aim and MP5 punch must
+    // be applied before that, not after (post-hook was too late for bullets).
+    applyControllerAim();
+
     bool result = hkCreateMove.fOriginal(ecx, flInputSampleTime, cmd);
 
     if (m_VR && cmd->command_number && m_VR->IsGameplayEligible())
@@ -1982,23 +2317,11 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
     // BM has no FireTerror / Weapon_ShootPosition yet, so cmd viewangles is
     // the aim. Stick walk stays HMD-relative by rotating analog into the
     // controller yaw frame. Do not hook EyePosition (that would move the camera).
-    if (m_VR->IsGameplayEligible() && EngineInGame() && m_VR->m_HmdPoseValid)
-    {
-        const Vector hmdVa = m_VR->GetViewAngle();
-        if (m_VR->m_ControllerPoseValid)
-        {
-            QAngle aim = m_VR->GetRightControllerAbsAngle();
-            // L4D2VR melee: CreateMove viewangles stay controller, not blade
-            // pitch. Hit geometry is the client fan from viewmodel abs origin.
-            if (aim.x > 180.f) aim.x -= 360.f;
-            if (aim.x < -180.f) aim.x += 360.f;
-            if (aim.x > 89.f) aim.x = 89.f;
-            if (aim.x < -89.f) aim.x = -89.f;
-            cmd->viewangles.Init(aim.x, aim.y, 0.f);
-        }
-        else
-            cmd->viewangles.Init(hmdVa.x, hmdVa.y, 0.f);
-    }
+    applyControllerAim();
+    if (mp5)
+        ZeroPlayerViewRecoil(localPlayer);
+    if (m_VR && m_VR->EmptyHands())
+        cmd->buttons &= ~(IN_ATTACK | IN_ATTACK2);
 
     if (m_VR)
         m_VR->FlushPendingGameUi();
@@ -2052,6 +2375,12 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
         else
             Game::logMsg("Weapon cycle skipped (no other weapon) dir=%d", inv);
     }
+    const int menuWeap = m_VR->m_PendingWeaponSelect.exchange(0, std::memory_order_acq_rel);
+    if (menuWeap > 0)
+    {
+        cmd->weaponselect = menuWeap;
+        Game::logMsg("Weapon menu via CUserCmd weaponselect=%d", menuWeap);
+    }
     return result;
 }
 
@@ -2099,10 +2428,27 @@ void __fastcall Hooks::dCalcViewModelView(void* ecx, void* edx, void* owner, con
             // lag/bob and $origin are in the same frame as the hard-lock.
             const Vector targetOrigin = m_VR->GetRecommendedViewmodelAbsPos(eyePosition);
             const QAngle targetAng = m_VR->GetRecommendedViewmodelAbsAngle();
+            // Crowbar idle-force runs in SuppressViewmodelMovementAnims.
+            // MP5 fire sequences must keep playing (never idle-force those).
+            if (m_Game)
+            {
+                const char* weaponModel = m_Game->GetActiveWeaponModelName();
+                if (IsMp5Viewmodel(weaponModel)
+                    || (m_VR && IsMp5Viewmodel(m_VR->m_LastViewmodelModel.c_str())))
+                    ZeroPlayerViewRecoil(owner);
+            }
+            SuppressViewmodelMovementAnims(ecx);
             CallCalcViewModelViewOriginal(ecx, owner, targetOrigin, targetAng);
             const float origin3[3] = { targetOrigin.x, targetOrigin.y, targetOrigin.z };
             const float angles3[3] = { targetAng.x, targetAng.y, targetAng.z };
             CallSetAbsOriginAngles(ecx, origin3, angles3);
+            if (m_Game)
+            {
+                const char* weaponModel = m_Game->GetActiveWeaponModelName();
+                if (IsMp5Viewmodel(weaponModel)
+                    || (m_VR && IsMp5Viewmodel(m_VR->m_LastViewmodelModel.c_str())))
+                    ZeroPlayerViewRecoil(owner);
+            }
             SuppressViewmodelMovementAnims(ecx);
             return;
         }
@@ -2152,6 +2498,7 @@ void __fastcall Hooks::dGetViewport(void* ecx, void* edx, int& x, int& y, int& w
 void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, const ModelRenderInfo_t& info, void* pCustomBoneToWorld)
 {
     (void)edx;
+    const long long dmeEnter = g_Cost.active ? QpcNow() : 0;
     char modelNameBuf[260]{};
     bool hideArms = false;
     bool skipLocal = false;
@@ -2160,9 +2507,10 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
     int body = 0;
     int skin = 0;
     int entityIndex = 0;
+    void* pModel = nullptr;
     __try
     {
-        void* pModel = info.pModel;
+        pModel = info.pModel;
         entityIndex = info.entity_index;
         body = info.body;
         skin = info.skin;
@@ -2170,7 +2518,7 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
             && m_VR
             && m_VR->IsGameplayEligible())
         {
-            const int local = SafeLocalPlayerIndex();
+            const int local = CachedLocalPlayerIndex();
             if (local > 0 && entityIndex == local)
                 skipLocal = true;
         }
@@ -2210,6 +2558,40 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
         Game::logMsg("DME info SEH - passthrough original");
     }
 
+    if (g_Cost.active)
+    {
+        ++g_Cost.dme;
+        if (g_Cost.eye == 1)
+            ++g_Cost.dmeL;
+        else if (g_Cost.eye == 2)
+            ++g_Cost.dmeR;
+        if (AuxSceneRtBound())
+            ++g_Cost.dmeShadow;
+        if (isViewmodel)
+            ++g_Cost.dmeVm;
+        if (entityIndex > 1)
+        {
+            ++g_Cost.dmeEnt;
+            CostMarkEnt(entityIndex);
+        }
+        if (state)
+        {
+            const auto* lite = reinterpret_cast<const DrawModelStateLite*>(state);
+            const unsigned char* hdr = lite->studioHdr;
+            if (hdr)
+            {
+                const int nb = *reinterpret_cast<const int*>(hdr + kStudioHdrNumBones);
+                if (nb >= 32 && nb <= kMaxStudioBones)
+                {
+                    ++g_Cost.dmeBones32;
+                    if (pModel)
+                        g_Cost.lastCharModel = pModel;
+                }
+            }
+        }
+        g_Cost.dmeHookTicks += QpcNow() - dmeEnter;
+    }
+
     if (skipLocal)
     {
         static int s_hideLog;
@@ -2220,6 +2602,9 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
         }
         return;
     }
+
+    if (isViewmodel && m_VR && m_VR->EmptyHands() && m_VR->IsGameplayEligible() && EngineInGame())
+        return;
 
     if (isViewmodel && m_VR && m_VR->IsGameplayEligible() && EngineInGame())
         ApplyViewmodelStudioWork(state, modelName, body, skin, hideArms, pCustomBoneToWorld);
@@ -2237,6 +2622,16 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
             if (modelName && (std::strstr(modelName, "shotgun") || std::strstr(modelName, "spas")
                 || std::strstr(modelName, "pump")))
                 s = 0.64f;
+            if (modelName && (std::strstr(modelName, "grenade") || std::strstr(modelName, "Grenade")
+                || std::strstr(modelName, "frag") || std::strstr(modelName, "Frag")))
+                s *= 1.25f;
+            if (modelName && (std::strstr(modelName, "357") || std::strstr(modelName, "python")
+                || std::strstr(modelName, "revolver") || std::strstr(modelName, "Revolver")))
+                s *= 1.15f;
+            if (s < 0.2f)
+                s = 0.2f;
+            if (s > 1.5f)
+                s = 1.5f;
             return s;
         }();
         float yFix = 1.f;
@@ -2359,7 +2754,10 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
     {
         __try
         {
+            const long long t0 = g_Cost.active ? QpcNow() : 0;
             hkDrawModelExecute.fOriginal(ecx, state, *infoToDraw, bonesToDraw);
+            if (g_Cost.active)
+                g_Cost.dmeOrigTicks += QpcNow() - t0;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {

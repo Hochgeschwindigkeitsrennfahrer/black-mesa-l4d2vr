@@ -7,8 +7,8 @@ L4D2VR is not a separate injector plus a graphics hook. It is **one Win32 `d3d9.
 1. Full DXVK D3D9→Vulkan translation (fork under `dxvk_new`).
 2. `DllMain` starts a thread that constructs `Game` after Source modules exist.
 3. `Game` uses `CreateInterface` + MinHook signature scans.
-4. `VR` calls `VR_Init(VRApplication_Scene)` and `IVRCompositor::Submit` with `TextureType_Vulkan`.
-5. DXVK `IDirect3DVR9` (`d3d9_vr.h`, UUID `7e272b32-a49c-46c7-b1a4-ef52936bec87`) exposes `GetVRDesc`, `TransferSurface`, `LockSubmissionQueue`, `GetD3DDevice`.
+4. `VR` selects `VRRuntimeBackend` from `VR/config.txt`. `openvr` calls `VR_Init(VRApplication_Scene)` and `IVRCompositor::Submit` with `TextureType_Vulkan`. `openxr` launches L4D2VR's x64 `OpenXRHelper64.exe`, which owns the OpenXR session and `xrEndFrame`s shared KMT eye textures.
+5. DXVK `IDirect3DVR9` (`d3d9_vr.h`, UUID `7e272b32-a49c-46c7-b1a4-ef52936bec87`) exposes `GetVRDesc`, `TransferSurface`, `LockSubmissionQueue`, `GetD3DDevice`. OpenXR adds KMT `SharedHandle` fields on `D3D9_TEXTURE_VR_DESC`.
 6. Eye textures are created with `VR::m_CreatingTextureID` set so `D3D9DeviceEx::CreateTexture` fills `m_D9*Surface` + `m_VK*` Vulkan descriptors.
 7. `D3D9DeviceEx::Present` (inside DXVK) resolves/mirrors, presents the desktop swapchain, then calls `VR::Update()` (poses + submit).
 
@@ -37,7 +37,7 @@ That combined-DLL design is the default here.
 | Swapchain forced to HMD size in `CreateDevice` | **Skipped after verify:** 3168×3100 blacked the desktop and stopped Submit after Reset | Desktop window size; private eye RTs + backbuffer capture |
 | Exclusive fullscreen `Reset` | **Refused after verify:** `Windowed=false` + `ChangeDisplaySettings` 1920×1080@0 Reset-looped, 1 FPS, crash, leftover desktop res | Force `Windowed=TRUE` (`DXVK_FORCE_WINDOWED`) |
 | `WaitDeviceIdle` | After `TransferSurface` | `TransferSurface(..., FALSE)` only |
-| OpenVR | OpenVR | — |
+| OpenVR | OpenVR **or** L4D2VR `openxr` branch (`VRRuntimeBackend=openxr`) | Helper missing → OpenVR fallback |
 
 Prototype OpenXR crashes are not treated as hard bans. Crash-sticky files `bmvr_in_*.flag` next to the loaded `d3d9.dll` disable only the attempt that killed the previous process.
 
@@ -49,11 +49,11 @@ On modern Windows the launcher calls `SetDefaultDllDirectories(0xC00)` (`USER_DI
 
 ```
 CreateDevice: desktop swapchain (HMD size skipped) + IDirect3DVR9
-  → VR::InitOpenVR on the Game thread
+  → VR::InitOpenVR or InitOpenXR on the Game thread
   → private eye CreateTexture (named RTs skipped: bad GetBackBufferFormat)
   → single RenderView (stereo needs named ITexture*)
   → pre-Present StretchRect RT0 or GetBackBuffer → eye textures
-  → VR::Update: WaitGetPoses, TransferSurface, IVRCompositor::Submit
+  → VR::Update: WaitGetPoses + IVRCompositor::Submit, or OpenXR shared-texture publish to OpenXRHelper64
 ```
 
 If named RTs or double RenderView are disabled, capture is unbind/pre-Present `StretchRect` of FullFrameFB or the swapchain backbuffer (after Reset, RT0 is often null).

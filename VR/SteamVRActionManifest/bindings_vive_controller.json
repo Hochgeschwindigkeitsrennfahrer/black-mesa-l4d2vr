@@ -56,7 +56,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/ResetPosition"
+                     "output": "/actions/main/in/WeaponMenu"
                   },
                   "position": {
                      "output": "/actions/main/in/Turn"

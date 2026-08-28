@@ -5,7 +5,7 @@ L4D2VR’s VR architecture adapted to Steam **Black Mesa** (Win32, DXVK).
 Primary reference: https://github.com/keyou91/l4d2vr  
 Secondary (BM-specific evidence only): https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr
 
-This is **not** a new VR design. The shipped artifact is a combined `d3d9.dll` (L4D2VR’s DXVK fork + OpenVR + Black Mesa hooks).
+This is **not** a new VR design. The shipped artifact is a combined `d3d9.dll` (L4D2VR’s DXVK fork + OpenVR or L4D2VR’s x64 OpenXR helper + Black Mesa hooks).
 
 Sources live in `src/`. The `L4D2VR/` folder is only include shims so DXVK can `#include "L4D2VR/game.h"`.
 
@@ -14,7 +14,7 @@ Sources live in `src/`. The `L4D2VR/` folder is only include shims so DXVK can `
 | Milestone | State |
 | --- | --- |
 | Implemented | Yes (L4D2VR-style `d3d9.dll`, BM offsets, capture Submit fallback) |
-| Compiled | Yes — `build\Release\d3d9.dll` (Win32) |
+| Compiled | Yes — `build\Release\d3d9.dll` (Win32) and `build\Release\openxr_helper64\OpenXRHelper64.exe` (x64) |
 | Installed | Yes — next to `bms.exe`, `bin\`, and the DXVK folder |
 | Launched with this DLL | Yes |
 | Runtime-initialized | Yes |
@@ -25,7 +25,8 @@ Sources live in `src/`. The `L4D2VR/` folder is only include shims so DXVK can `
 | Motion controllers | User-verified: uncoupled viewmodel on the aim controller, FP arms hidden, independent hand markers + finger curl. |
 | Weapon in HMD | User-verified 2026-08-19: world-space `v_` gun keeps desktop proportions (view-Y unstretch). Walk-bob/ghosting still open. |
 | Multicore (`mat_queue_mode`) | Compiled: real `GetMatQueueMode` + `SetThreadMode` AutoMatQueueMode. **Not user-verified.** If it dies, next launch skips `mat_queue`. |
-| Gameplay in headset | Yes with `-oldgameui`. New game UI is upside-down / black after load. |
+| Gameplay in headset | Yes with `-oldgameui` on the OpenVR path. New game UI is upside-down / black after load. |
+| OpenXR helper (L4D2VR `openxr` branch) | Implemented — **not headset-verified on this DLL** |
 
 Acceptance is **visible fused Black Mesa gameplay in the headset**.
 
@@ -57,7 +58,7 @@ Win32 only. From a Developer PowerShell or with VS 2022 Build Tools:
 .\scripts\build.ps1
 ```
 
-Output: `build\Release\d3d9.dll`
+Output: `build\Release\d3d9.dll` and `build\Release\openxr_helper64\OpenXRHelper64.exe`
 
 Drag-and-drop zip (DLL in all three load paths, `VR\`, SteamVR bindings, resolution notes):
 
@@ -78,8 +79,10 @@ Output: `dist\Black-Mesa-VR-drop-in.zip` — copy the folder contents into `Stea
 Copies `d3d9.dll` and SteamVR’s 32-bit `openvr_api.dll` into:
 
 1. `Black Mesa\bin\thirdparty\dxvk-windows-x86\` (DXVK folder)
-2. `Black Mesa\bin\` (`LoadLibrary("d3d9.dll")` search)
-3. `Black Mesa\` (next to `bms.exe`, L4D2VR-style)
+2. `Black Mesa\bin\`
+3. next to `bms.exe`
+
+and copies `OpenXRHelper64.exe` + `openxr_loader.dll` to `Black Mesa\VR\openxr_helper64\`.
 
 Proof the new DLL loaded: `Black Mesa\bmvr_log.txt` appears **this session** (and a DXVK log whose build line is MSVC `x86`, not stock gcc 2.6.2).
 

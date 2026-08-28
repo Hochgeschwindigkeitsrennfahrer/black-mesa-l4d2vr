@@ -60,6 +60,20 @@ Install-One $BinDir
 # 3) Next to bms.exe — L4D2VR-style, and AddDllDirectory(game root)
 Install-One $GameRoot
 
+$HelperSrc = Join-Path $Root "build\Release\openxr_helper64"
+$HelperDst = Join-Path $GameRoot "VR\openxr_helper64"
+if (Test-Path (Join-Path $HelperSrc "OpenXRHelper64.exe")) {
+  New-Item -ItemType Directory -Force -Path $HelperDst | Out-Null
+  Copy-Item -Force (Join-Path $HelperSrc "OpenXRHelper64.exe") $HelperDst
+  $Loader = Join-Path $HelperSrc "openxr_loader.dll"
+  if (Test-Path $Loader) {
+    Copy-Item -Force $Loader $HelperDst
+  }
+  Write-Host "Installed OpenXR helper to $HelperDst"
+} else {
+  Write-Host "OpenXR helper not built (build\Release\openxr_helper64\OpenXRHelper64.exe missing). OpenXR will fall back to OpenVR."
+}
+
 $VrSrc = Join-Path $Root "VR"
 $VrDst = Join-Path $GameRoot "VR"
 if (-not (Test-Path $VrSrc)) { throw "Missing $VrSrc" }
@@ -76,6 +90,12 @@ if (Test-Path $HandsSrc) {
   New-Item -ItemType Directory -Force -Path $HandsDst | Out-Null
   Copy-Item -Force (Join-Path $HandsSrc "*.glb") $HandsDst
   Write-Host "Installed HEV glove GLBs to $HandsDst"
+}
+$OffSrc = Join-Path $VrSrc "viewmodel_offsets.txt"
+$OffDst = Join-Path $VrDst "viewmodel_offsets.txt"
+if (Test-Path $OffSrc) {
+  Copy-Item -Force $OffSrc $OffDst
+  Write-Host "Installed $OffDst (baked pose table; numpad extras start empty)"
 }
 $CfgSrc = Join-Path $VrSrc "config.txt"
 $CfgDst = Join-Path $VrDst "config.txt"
@@ -99,8 +119,8 @@ if (-not (Test-Path $CfgDst)) {
   $cfgText = [regex]::Replace($cfgText, '(?m)^VrHandsModelScale=.*$', 'VrHandsModelScale=0.85')
   if ($cfgText -notmatch '(?m)^VrHandsPoseRotationOffset=') { $cfgText += "`r`nVrHandsPoseRotationOffset=0,180,0`r`n" }
   $cfgText = [regex]::Replace($cfgText, '(?m)^VrHandsPoseRotationOffset=.*$', 'VrHandsPoseRotationOffset=0,180,0')
-  if ($cfgText -notmatch '(?m)^VrHandsPoseOffsetMeters=') { $cfgText += "`r`nVrHandsPoseOffsetMeters=0,-0.035,0`r`n" }
-  $cfgText = [regex]::Replace($cfgText, '(?m)^VrHandsPoseOffsetMeters=.*$', 'VrHandsPoseOffsetMeters=0,-0.035,0')
+  if ($cfgText -notmatch '(?m)^VrHandsPoseOffsetMeters=') { $cfgText += "`r`nVrHandsPoseOffsetMeters=0,-0.035,-0.10`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^VrHandsPoseOffsetMeters=.*$', 'VrHandsPoseOffsetMeters=0,-0.035,-0.10')
   if ($cfgText -notmatch '(?m)^AutoMatQueueMode=') { $cfgText += "`r`nAutoMatQueueMode=false`r`n" }
   $cfgText = [regex]::Replace($cfgText, '(?m)^AutoMatQueueMode=.*$', 'AutoMatQueueMode=false')
   if ($cfgText -notmatch '(?m)^AntiAliasing=') { $cfgText += "`r`nAntiAliasing=0`r`n" }
@@ -110,8 +130,14 @@ if (-not (Test-Path $CfgDst)) {
   if ($cfgText -notmatch '(?m)^DesktopLeftoverRender=') { $cfgText += "`r`nDesktopLeftoverRender=false`r`n" }
   if ($cfgText -notmatch '(?m)^ForceOpenVis=') { $cfgText += "`r`nForceOpenVis=false`r`n" }
   if ($cfgText -notmatch '(?m)^StereoBlitGpuFlush=') { $cfgText += "`r`nStereoBlitGpuFlush=false`r`n" }
+  if ($cfgText -notmatch '(?m)^VRRuntimeBackend=') { $cfgText += "`r`nVRRuntimeBackend=openxr`r`n" }
+  if ($cfgText -notmatch '(?m)^OpenXRHelper=') { $cfgText += "`r`nOpenXRHelper=true`r`n" }
+  if ($cfgText -notmatch '(?m)^OpenXRHelperSubmitTestFrames=') { $cfgText += "`r`nOpenXRHelperSubmitTestFrames=0`r`n" }
+  if ($cfgText -notmatch '(?m)^OpenXRHelperWaitReadySeconds=') { $cfgText += "`r`nOpenXRHelperWaitReadySeconds=45`r`n" }
+  if ($cfgText -notmatch '(?m)^OpenXRHelperUseGameRenderPoseForProjection=') { $cfgText += "`r`nOpenXRHelperUseGameRenderPoseForProjection=true`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^OpenXRHelperUseGameRenderPoseForProjection=.*$', 'OpenXRHelperUseGameRenderPoseForProjection=true')
   Set-Content -LiteralPath $CfgDst -Value $cfgText -Encoding ASCII -NoNewline
-  Write-Host "Updated HudDistance/HudSize/ViewmodelScale/CompositorPostPresentHandoff/gloves/wrist HUD in $CfgDst"
+  Write-Host "Updated HudDistance/HudSize/ViewmodelScale/CompositorPostPresentHandoff/gloves/wrist HUD/OpenXR in $CfgDst"
 }
 Write-Host "Installed SteamVR bindings to $ManifestDst"
 Write-Host "If SteamVR still has X=Flashlight or old jump/crouch, restore BMVR defaults (v3: Y=next, X=prev, right grip=flashlight)."
@@ -121,7 +147,7 @@ if (-not (Test-Path $CfgGame)) { throw "Missing $CfgGame" }
 $BmvrCfgSrc = Join-Path $VrSrc "bmvr.cfg"
 $BmvrCfgDst = Join-Path $CfgGame "bmvr.cfg"
 Copy-Item -Force $BmvrCfgSrc $BmvrCfgDst
-Write-Host "Installed $BmvrCfgDst (vis restored, CSM low, no flashlight cvars)"
+Write-Host "Installed $BmvrCfgDst (vis restored, CSM quality 0, combat cvar bundle reverted)"
 $Autoexec = Join-Path $CfgGame "autoexec.cfg"
 if (Test-Path $Autoexec) {
   $autoText = Get-Content -LiteralPath $Autoexec -Raw

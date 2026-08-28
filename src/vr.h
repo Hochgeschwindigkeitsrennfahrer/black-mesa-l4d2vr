@@ -5,6 +5,8 @@
 #include <Windows.h>
 #include "openvr.h"
 #include "vector.h"
+#include "openxr_bridge_protocol.h"
+#include "vr_runtime_backend.h"
 #include <cstdint>
 #include <array>
 #include <atomic>
@@ -14,6 +16,7 @@
 #include <chrono>
 #include <d3d9.h>
 
+struct D3D9_TEXTURE_VR_DESC;
 class Game;
 class ITexture;
 class IMatRenderContext;
@@ -30,6 +33,9 @@ struct SharedTextureHolder
 {
     vr::VRVulkanTextureData_t m_VulkanData{};
     vr::Texture_t m_VRTexture{};
+    uint64_t m_SharedHandle = 0;
+    uint32_t m_SharedHandleType = 0;
+    uint32_t m_SharedHandleValid = 0;
 };
 
 struct D3DAimLineOverlayEyeState
@@ -50,6 +56,27 @@ class VR
 {
 public:
     Game* m_Game = nullptr;
+
+    VrRuntimeBackend m_RuntimeBackend = VrRuntimeBackend::OpenVR;
+    VrRuntimeBackend m_RequestedRuntimeBackend = VrRuntimeBackend::OpenVR;
+    bool m_RuntimeBackendFallbackToOpenVR = true;
+    bool m_OpenXrLoaderAvailable = false;
+    bool m_OpenXrHelperBridgeActive = false;
+    bool m_OpenXrSwapGameEyeOrigins = false;
+    L4D2VROpenXrPoseDesc m_OpenXrLastHmdPose{};
+    uint32_t m_OpenXrLastHmdPoseGeneration = 0;
+    // Pose actually used for the stereo RenderView pair. Published with the
+    // eye textures so OpenXR xrEndFrame does not pair a fresh locate with a
+    // late image (head-turn jitter). SteamVR "motion smoothing" does not
+    // apply on this OpenXR helper path.
+    L4D2VROpenXrPoseDesc m_OpenXrStereoRenderPose{};
+    bool m_OpenXrStereoRenderPoseValid = false;
+    L4D2VROpenXrInputStateDesc m_OpenXrLastInputState{};
+    uint32_t m_OpenXrLastInputStateGeneration = 0;
+    L4D2VROpenXrSharedTextureDesc m_OpenXrSharedEyeTextures[L4D2VR_OPENXR_EYE_COUNT]{};
+    std::atomic<uint32_t> m_OpenXrSharedEyeTextureReadyMask{ 0 };
+    std::atomic<uint32_t> m_OpenXrLastPublishedSharedTextureFrameId{ 0 };
+    std::atomic<uint32_t> m_OpenXrSubmitFrameId{ 1 };
 
     vr::IVRSystem* m_System = nullptr;
     vr::IVRInput* m_Input = nullptr;
@@ -338,6 +365,8 @@ public:
     vr::VRActionHandle_t m_ActionPause = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionSprint = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionMenuSelect = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionWeaponMenu = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionInventoryQuickSwitch = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionSkeletonLeft = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionSkeletonRight = vr::k_ulInvalidActionHandle;
     bool m_CompositorAppHandoff = false;
@@ -353,6 +382,7 @@ public:
     std::atomic<float> m_RotationOffsetY{ 0.f };
     std::atomic<uint32_t> m_PendingImpulse{ 0 };
     std::atomic<int> m_PendingInvDelta{ 0 };
+    std::atomic<int> m_PendingWeaponSelect{ 0 };
     std::atomic<int> m_PendingGameUi{ 0 };
     bool m_GameUiVisible = false;
     bool m_PressedTurn = false;
@@ -458,6 +488,9 @@ public:
         return m_PassThroughMainViews >= kPassThroughViewsBeforeQueued;
     }
     void InstallDeviceHooks(IDirect3DDevice9* device);
+    bool ShouldExportOpenXrEyeTexture(TextureID texID, uint32_t sampleCount) const;
+    void PublishOpenXrEyeTexture(TextureID texID, const D3D9_TEXTURE_VR_DESC& desc);
+    void PublishOpenXrResolvedEyeTextures(uint32_t frameId);
     bool EnsureNamedEyeTextures();
     void PrepareNamedStereoFromPresent();
     bool NamedStereoReady() const;
@@ -476,12 +509,21 @@ public:
     void NoteHudPainted() { m_HudPaintedThisFrame.store(true, std::memory_order_release); }
     bool HudPaintedThisFrame() const { return m_HudPaintedThisFrame.load(std::memory_order_acquire); }
     void UpdateCrowbarMelee();
+    bool WeaponMenuOpen() const { return m_WeaponMenuOpen; }
+    bool WeaponMenuClickHeld() const { return m_WeaponMenuClickHeld; }
+    bool WeaponMenuStickHeld() const;
+    bool EmptyHands() const { return m_EmptyHands; }
+    void UpdateWeaponMenu(bool stickClickHeld, float deltaMs);
+    void DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
+        const Vector& eyeOrig, const Vector& fwd, const Vector& right, const Vector& up);
+    void UpdateWeaponFireHaptics();
     bool IsPerformingMelee() const { return m_PerformingMelee; }
     bool TryGetMeleeBladeViewAngles(QAngle& out) const;
     bool TryGetMeleeTraceOrigin(Vector& origin) const;
     // True while VR should keep fire/reload/equip sequences running.
     bool WantsWeaponActionAnim() const;
     void GetRightGlovePalmOffsetMeters(Vector& meters) const;
+    bool WantsRightGloveVisible() const;
     bool WantsRightGloveWeaponGripCurl() const;
     bool HudOverlayReady() const { return m_HudOverlayReady; }
     void EnsureHudOverlay();
@@ -508,6 +550,12 @@ private:
     static bool IsGameplayMapName(const char* map);
     void PollMapFromEngine();
     bool InitOpenVR();
+    bool InitOpenXR();
+    bool ConsumeOpenXrTracking();
+    bool PrepareOpenXrEyeSurfacesForRead();
+    void BindOpenXrActionHandles();
+    bool PublishOpenXrHudOverlay(uint32_t frameId);
+    void HideOpenXrHudOverlay();
     void UpdateTracking();
     bool RefreshPosesFromCompositor();
     void StartPoseWaiter();
@@ -528,6 +576,8 @@ private:
     void TickCompositorFocus();
     void ReclaimCompositorFocus(const char* reason);
     void PulseAimHaptic(unsigned short durationUs = 2500);
+    void PulseHandHaptic(vr::ETrackedControllerRole hand, unsigned short durationUs, float amplitude = 0.6f);
+    void UpdateViewmodelNumpadAdjust(bool paused);
     void ResolveWeaponViewmodelPose(float& ox, float& oy, float& oz, float& ax, float& ay, float& az) const;
     void DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         bool leftOk, const Vector& leftWrist, bool rightOk, const Vector& rightWrist,
@@ -568,6 +618,7 @@ private:
     QAngle m_PrevControllerAngAbs{};
     DWORD m_PrevControllerTick = 0;
     DWORD m_MeleeAttackUntilMs = 0;
+    DWORD m_MeleeNextSwingMs = 0;
     bool m_PerformingMelee = false;
     bool m_MeleeNewSwing = true;
     void* m_MeleeHitEntity = nullptr;
@@ -581,6 +632,37 @@ private:
     bool m_HudOverlayCreateAttempted = false;
     std::atomic<bool> m_HudPaintedThisFrame{ false };
     bool m_MenuTriggerWasDown = false;
+    bool m_WeaponMenuOpen = false;
+    bool m_WeaponMenuClickHeld = false;
+    bool m_WeaponMenuOpenedThisHold = false;
+    bool m_WeaponMenuLatched = false;
+    bool m_EmptyHands = false;
+    DWORD m_WeaponMenuClickStartMs = 0;
+    int m_WeaponMenuHover = -1;
+    int m_WeaponMenuCount = 0;
+    Vector m_WeaponMenuOrigin{};
+    Vector m_WeaponMenuFwd{};
+    Vector m_WeaponMenuRight{};
+    Vector m_WeaponMenuUp{};
+    Vector m_WeaponMenuLatchBody{};
+    Vector m_WeaponMenuLatchDelta{};
+    Vector m_WeaponMenuLatchFwd{};
+    Vector m_WeaponMenuLatchRight{};
+    Vector m_WeaponMenuLatchUp{};
+    float m_WeaponMenuLatchYaw = 0.f;
+    struct WeaponMenuSlot
+    {
+        int entityIndex = 0;
+        int kind = 0;
+        Vector center{};
+        char label[16]{};
+        bool equipped = false;
+        bool emptyHand = false;
+    };
+    WeaponMenuSlot m_WeaponMenuSlots[16]{};
+    int m_LastMuzzleFlashParity = -1;
+    int m_LastFireClip = -1;
+    void* m_LastFireWeapon = nullptr;
     bool m_StereoEyeBlitOk = false;
     int m_StereoEyeBlitRank = 0;
     uint32_t m_LastStereoBlitWidth = 0;

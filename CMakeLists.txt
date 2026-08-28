@@ -32,8 +32,12 @@ set(BMVR_SOURCES
   src/game.cpp
   src/hooks.cpp
   src/vr.cpp
+  src/vr_weapon_menu.cpp
   src/vr_hands.cpp
   src/vr_hand_renderer_d3d9.cpp
+  src/vr_runtime_backend.cpp
+  src/openxr_helper_bridge.cpp
+  src/openxr_loader_util.cpp
   src/bmvr_flags.cpp
   src/sdk/checksum_crc.cpp
   third_party/l4d2vr/L4D2VR/vr_hands/vr_hand_asset_loader.cpp
@@ -80,6 +84,7 @@ target_include_directories(d3d9 PRIVATE
   "${DXVK}/subprojects/libdisplay-info/include"
   "${ROOT}/third_party/minhook/include"
   "${ROOT}/third_party/openvr/include"
+  "${ROOT}/third_party/openxr/include"
 )
 
 target_compile_options(d3d9 PRIVATE

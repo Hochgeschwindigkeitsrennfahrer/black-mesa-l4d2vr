@@ -10,6 +10,7 @@
 #include "trace.h"
 #include "texture.h"
 #include "vr_hands.h"
+#include "openxr_helper_bridge.h"
 
 #include <algorithm>
 #include <cmath>
@@ -17,6 +18,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -424,7 +427,33 @@ namespace
 VR::VR(Game* game)
     : m_Game(game)
 {
-    Game::logMsg("VR ctor: L4D2VR OpenVR + IDirect3DVR9 path (Black Mesa capture)");
+    Game::logMsg("VR ctor: L4D2VR OpenVR / OpenXR helper path (Black Mesa capture)");
+    const VrRuntimeBackendConfig runtimeConfig = L4D2VR_ReadRuntimeBackendConfig();
+    m_RuntimeBackendFallbackToOpenVR = true;
+    const VrRuntimeBackendSelection runtimeSelection =
+        L4D2VR_SelectRuntimeBackend(runtimeConfig.requestedBackend, m_RuntimeBackendFallbackToOpenVR);
+    m_RequestedRuntimeBackend = runtimeSelection.requested;
+    m_RuntimeBackend = runtimeSelection.active;
+    m_OpenXrLoaderAvailable = runtimeSelection.openXrLoaderAvailable;
+    Game::logMsg(
+        "[VR][Runtime] requested=%s active=%s fallback=%d usedFallback=%d openxrLoader=%d openxrBackendImplemented=%d detail=%s",
+        L4D2VR_RuntimeBackendName(runtimeSelection.requested),
+        L4D2VR_RuntimeBackendName(runtimeSelection.active),
+        runtimeSelection.fallbackToOpenVR ? 1 : 0,
+        runtimeSelection.usedFallback ? 1 : 0,
+        runtimeSelection.openXrLoaderAvailable ? 1 : 0,
+        runtimeSelection.openXrBackendImplemented ? 1 : 0,
+        runtimeSelection.message.c_str());
+
+    if (runtimeSelection.active == VrRuntimeBackend::OpenXR)
+    {
+        m_IsInitialized = InitOpenXR();
+        if (m_IsInitialized)
+            return;
+        Game::logMsg("[VR][Runtime] OpenXR helper init failed; falling back to OpenVR (desktop must still launch)");
+        m_OpenXrHelperBridgeActive = false;
+        m_RuntimeBackend = VrRuntimeBackend::OpenVR;
+    }
     m_IsInitialized = InitOpenVR();
 }
 
@@ -526,6 +555,7 @@ void VR::OnLevelShutdown()
     m_FirstAttackPresentTick = 0;
     m_FirstAttackSpikeLogs = 0;
     m_CompositorHandoffSlowCount = 0;
+    m_EmptyHands = false;
     Game::logMsg("LevelShutdown");
 }
 
@@ -785,6 +815,532 @@ bool VR::InitOpenVR()
     return true;
 }
 
+void VR::BindOpenXrActionHandles()
+{
+    auto handle = [](L4D2VROpenXrActionId id) -> vr::VRActionHandle_t {
+        return static_cast<vr::VRActionHandle_t>(static_cast<uint32_t>(id));
+    };
+    m_ActionJump = handle(L4D2VROpenXrActionId::Jump);
+    m_ActionPrimaryAttack = handle(L4D2VROpenXrActionId::PrimaryAttack);
+    m_ActionSecondaryAttack = handle(L4D2VROpenXrActionId::SecondaryAttack);
+    m_ActionReload = handle(L4D2VROpenXrActionId::Reload);
+    m_ActionUse = handle(L4D2VROpenXrActionId::Use);
+    m_ActionWalk = handle(L4D2VROpenXrActionId::Walk);
+    m_ActionTurn = handle(L4D2VROpenXrActionId::Turn);
+    m_ActionNextItem = handle(L4D2VROpenXrActionId::NextItem);
+    m_ActionPrevItem = handle(L4D2VROpenXrActionId::PrevItem);
+    m_ActionResetPosition = handle(L4D2VROpenXrActionId::ResetPosition);
+    m_ActionCrouch = handle(L4D2VROpenXrActionId::Crouch);
+    m_ActionFlashlight = handle(L4D2VROpenXrActionId::Flashlight);
+    m_ActionScoreboard = handle(L4D2VROpenXrActionId::Scoreboard);
+    m_ActionPause = handle(L4D2VROpenXrActionId::Pause);
+    m_ActionMenuSelect = handle(L4D2VROpenXrActionId::MenuSelect);
+    m_ActionWeaponMenu = handle(L4D2VROpenXrActionId::InventoryQuickSwitch);
+    m_ActionInventoryQuickSwitch = handle(L4D2VROpenXrActionId::InventoryQuickSwitch);
+    // Helper has no Sprint action id. CustomAction1 is left-stick click (G2 sprint).
+    m_ActionSprint = handle(L4D2VROpenXrActionId::CustomAction1);
+    m_ActionCrouchToggle = handle(L4D2VROpenXrActionId::CustomAction2);
+    m_ActionSkeletonLeft = handle(L4D2VROpenXrActionId::CustomAction3);
+    m_ActionSkeletonRight = handle(L4D2VROpenXrActionId::CustomAction4);
+    m_ActionsReady.store(true, std::memory_order_release);
+}
+
+bool VR::InitOpenXR()
+{
+    const OpenXrHelperLaunchConfig helperConfig = L4D2VR_ReadOpenXrHelperLaunchConfig();
+    m_OpenXrSwapGameEyeOrigins = helperConfig.swapGameEyeOrigins;
+    Game::logMsg("[VR][OpenXRHelper] enabled=%d submitTestFrames=%u waitReadySeconds=%u swapGameEyeOrigins=%d",
+        helperConfig.enabled ? 1 : 0,
+        helperConfig.submitTestFrames,
+        helperConfig.waitReadySeconds,
+        m_OpenXrSwapGameEyeOrigins ? 1 : 0);
+    if (!helperConfig.enabled)
+    {
+        Game::logMsg("[VR][OpenXRHelper] OpenXR selected but OpenXRHelper=false in VR/config.txt");
+        return false;
+    }
+
+    m_OpenXrHelperBridgeActive = L4D2VR_StartOpenXrHelper(helperConfig);
+    if (!m_OpenXrHelperBridgeActive)
+    {
+        Game::logMsg("[VR][OpenXRHelper] helper did not start");
+        return false;
+    }
+
+    L4D2VROpenXrRuntimeViewConfigDesc runtimeViewConfig{};
+    uint32_t runtimeViewConfigGeneration = 0;
+    const ULONGLONG runtimeViewStartMs = GetTickCount64();
+    const ULONGLONG runtimeViewTimeoutMs = (std::max)(1000u, helperConfig.waitReadySeconds * 1000u);
+    while (true)
+    {
+        const bool haveConfig = L4D2VR_ReadOpenXrRuntimeViewConfig(runtimeViewConfig, &runtimeViewConfigGeneration);
+        if (haveConfig && runtimeViewConfig.reserved0 == L4D2VR_OPENXR_RUNTIME_VIEW_FOV_LOCATED)
+            break;
+        if (!L4D2VR_OpenXrHelperBridgeIsStarted())
+        {
+            Game::logMsg("[VR][OpenXRHelper] helper exited before runtime views");
+            m_OpenXrHelperBridgeActive = false;
+            return false;
+        }
+        if (GetTickCount64() - runtimeViewStartMs > runtimeViewTimeoutMs)
+        {
+            Game::logMsg("[VR][OpenXRHelper] runtime view projection was not published in time");
+            m_OpenXrHelperBridgeActive = false;
+            return false;
+        }
+        Sleep(10);
+    }
+
+    auto getOpenXrRawProjection = [](const L4D2VROpenXrRuntimeViewDesc& view,
+        float& left, float& right, float& top, float& bottom) -> bool
+    {
+        if (!view.valid || view.width == 0 || view.height == 0)
+            return false;
+        left = std::tan(view.angleLeft);
+        right = std::tan(view.angleRight);
+        top = std::tan(view.angleDown);
+        bottom = std::tan(view.angleUp);
+        return std::isfinite(left) && std::isfinite(right) &&
+            std::isfinite(top) && std::isfinite(bottom) &&
+            left < -0.001f && right > 0.001f &&
+            top < -0.001f && bottom > 0.001f;
+    };
+
+    float l_left = 0.0f, l_right = 0.0f, l_top = 0.0f, l_bottom = 0.0f;
+    float r_left = 0.0f, r_right = 0.0f, r_top = 0.0f, r_bottom = 0.0f;
+    if (!getOpenXrRawProjection(runtimeViewConfig.views[L4D2VR_OPENXR_EYE_LEFT], l_left, l_right, l_top, l_bottom) ||
+        !getOpenXrRawProjection(runtimeViewConfig.views[L4D2VR_OPENXR_EYE_RIGHT], r_left, r_right, r_top, r_bottom))
+    {
+        Game::logMsg("[VR][OpenXRHelper] runtime view projection is invalid");
+        m_OpenXrHelperBridgeActive = false;
+        return false;
+    }
+
+    const float tanHalfFovX = (std::max)({ -l_left, l_right, -r_left, r_right });
+    const float tanHalfFovY = (std::max)({ -l_top, l_bottom, -r_top, r_bottom });
+    if (!(std::isfinite(tanHalfFovX) && tanHalfFovX > 0.001f &&
+        std::isfinite(tanHalfFovY) && tanHalfFovY > 0.001f))
+    {
+        Game::logMsg("[VR][OpenXRHelper] runtime view FOV is invalid");
+        m_OpenXrHelperBridgeActive = false;
+        return false;
+    }
+
+    m_RenderWidth = (std::max)(
+        runtimeViewConfig.views[L4D2VR_OPENXR_EYE_LEFT].width,
+        runtimeViewConfig.views[L4D2VR_OPENXR_EYE_RIGHT].width);
+    m_RenderHeight = (std::max)(
+        runtimeViewConfig.views[L4D2VR_OPENXR_EYE_LEFT].height,
+        runtimeViewConfig.views[L4D2VR_OPENXR_EYE_RIGHT].height);
+    bmvr::g_RecommendedEyeWidth = m_RenderWidth;
+    bmvr::g_RecommendedEyeHeight = m_RenderHeight;
+
+    m_TextureBounds[0].uMin = 0.5f + 0.5f * l_left / tanHalfFovX;
+    m_TextureBounds[0].uMax = 0.5f + 0.5f * l_right / tanHalfFovX;
+    m_TextureBounds[0].vMin = 0.5f - 0.5f * l_bottom / tanHalfFovY;
+    m_TextureBounds[0].vMax = 0.5f - 0.5f * l_top / tanHalfFovY;
+    m_TextureBounds[1].uMin = 0.5f + 0.5f * r_left / tanHalfFovX;
+    m_TextureBounds[1].uMax = 0.5f + 0.5f * r_right / tanHalfFovX;
+    m_TextureBounds[1].vMin = 0.5f - 0.5f * r_bottom / tanHalfFovY;
+    m_TextureBounds[1].vMax = 0.5f - 0.5f * r_top / tanHalfFovY;
+
+    auto sanitizeTextureBounds = [](vr::VRTextureBounds_t& bounds)
+    {
+        bounds.uMin = std::clamp(bounds.uMin, 0.0f, 1.0f);
+        bounds.uMax = std::clamp(bounds.uMax, 0.0f, 1.0f);
+        bounds.vMin = std::clamp(bounds.vMin, 0.0f, 1.0f);
+        bounds.vMax = std::clamp(bounds.vMax, 0.0f, 1.0f);
+        if (bounds.uMax <= bounds.uMin || bounds.vMax <= bounds.vMin)
+            bounds = vr::VRTextureBounds_t{ 0.0f, 0.0f, 1.0f, 1.0f };
+    };
+    sanitizeTextureBounds(m_TextureBounds[0]);
+    sanitizeTextureBounds(m_TextureBounds[1]);
+
+    m_Aspect = tanHalfFovX / tanHalfFovY;
+    m_Fov = 2.0f * atanf(tanHalfFovX) * 180.0f / 3.14159265358979323846f;
+    ChooseEyeRenderSize();
+    BindOpenXrActionHandles();
+
+    m_IsVREnabled = true;
+    Game::logMsg(
+        "[VR][OpenXR] helper scene backend ready runtimeViewGen=%u recommendedRT=%ux%u finalRT=%ux%u fov=%.3f aspect=%.6f boundsL=(%.4f %.4f %.4f %.4f) boundsR=(%.4f %.4f %.4f %.4f)",
+        runtimeViewConfigGeneration,
+        bmvr::g_RecommendedEyeWidth, bmvr::g_RecommendedEyeHeight,
+        m_RenderWidth, m_RenderHeight, m_Fov, m_Aspect,
+        m_TextureBounds[0].uMin, m_TextureBounds[0].vMin, m_TextureBounds[0].uMax, m_TextureBounds[0].vMax,
+        m_TextureBounds[1].uMin, m_TextureBounds[1].vMin, m_TextureBounds[1].uMax, m_TextureBounds[1].vMax);
+    return true;
+}
+
+namespace
+{
+    vr::TrackedDevicePose_t OpenXrPoseToTracked(
+        const float* position, const float* orientation, bool valid)
+    {
+        vr::TrackedDevicePose_t pose{};
+        if (!valid)
+            return pose;
+        float x = orientation[0];
+        float y = orientation[1];
+        float z = orientation[2];
+        float w = orientation[3];
+        const float lenSq = x * x + y * y + z * z + w * w;
+        if (lenSq > 0.000001f)
+        {
+            const float invLen = 1.0f / std::sqrt(lenSq);
+            x *= invLen; y *= invLen; z *= invLen; w *= invLen;
+        }
+        else
+        {
+            x = 0.0f; y = 0.0f; z = 0.0f; w = 1.0f;
+        }
+        pose.bDeviceIsConnected = true;
+        pose.bPoseIsValid = true;
+        pose.eTrackingResult = vr::TrackingResult_Running_OK;
+        vr::HmdMatrix34_t& mat = pose.mDeviceToAbsoluteTracking;
+        mat.m[0][0] = 1.0f - 2.0f * y * y - 2.0f * z * z;
+        mat.m[0][1] = 2.0f * x * y - 2.0f * z * w;
+        mat.m[0][2] = 2.0f * x * z + 2.0f * y * w;
+        mat.m[1][0] = 2.0f * x * y + 2.0f * z * w;
+        mat.m[1][1] = 1.0f - 2.0f * x * x - 2.0f * z * z;
+        mat.m[1][2] = 2.0f * y * z - 2.0f * x * w;
+        mat.m[2][0] = 2.0f * x * z - 2.0f * y * w;
+        mat.m[2][1] = 2.0f * y * z + 2.0f * x * w;
+        mat.m[2][2] = 1.0f - 2.0f * x * x - 2.0f * y * y;
+        mat.m[0][3] = position[0];
+        mat.m[1][3] = position[1];
+        mat.m[2][3] = position[2];
+        return pose;
+    }
+
+    void FillOpenXrLinearVelocity(
+        vr::TrackedDevicePose_t& pose,
+        const float* position,
+        const float* prevPosition,
+        double dtSeconds)
+    {
+        if (!pose.bPoseIsValid || !position || !prevPosition || dtSeconds < 0.001 || dtSeconds > 0.25)
+            return;
+        const float dt = static_cast<float>(dtSeconds);
+        pose.vVelocity.v[0] = (position[0] - prevPosition[0]) / dt;
+        pose.vVelocity.v[1] = (position[1] - prevPosition[1]) / dt;
+        pose.vVelocity.v[2] = (position[2] - prevPosition[2]) / dt;
+    }
+
+    const L4D2VROpenXrControllerPoseDesc& PickOpenXrHandPose(
+        const L4D2VROpenXrControllerPoseDesc& grip,
+        const L4D2VROpenXrControllerPoseDesc& aim)
+    {
+        if (grip.valid && grip.active)
+            return grip;
+        return aim;
+    }
+
+    bool FillOpenXrOverlayTextureFromShared(
+        L4D2VROpenXrOverlayDesc& overlay,
+        const SharedTextureHolder& texture)
+    {
+        const uint32_t width = texture.m_VulkanData.m_nWidth;
+        const uint32_t height = texture.m_VulkanData.m_nHeight;
+        const uint32_t sampleCount = texture.m_VulkanData.m_nSampleCount;
+        if (!texture.m_SharedHandleValid || texture.m_SharedHandle == 0 ||
+            width == 0 || height == 0 || sampleCount != 1)
+        {
+            return false;
+        }
+
+        overlay.texture.valid = 1;
+        overlay.texture.width = width;
+        overlay.texture.height = height;
+        overlay.texture.format = texture.m_VulkanData.m_nFormat;
+        overlay.texture.sampleCount = sampleCount;
+        overlay.texture.handleType = texture.m_SharedHandleType;
+        overlay.texture.queueFamilyIndex = texture.m_VulkanData.m_nQueueFamilyIndex;
+        overlay.texture.kmtHandle = texture.m_SharedHandle;
+        overlay.texture.image = static_cast<uint64_t>(texture.m_VulkanData.m_nImage);
+        overlay.texture.uMin = 0.0f;
+        overlay.texture.vMin = 0.0f;
+        overlay.texture.uMax = 1.0f;
+        overlay.texture.vMax = 1.0f;
+        overlay.texture.renderFovXDeg = 90.0f;
+        overlay.texture.renderAspect = static_cast<float>(width) / static_cast<float>(height);
+        return true;
+    }
+}
+
+bool VR::ConsumeOpenXrTracking()
+{
+    if (!m_OpenXrHelperBridgeActive)
+        return false;
+
+    L4D2VROpenXrPoseDesc openXrPose{};
+    uint32_t generation = 0;
+    if (!L4D2VR_ReadOpenXrHmdPose(openXrPose, &generation))
+        return false;
+
+    m_OpenXrLastHmdPose = openXrPose;
+    m_OpenXrLastHmdPoseGeneration = generation;
+    L4D2VR_ReadOpenXrInputState(m_OpenXrLastInputState, &m_OpenXrLastInputStateGeneration);
+
+    const L4D2VROpenXrControllerPoseDesc& physicalLeft = PickOpenXrHandPose(
+        m_OpenXrLastInputState.controllerPoses[L4D2VR_OPENXR_HAND_LEFT],
+        m_OpenXrLastInputState.controllerAimPoses[L4D2VR_OPENXR_HAND_LEFT]);
+    const L4D2VROpenXrControllerPoseDesc& physicalRight = PickOpenXrHandPose(
+        m_OpenXrLastInputState.controllerPoses[L4D2VR_OPENXR_HAND_RIGHT],
+        m_OpenXrLastInputState.controllerAimPoses[L4D2VR_OPENXR_HAND_RIGHT]);
+    vr::TrackedDevicePose_t hmdPose = OpenXrPoseToTracked(
+        openXrPose.position, openXrPose.orientation, openXrPose.valid != 0);
+    vr::TrackedDevicePose_t leftPose = OpenXrPoseToTracked(
+        physicalLeft.position, physicalLeft.orientation,
+        physicalLeft.valid != 0 && physicalLeft.active != 0);
+    vr::TrackedDevicePose_t rightPose = OpenXrPoseToTracked(
+        physicalRight.position, physicalRight.orientation,
+        physicalRight.valid != 0 && physicalRight.active != 0);
+
+    // OpenXR controller poses have no velocity. Crowbar melee needs |v| > 1.1 m/s.
+    static struct
+    {
+        bool have = false;
+        LARGE_INTEGER qpc{};
+        float hmd[3]{};
+        float left[3]{};
+        float right[3]{};
+        bool haveLeft = false;
+        bool haveRight = false;
+    } s_openXrVel;
+    LARGE_INTEGER nowQpc{};
+    LARGE_INTEGER freq{};
+    QueryPerformanceCounter(&nowQpc);
+    QueryPerformanceFrequency(&freq);
+    if (s_openXrVel.have && freq.QuadPart > 0)
+    {
+        const double dt = static_cast<double>(nowQpc.QuadPart - s_openXrVel.qpc.QuadPart) /
+            static_cast<double>(freq.QuadPart);
+        FillOpenXrLinearVelocity(hmdPose, openXrPose.position, s_openXrVel.hmd, dt);
+        if (s_openXrVel.haveLeft)
+            FillOpenXrLinearVelocity(leftPose, physicalLeft.position, s_openXrVel.left, dt);
+        if (s_openXrVel.haveRight)
+            FillOpenXrLinearVelocity(rightPose, physicalRight.position, s_openXrVel.right, dt);
+    }
+    if (openXrPose.valid)
+    {
+        s_openXrVel.hmd[0] = openXrPose.position[0];
+        s_openXrVel.hmd[1] = openXrPose.position[1];
+        s_openXrVel.hmd[2] = openXrPose.position[2];
+        s_openXrVel.have = true;
+        s_openXrVel.qpc = nowQpc;
+    }
+    s_openXrVel.haveLeft = physicalLeft.valid && physicalLeft.active;
+    if (s_openXrVel.haveLeft)
+    {
+        s_openXrVel.left[0] = physicalLeft.position[0];
+        s_openXrVel.left[1] = physicalLeft.position[1];
+        s_openXrVel.left[2] = physicalLeft.position[2];
+    }
+    s_openXrVel.haveRight = physicalRight.valid && physicalRight.active;
+    if (s_openXrVel.haveRight)
+    {
+        s_openXrVel.right[0] = physicalRight.position[0];
+        s_openXrVel.right[1] = physicalRight.position[1];
+        s_openXrVel.right[2] = physicalRight.position[2];
+    }
+
+    if (bmvr::g_LeftHanded)
+        std::swap(leftPose, rightPose);
+
+    {
+        std::lock_guard<std::mutex> lock(m_PoseMutex);
+        m_WaitedPoses[vr::k_unTrackedDeviceIndex_Hmd] = hmdPose;
+        for (uint32_t i = 1; i < vr::k_unMaxTrackedDeviceCount; ++i)
+            m_WaitedPoses[i] = {};
+        m_WaitedPoses[1] = leftPose;
+        m_WaitedPoses[2] = rightPose;
+    }
+    m_WaitedPoseTick.store(GetTickCount(), std::memory_order_release);
+    m_LastPoseWaitError.store(static_cast<int>(vr::VRCompositorError_None), std::memory_order_release);
+
+    static bool s_logged;
+    static bool s_loggedHands;
+    if (!s_logged && openXrPose.valid)
+    {
+        s_logged = true;
+        Game::logMsg("[VR][OpenXRHelper] consumed HMD pose gen=%u pos=(%.3f %.3f %.3f) L=%u R=%u",
+            generation, openXrPose.position[0], openXrPose.position[1], openXrPose.position[2],
+            physicalLeft.valid && physicalLeft.active ? 1u : 0u,
+            physicalRight.valid && physicalRight.active ? 1u : 0u);
+    }
+    if (!s_loggedHands && (s_openXrVel.haveLeft || s_openXrVel.haveRight))
+    {
+        s_loggedHands = true;
+        Game::logMsg("[VR][OpenXRHelper] controller poses L=%u R=%u velR=(%.2f %.2f %.2f)",
+            s_openXrVel.haveLeft ? 1u : 0u,
+            s_openXrVel.haveRight ? 1u : 0u,
+            rightPose.vVelocity.v[0], rightPose.vVelocity.v[1], rightPose.vVelocity.v[2]);
+    }
+    return true;
+}
+
+bool VR::ShouldExportOpenXrEyeTexture(TextureID texID, uint32_t sampleCount) const
+{
+    if (!m_OpenXrHelperBridgeActive || !L4D2VR_OpenXrHelperBridgeIsStarted())
+        return false;
+    if (sampleCount != 1)
+        return false;
+    return texID == Texture_LeftEye ||
+        texID == Texture_RightEye ||
+        texID == Texture_LeftEyeSubmit ||
+        texID == Texture_RightEyeSubmit ||
+        texID == Texture_HUD;
+}
+
+void VR::PublishOpenXrEyeTexture(TextureID texID, const D3D9_TEXTURE_VR_DESC& desc)
+{
+    if (!ShouldExportOpenXrEyeTexture(texID, desc.SampleCount))
+        return;
+
+    const bool isLeft = texID == Texture_LeftEye || texID == Texture_LeftEyeSubmit;
+    const bool isRight = texID == Texture_RightEye || texID == Texture_RightEyeSubmit;
+    if (!isLeft && !isRight)
+        return;
+    if (!desc.SharedHandleValid || desc.SharedHandle == 0)
+    {
+        Game::logMsg("[VR][OpenXRHelper] shared texture export missing texID=%d size=%ux%u",
+            static_cast<int>(texID), desc.Width, desc.Height);
+        return;
+    }
+
+    L4D2VROpenXrSharedTextureDesc shared{};
+    shared.valid = 1;
+    shared.width = desc.Width;
+    shared.height = desc.Height;
+    shared.format = static_cast<uint32_t>(desc.Format);
+    shared.sampleCount = desc.SampleCount;
+    shared.handleType = desc.SharedHandleType;
+    shared.queueFamilyIndex = desc.QueueFamilyIndex;
+    shared.kmtHandle = desc.SharedHandle;
+    shared.image = desc.Image;
+    const uint32_t eyeIndex = isLeft ? L4D2VR_OPENXR_EYE_LEFT : L4D2VR_OPENXR_EYE_RIGHT;
+    const bool submitTexture = texID == Texture_LeftEyeSubmit || texID == Texture_RightEyeSubmit;
+    if (submitTexture)
+    {
+        shared.uMin = 0.0f;
+        shared.vMin = 0.0f;
+        shared.uMax = 1.0f;
+        shared.vMax = 1.0f;
+        shared.renderFovXDeg = 0.0f;
+        shared.renderAspect = 0.0f;
+    }
+    else
+    {
+        shared.uMin = std::clamp(m_TextureBounds[eyeIndex].uMin, 0.0f, 1.0f);
+        shared.vMin = std::clamp(m_TextureBounds[eyeIndex].vMin, 0.0f, 1.0f);
+        shared.uMax = std::clamp(m_TextureBounds[eyeIndex].uMax, 0.0f, 1.0f);
+        shared.vMax = std::clamp(m_TextureBounds[eyeIndex].vMax, 0.0f, 1.0f);
+        shared.renderFovXDeg = (std::isfinite(m_Fov) && m_Fov > 1.0f && m_Fov < 179.0f) ? m_Fov : 90.0f;
+        shared.renderAspect = (std::isfinite(m_Aspect) && m_Aspect > 0.1f && m_Aspect < 10.0f)
+            ? m_Aspect
+            : ((desc.Height > 0) ? (static_cast<float>(desc.Width) / static_cast<float>(desc.Height)) : 1.0f);
+    }
+    if (shared.uMax <= shared.uMin)
+    {
+        shared.uMin = 0.0f;
+        shared.uMax = 1.0f;
+    }
+    if (shared.vMax <= shared.vMin)
+    {
+        shared.vMin = 0.0f;
+        shared.vMax = 1.0f;
+    }
+
+    m_OpenXrSharedEyeTextures[eyeIndex] = shared;
+    m_OpenXrSharedEyeTextureReadyMask.fetch_or(1u << eyeIndex, std::memory_order_acq_rel);
+    Game::logMsg(
+        "[VR][OpenXRHelper][GamePublishTexture] texID=%d eye=%s handle=0x%llX size=%ux%u fmt=%u bounds=(%.4f %.4f %.4f %.4f)",
+        static_cast<int>(texID),
+        eyeIndex == L4D2VR_OPENXR_EYE_LEFT ? "left" : "right",
+        static_cast<unsigned long long>(shared.kmtHandle),
+        shared.width, shared.height, shared.format,
+        shared.uMin, shared.vMin, shared.uMax, shared.vMax);
+}
+
+void VR::PublishOpenXrResolvedEyeTextures(uint32_t frameId)
+{
+    if (!m_OpenXrHelperBridgeActive || !L4D2VR_OpenXrHelperBridgeIsStarted() || frameId == 0)
+        return;
+    if (m_OpenXrLastPublishedSharedTextureFrameId.load(std::memory_order_acquire) == frameId)
+        return;
+    const uint32_t readyMask = m_OpenXrSharedEyeTextureReadyMask.load(std::memory_order_acquire);
+    if ((readyMask & L4D2VR_OPENXR_EYES_READY_MASK) != L4D2VR_OPENXR_EYES_READY_MASK)
+        return;
+    const L4D2VROpenXrSharedTextureDesc left = m_OpenXrSharedEyeTextures[L4D2VR_OPENXR_EYE_LEFT];
+    const L4D2VROpenXrSharedTextureDesc right = m_OpenXrSharedEyeTextures[L4D2VR_OPENXR_EYE_RIGHT];
+    if (!left.valid || !right.valid)
+        return;
+    L4D2VR_PublishOpenXrSharedTexture(L4D2VR_OPENXR_EYE_LEFT, left);
+    L4D2VR_PublishOpenXrSharedTexture(L4D2VR_OPENXR_EYE_RIGHT, right);
+    L4D2VR_PublishOpenXrSharedTextureFrame(frameId);
+    m_OpenXrLastPublishedSharedTextureFrameId.store(frameId, std::memory_order_release);
+}
+
+bool VR::PrepareOpenXrEyeSurfacesForRead()
+{
+    if (!m_OpenXrHelperBridgeActive || !g_D3DVR9)
+        return false;
+    IDirect3DSurface9* left = m_D9LeftEyeSubmitSurface ? m_D9LeftEyeSubmitSurface : m_D9LeftEyeSurface;
+    IDirect3DSurface9* right = m_D9RightEyeSubmitSurface ? m_D9RightEyeSubmitSurface : m_D9RightEyeSurface;
+    if (!left || !right)
+        return false;
+    if (FAILED(g_D3DVR9->TransferSurface(left, FALSE)) ||
+        FAILED(g_D3DVR9->TransferSurface(right, FALSE)))
+        return false;
+    return SUCCEEDED(g_D3DVR9->WaitDeviceIdle());
+}
+
+bool VR::PublishOpenXrHudOverlay(uint32_t frameId)
+{
+    if (!m_OpenXrHelperBridgeActive || !L4D2VR_OpenXrHelperBridgeIsStarted())
+        return false;
+    if (frameId == 0)
+        return false;
+
+    SharedTextureHolder hud{};
+    {
+        std::lock_guard<TextureStateMutex> textureLock(m_TextureMutex);
+        hud = m_VKHUD;
+    }
+
+    L4D2VROpenXrOverlayDesc overlay{};
+    overlay.valid = 1;
+    overlay.visible = 1;
+    if (!FillOpenXrOverlayTextureFromShared(overlay, hud))
+        return false;
+
+    const bool pauseUi = PauseUiActive();
+    overlay.widthMeters = (std::max)(0.10f, pauseUi ? 1.35f : bmvr::g_HudSize);
+    overlay.heightMeters = overlay.widthMeters *
+        (static_cast<float>(hud.m_VulkanData.m_nHeight) /
+            static_cast<float>((std::max)(1u, hud.m_VulkanData.m_nWidth)));
+    overlay.distanceMeters = (std::max)(0.10f, pauseUi ? 1.15f : bmvr::g_HudDistance);
+    overlay.curvature = 0.0f;
+    overlay.offsetMeters[0] = 0.0f;
+    overlay.offsetMeters[1] = pauseUi ? -0.05f : -0.12f;
+    overlay.offsetMeters[2] = 0.0f;
+
+    L4D2VR_PublishOpenXrOverlay(L4D2VR_OPENXR_OVERLAY_HUD, overlay);
+    L4D2VR_PublishOpenXrOverlayFrame(frameId);
+    return true;
+}
+
+void VR::HideOpenXrHudOverlay()
+{
+    if (!m_OpenXrHelperBridgeActive || !L4D2VR_OpenXrHelperBridgeIsStarted())
+        return;
+    L4D2VROpenXrOverlayDesc overlay{};
+    overlay.valid = 1;
+    overlay.visible = 0;
+    L4D2VR_PublishOpenXrOverlay(L4D2VR_OPENXR_OVERLAY_HUD, overlay);
+}
+
 void VR::SetActionManifest()
 {
     m_ActionsReady.store(false, std::memory_order_release);
@@ -869,6 +1425,8 @@ void VR::SetActionManifest()
     grab("/actions/main/in/Pause", &m_ActionPause);
     grab("/actions/main/in/Sprint", &m_ActionSprint);
     grab("/actions/main/in/MenuSelect", &m_ActionMenuSelect);
+    grab("/actions/main/in/WeaponMenu", &m_ActionWeaponMenu);
+    grab("/actions/main/in/InventoryQuickSwitch", &m_ActionInventoryQuickSwitch);
     grab("/actions/base/in/skeleton_lefthand", &m_ActionSkeletonLeft);
     grab("/actions/base/in/skeleton_righthand", &m_ActionSkeletonRight);
 
@@ -884,6 +1442,22 @@ void VR::SetActionManifest()
 
 bool VR::GetDigitalActionData(vr::VRActionHandle_t handle, vr::InputDigitalActionData_t& out) const
 {
+    out = {};
+    if (m_RuntimeBackend == VrRuntimeBackend::OpenXR)
+    {
+        const uint32_t actionIndex = static_cast<uint32_t>(handle);
+        if (actionIndex == 0 || actionIndex >= L4D2VR_OPENXR_ACTION_COUNT)
+            return false;
+        const L4D2VROpenXrDigitalActionDesc& action = m_OpenXrLastInputState.digitalActions[actionIndex];
+        if (!action.active)
+            return false;
+        out.bActive = true;
+        out.activeOrigin = vr::k_ulInvalidInputValueHandle;
+        out.bState = action.state != 0;
+        out.bChanged = action.changed != 0;
+        out.fUpdateTime = 0.0f;
+        return true;
+    }
     if (!m_Input || handle == vr::k_ulInvalidActionHandle)
         return false;
     const vr::EVRInputError result = m_Input->GetDigitalActionData(
@@ -893,6 +1467,26 @@ bool VR::GetDigitalActionData(vr::VRActionHandle_t handle, vr::InputDigitalActio
 
 bool VR::GetAnalogActionData(vr::VRActionHandle_t handle, vr::InputAnalogActionData_t& out) const
 {
+    out = {};
+    if (m_RuntimeBackend == VrRuntimeBackend::OpenXR)
+    {
+        const uint32_t actionIndex = static_cast<uint32_t>(handle);
+        if (actionIndex == 0 || actionIndex >= L4D2VR_OPENXR_ACTION_COUNT)
+            return false;
+        const L4D2VROpenXrAnalogActionDesc& action = m_OpenXrLastInputState.analogActions[actionIndex];
+        if (!action.active)
+            return false;
+        out.bActive = true;
+        out.activeOrigin = vr::k_ulInvalidInputValueHandle;
+        out.x = action.x;
+        out.y = action.y;
+        out.z = 0.0f;
+        out.deltaX = 0.0f;
+        out.deltaY = 0.0f;
+        out.deltaZ = 0.0f;
+        out.fUpdateTime = 0.0f;
+        return true;
+    }
     if (!m_Input || handle == vr::k_ulInvalidActionHandle)
         return false;
     const vr::EVRInputError result = m_Input->GetAnalogActionData(
@@ -951,7 +1545,9 @@ void VR::ApplyTurnStick(float stickX, float deltaMs)
 
 void VR::ProcessInput()
 {
-    if (!m_IsVREnabled || !m_ActionsReady.load(std::memory_order_acquire) || !m_Input)
+    if (!m_IsVREnabled || !m_ActionsReady.load(std::memory_order_acquire))
+        return;
+    if (m_RuntimeBackend != VrRuntimeBackend::OpenXR && !m_Input)
         return;
 
     static auto s_prev = std::chrono::steady_clock::now();
@@ -973,6 +1569,9 @@ void VR::ProcessInput()
         s_next = s_prevItem = s_pause = s_reset = false;
         s_atk = s_atk2 = s_reload = s_use = false;
         m_CrouchToggled = false;
+        m_WeaponMenuOpen = false;
+        m_WeaponMenuClickHeld = false;
+        m_WeaponMenuOpenedThisHold = false;
         if (m_Game)
         {
             m_Game->m_AnalogForward = 0.f;
@@ -1008,21 +1607,30 @@ void VR::ProcessInput()
         m_Game->m_AnalogForward = ny;
     }
 
+    const bool menuStick = WeaponMenuStickHeld();
+    UpdateWeaponMenu(menuStick, deltaMs);
+
     bool usedAnalogTurn = false;
     float turnY = 0.f;
     bool haveTurnY = false;
     if (GetAnalogActionData(m_ActionTurn, analog))
     {
-        ApplyTurnStick(analog.x, deltaMs);
+        if (!menuStick)
+            ApplyTurnStick(analog.x, deltaMs);
+        else
+            ApplyTurnStick(0.f, deltaMs);
         usedAnalogTurn = true;
-        turnY = analog.y;
-        haveTurnY = true;
+        if (!menuStick)
+        {
+            turnY = analog.y;
+            haveTurnY = true;
+        }
     }
     if (!usedAnalogTurn)
     {
-        if (PressedDigitalAction(m_ActionBooleanTurnLeft))
+        if (!menuStick && PressedDigitalAction(m_ActionBooleanTurnLeft))
             ApplyTurnStick(-1.f, deltaMs);
-        else if (PressedDigitalAction(m_ActionBooleanTurnRight))
+        else if (!menuStick && PressedDigitalAction(m_ActionBooleanTurnRight))
             ApplyTurnStick(1.f, deltaMs);
         else
             ApplyTurnStick(0.f, deltaMs);
@@ -1030,15 +1638,17 @@ void VR::ProcessInput()
 
     const bool paused = SehIsPaused(m_Game->m_EngineClient);
     RefreshActiveWeaponModel();
-    if (!paused)
+    if (!paused && !m_WeaponMenuOpen)
         UpdateCrowbarMelee();
+    if (!paused)
+        UpdateWeaponFireHaptics();
 
     uint32_t buttons = 0;
     if (!paused && !m_GameUiVisible)
     {
-        if (PressedDigitalAction(m_ActionPrimaryAttack))
+        if (!m_WeaponMenuOpen && !m_EmptyHands && PressedDigitalAction(m_ActionPrimaryAttack))
             buttons |= IN_ATTACK;
-        if (PressedDigitalAction(m_ActionSecondaryAttack))
+        if (!m_WeaponMenuOpen && !m_EmptyHands && PressedDigitalAction(m_ActionSecondaryAttack))
             buttons |= IN_ATTACK2;
         if (PressedDigitalAction(m_ActionJump) || (haveTurnY && turnY > 0.65f))
             buttons |= IN_JUMP;
@@ -1102,14 +1712,14 @@ void VR::ProcessInput()
     static int s_flashReleasePolls = 0;
     if (GetDigitalActionData(m_ActionFlashlight, flash))
     {
-        const DWORD now = GetTickCount();
+        const DWORD nowTick = GetTickCount();
         if (flash.bState)
         {
             s_flashReleasePolls = 0;
-            if (!paused && !m_GameUiVisible && !s_flashLatched && (now - s_flashImpulseMs) > 300)
+            if (!paused && !m_GameUiVisible && !s_flashLatched && (nowTick - s_flashImpulseMs) > 300)
             {
                 m_PendingImpulse.store(100, std::memory_order_release);
-                s_flashImpulseMs = now;
+                s_flashImpulseMs = nowTick;
                 s_flashLatched = true;
                 Game::logMsg("Flashlight queued impulse 100 (CreateMove only; vanilla ImpulseCommands) handle=%llu",
                     static_cast<unsigned long long>(m_ActionFlashlight));
@@ -1118,14 +1728,16 @@ void VR::ProcessInput()
         else if (++s_flashReleasePolls >= 3)
             s_flashLatched = false;
     }
-    if (!paused && nextHeld && !s_next)
+    if (!paused && !menuStick && nextHeld && !s_next)
     {
         m_PendingInvDelta.store(1, std::memory_order_release);
+        m_EmptyHands = false;
         Game::logMsg("NextItem queued on CreateMove (weaponselect, not invnext)");
     }
-    if (!paused && prevHeld && !s_prevItem)
+    if (!paused && !menuStick && prevHeld && !s_prevItem)
     {
         m_PendingInvDelta.store(-1, std::memory_order_release);
+        m_EmptyHands = false;
         Game::logMsg("PrevItem queued on CreateMove (weaponselect, not invprev)");
     }
     if (pauseHeld && !s_pause)
@@ -1138,7 +1750,9 @@ void VR::ProcessInput()
         ApplyMenuCursor();
     else
         m_MenuTriggerWasDown = false;
-    if (resetHeld && !s_reset)
+    // Recenter is a short tap of the same right-stick click that opens the
+    // weapon menu. Do not recenter on press-edge while that click is held.
+    if (resetHeld && !s_reset && !menuStick && !m_WeaponMenuOpenedThisHold)
     {
         m_HmdOriginLatched = false;
         if (bmvr::g_RecenterResetsYaw)
@@ -1159,13 +1773,13 @@ void VR::ProcessInput()
     }
     if (atk && !s_atk)
     {
-        PulseAimHaptic(melee ? 3500 : 2500);
         if (!melee)
             m_WeaponActionAnimUntilMs = GetTickCount() + 450;
     }
     if (atk2 && !s_atk2)
     {
-        PulseAimHaptic(1600);
+        if (!melee)
+            PulseAimHaptic(1600);
         m_WeaponActionAnimUntilMs = GetTickCount() + 450;
     }
     if (reload && !s_reload)
@@ -1195,6 +1809,8 @@ void VR::ProcessInput()
             ny, nx, buttons, m_RotationOffsetY.load(std::memory_order_relaxed));
         ++s_inLog;
     }
+
+    UpdateViewmodelNumpadAdjust(paused || m_GameUiVisible);
 }
 
 void VR::ApplyVulkanYFlip(vr::VRTextureBounds_t& bounds)
@@ -1807,8 +2423,15 @@ void VR::UpdateCrowbarMelee()
         return;
     }
 
-    // L4D2VR: |TrackedDeviceVel| > 1.1 m/s.
-    const bool swinging = speedMs > 1.1f;
+    // L4D2VR used |vel| > 1.1 m/s with NewSwing reset on every drop below
+    // that, which machine-gunned BM's IN_ATTACK pulse. Higher on-threshold,
+    // hysteresis off-threshold, and a cooldown between swings.
+    constexpr float kSwingOnMs = 2.4f;
+    constexpr float kSwingOffMs = 0.9f;
+    constexpr DWORD kSwingCooldownMs = 400;
+    constexpr DWORD kAttackPulseMs = 120;
+    const bool heldSwing = !m_MeleeNewSwing || attackWindow;
+    const bool swinging = speedMs > (heldSwing ? kSwingOffMs : kSwingOnMs);
 
     Vector body = m_HasStereoBodyOrigin ? m_StereoBodyOrigin : m_SetupOrigin;
     if (body.LengthSqr() <= 1.f)
@@ -1846,10 +2469,20 @@ void VR::UpdateCrowbarMelee()
     // 10 hulls/frame stuttered).
     if (m_MeleeNewSwing)
     {
+        const DWORD now = GetTickCount();
+        if (now < m_MeleeNextSwingMs)
+        {
+            m_PrevControllerAngAbs = curAng;
+            m_PrevControllerPosAbs = curPos;
+            m_PerformingMelee = attackWindow;
+            if (!m_PerformingMelee)
+                m_MeleeBladeAnglesValid = false;
+            return;
+        }
         m_MeleeNewSwing = false;
         m_MeleeHitEntity = nullptr;
-        m_MeleeAttackUntilMs = GetTickCount() + 120;
-        PulseAimHaptic(2800);
+        m_MeleeNextSwingMs = now + kSwingCooldownMs;
+        m_MeleeAttackUntilMs = now + kAttackPulseMs;
         static int s_meleeLog;
         if (s_meleeLog < 12)
         {
@@ -1911,7 +2544,7 @@ void VR::UpdateCrowbarMelee()
                     if (tr.fraction < 1.f && tr.m_pEnt && tr.m_pEnt != player && tr.m_pEnt != m_MeleeHitEntity)
                     {
                         m_MeleeHitEntity = tr.m_pEnt;
-                        PulseAimHaptic(3200);
+                        PulseAimHaptic(3999);
                         QAngle hitAng{};
                         QAngle::VectorAngles(traceDirection, hitAng);
                         m_MeleeBladeAngles = hitAng;
@@ -1969,7 +2602,7 @@ void VR::UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose)
     m_LeftControllerTrackingValid = false;
     m_PhysicalRightTrackingValid = false;
     m_RightControllerTrackingValid = false;
-    if (!m_System)
+    if (!m_OpenXrHelperBridgeActive && !m_System)
         return;
 
     struct Sample
@@ -2026,27 +2659,35 @@ void VR::UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose)
 
     Sample physLeft{};
     Sample physRight{};
-    sampleRole(vr::TrackedControllerRole_LeftHand, physLeft);
-    sampleRole(vr::TrackedControllerRole_RightHand, physRight);
-    if (!physLeft.valid || !physRight.valid)
+    if (m_OpenXrHelperBridgeActive)
     {
-        for (uint32_t i = 1; i < vr::k_unMaxTrackedDeviceCount; ++i)
+        sampleIndex(1, physLeft);
+        sampleIndex(2, physRight);
+    }
+    else
+    {
+        sampleRole(vr::TrackedControllerRole_LeftHand, physLeft);
+        sampleRole(vr::TrackedControllerRole_RightHand, physRight);
+        if (!physLeft.valid || !physRight.valid)
         {
-            if (m_System->GetTrackedDeviceClass(i) != vr::TrackedDeviceClass_Controller)
-                continue;
-            if (i == physLeft.idx || i == physRight.idx)
-                continue;
-            Sample extra{};
-            sampleIndex(i, extra);
-            if (!extra.valid)
-                continue;
-            const vr::ETrackedControllerRole role = m_System->GetControllerRoleForTrackedDeviceIndex(i);
-            if (!physLeft.valid && (role == vr::TrackedControllerRole_LeftHand || role == vr::TrackedControllerRole_Invalid))
-                physLeft = extra;
-            else if (!physRight.valid && (role == vr::TrackedControllerRole_RightHand || role == vr::TrackedControllerRole_Invalid))
-                physRight = extra;
-            if (physLeft.valid && physRight.valid)
-                break;
+            for (uint32_t i = 1; i < vr::k_unMaxTrackedDeviceCount; ++i)
+            {
+                if (m_System->GetTrackedDeviceClass(i) != vr::TrackedDeviceClass_Controller)
+                    continue;
+                if (i == physLeft.idx || i == physRight.idx)
+                    continue;
+                Sample extra{};
+                sampleIndex(i, extra);
+                if (!extra.valid)
+                    continue;
+                const vr::ETrackedControllerRole role = m_System->GetControllerRoleForTrackedDeviceIndex(i);
+                if (!physLeft.valid && (role == vr::TrackedControllerRole_LeftHand || role == vr::TrackedControllerRole_Invalid))
+                    physLeft = extra;
+                else if (!physRight.valid && (role == vr::TrackedControllerRole_RightHand || role == vr::TrackedControllerRole_Invalid))
+                    physRight = extra;
+                if (physLeft.valid && physRight.valid)
+                    break;
+            }
         }
     }
     const Sample& aim = (AimControllerRole() == vr::TrackedControllerRole_LeftHand) ? physLeft : physRight;
@@ -2120,7 +2761,21 @@ vr::ETrackedControllerRole VR::AimControllerRole() const
 
 bool VR::GetFingerCurls(vr::VRActionHandle_t skeletonAction, float outCurls[5]) const
 {
-    if (!outCurls || !m_Input || skeletonAction == vr::k_ulInvalidActionHandle)
+    if (!outCurls)
+        return false;
+    if (m_OpenXrHelperBridgeActive)
+    {
+        const uint32_t hand = (skeletonAction == m_ActionSkeletonRight)
+            ? L4D2VR_OPENXR_HAND_RIGHT
+            : L4D2VR_OPENXR_HAND_LEFT;
+        const L4D2VROpenXrHandTrackingDesc& ht = m_OpenXrLastInputState.handTracking[hand];
+        if (!ht.valid || !ht.active)
+            return false;
+        for (int i = 0; i < 5; ++i)
+            outCurls[i] = std::clamp(ht.fingerCurls[i], 0.f, 1.f);
+        return true;
+    }
+    if (!m_Input || skeletonAction == vr::k_ulInvalidActionHandle)
         return false;
     vr::VRSkeletalSummaryData_t summary{};
     const vr::EVRInputError err = m_Input->GetSkeletalSummaryData(
@@ -2361,7 +3016,7 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
         else
             device->SetDepthStencilSurface(nullptr);
     };
-    if (!drawBoxes && !(bmvr::g_HandHud && m_Game))
+    if (!drawBoxes && !(bmvr::g_HandHud && m_Game) && !WeaponMenuOpen())
     {
         restoreTargets();
         device->Release();
@@ -2442,7 +3097,8 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
     {
         if (leftOk)
             drawHandProxy(toWorld(leftPos), leftAng, D3DCOLOR_XRGB(0, 255, 255), true, m_ActionSkeletonLeft);
-        if (rightOk && bmvr::g_VrHandsRightEnabled)
+        if (rightOk && (bmvr::g_VrHandsRightEnabled
+            || (g_Game && g_Game->m_VR && g_Game->m_VR->WantsRightGloveVisible())))
             drawHandProxy(toWorld(rightPos), rightAng, D3DCOLOR_XRGB(255, 0, 255), false, m_ActionSkeletonRight);
     }
 
@@ -2464,6 +3120,8 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
         DrawHandHud(device, stereoEye, w, h,
             leftOk, leftWrist, rightOk, rightWrist, eyeOrig, fwd, right, up);
     }
+    if (WeaponMenuOpen())
+        DrawWeaponMenu(device, w, h, eyeOrig, fwd, right, up);
 
     static int s_handLog;
     if (s_handLog < 4)
@@ -2806,6 +3464,8 @@ void VR::ApplyTwoHandShotgunAim()
 void VR::GetRightGlovePalmOffsetMeters(Vector& meters) const
 {
     meters = Vector(0.f, 0.f, 0.f);
+    if (m_EmptyHands)
+        return;
     std::string model;
     {
         std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
@@ -2831,14 +3491,22 @@ void VR::GetRightGlovePalmOffsetMeters(Vector& meters) const
     else if (has("glock") || has("pistol") || has("9mm") || has("beretta"))
         meters = Vector(0.f, -0.018f, -0.020f);
     else if (has("crossbow") || has("rpg") || has("rocket") || has("gauss")
-        || has("tau") || has("egon") || has("gluon") || has("hornet") || has("hive"))
+        || has("tau") || has("egon") || has("gluon") || has("hornet") || has("hive")
+        || has("hgun"))
         meters = Vector(0.f, -0.010f, -0.024f);
     else
         meters = Vector(0.f, -0.008f, -0.016f);
 }
 
+bool VR::WantsRightGloveVisible() const
+{
+    return bmvr::g_VrHandsRightEnabled || m_EmptyHands;
+}
+
 bool VR::WantsRightGloveWeaponGripCurl() const
 {
+    if (m_EmptyHands)
+        return false;
     std::string model;
     {
         std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
@@ -2855,6 +3523,235 @@ bool VR::WantsRightGloveWeaponGripCurl() const
         || model.find("squeak") != std::string::npos || model.find("snark") != std::string::npos)
         return false;
     return true;
+}
+
+namespace vm_numpad
+{
+    struct Offsets
+    {
+        float ox = 0.f;
+        float oy = 0.f;
+        float oz = 0.f;
+        float ax = 0.f;
+        float ay = 0.f;
+        float az = 0.f;
+    };
+
+    std::map<std::string, Offsets> g_Off;
+    bool g_Loaded = false;
+    DWORD g_LastRepeatMs = 0;
+    int g_LastVk = 0;
+
+    std::wstring SavePath()
+    {
+        wchar_t exe[MAX_PATH]{};
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring dir(exe);
+        const size_t slash = dir.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+            dir.resize(slash);
+        return dir + L"\\VR\\viewmodel_offsets.txt";
+    }
+
+    std::string KeyFromModel(const std::string& model)
+    {
+        std::string m = model;
+        for (char& c : m)
+            c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        auto has = [&](const char* s) { return m.find(s) != std::string::npos; };
+        if (has("crowbar") || has("wrench")) return "crowbar";
+        if (has("glock") || has("pistol") || has("9mm") || has("beretta")) return "glock";
+        if (has("357") || has("python") || has("revolver")) return "357";
+        if (has("mp5") || has("smg") || has("mp5k")) return "mp5";
+        if (has("shotgun") || has("spas") || has("pump")) return "shotgun";
+        if (has("crossbow")) return "crossbow";
+        if (has("rpg") || has("rocket")) return "rpg";
+        if (has("gauss") || has("tau")) return "gauss";
+        if (has("egon") || has("gluon")) return "gluon";
+        if (has("hgun") || has("hive") || has("hornet")) return "hgun";
+        if (has("grenade") || has("frag")) return "grenade";
+        if (has("satchel")) return "satchel";
+        if (has("tripmine") || has("trip")) return "tripmine";
+        if (has("squeak") || has("snark")) return "snark";
+        if (m.empty()) return {};
+        return "default";
+    }
+
+    void Load()
+    {
+        if (g_Loaded)
+            return;
+        g_Loaded = true;
+        const std::wstring path = SavePath();
+        std::ifstream in(path);
+        if (!in)
+            return;
+        std::string line;
+        int n = 0;
+        while (std::getline(in, line))
+        {
+            if (line.empty() || line[0] == '#')
+                continue;
+            char key[32]{};
+            Offsets o{};
+            if (sscanf_s(line.c_str(), "%31s %f %f %f %f %f %f",
+                key, static_cast<unsigned>(sizeof(key)),
+                &o.ox, &o.oy, &o.oz, &o.ax, &o.ay, &o.az) >= 4)
+            {
+                g_Off[key] = o;
+                ++n;
+            }
+        }
+        Game::logMsg("Viewmodel numpad offsets loaded=%d %ls", n, path.c_str());
+    }
+
+    void Save()
+    {
+        const std::wstring path = SavePath();
+        const size_t slash = path.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+            CreateDirectoryW(path.substr(0, slash).c_str(), nullptr);
+        std::ofstream out(path, std::ios::trunc);
+        if (!out)
+        {
+            Game::logMsg("Viewmodel numpad save failed %ls", path.c_str());
+            return;
+        }
+        out << "# Numpad (gameplay): 4/6 Y  8/2 Z  7/9 X. Hold Ctrl for angles.\n";
+        out << "# Numpad 5 save, 0 reset this weapon, Shift = fine step.\n";
+        out << "# key ox oy oz ax ay az  (added on top of the built-in table)\n";
+        for (const auto& kv : g_Off)
+        {
+            out << kv.first << " "
+                << kv.second.ox << " " << kv.second.oy << " " << kv.second.oz << " "
+                << kv.second.ax << " " << kv.second.ay << " " << kv.second.az << "\n";
+        }
+        Game::logMsg("Viewmodel numpad saved %d weapons %ls", static_cast<int>(g_Off.size()), path.c_str());
+    }
+
+    void Apply(const std::string& model, float& ox, float& oy, float& oz, float& ax, float& ay, float& az)
+    {
+        Load();
+        const std::string key = KeyFromModel(model);
+        if (key.empty())
+            return;
+        auto it = g_Off.find(key);
+        if (it == g_Off.end())
+            return;
+        ox += it->second.ox;
+        oy += it->second.oy;
+        oz += it->second.oz;
+        ax += it->second.ax;
+        ay += it->second.ay;
+        az += it->second.az;
+    }
+
+    bool KeyHeld(int vk)
+    {
+        return (GetAsyncKeyState(vk) & 0x8000) != 0;
+    }
+
+    bool RepeatEdge(int vk, DWORD now)
+    {
+        if (!KeyHeld(vk))
+        {
+            if (g_LastVk == vk)
+                g_LastVk = 0;
+            return false;
+        }
+        if (g_LastVk != vk)
+        {
+            g_LastVk = vk;
+            g_LastRepeatMs = now;
+            return true;
+        }
+        const DWORD delay = (now - g_LastRepeatMs > 400) ? 50u : 400u;
+        if (now - g_LastRepeatMs >= delay)
+        {
+            g_LastRepeatMs = now;
+            return true;
+        }
+        return false;
+    }
+}
+
+void VR::UpdateViewmodelNumpadAdjust(bool paused)
+{
+    vm_numpad::Load();
+    if (paused || !m_GameplayEligible)
+        return;
+    std::string model;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
+        model = m_LastViewmodelModel;
+    }
+    const std::string key = vm_numpad::KeyFromModel(model);
+    if (key.empty())
+        return;
+
+    const DWORD now = GetTickCount();
+    const bool ctrl = vm_numpad::KeyHeld(VK_CONTROL);
+    const bool fine = vm_numpad::KeyHeld(VK_SHIFT);
+    const float pstep = fine ? 0.15f : 0.5f;
+    const float astep = fine ? 0.5f : 2.0f;
+    vm_numpad::Offsets& o = vm_numpad::g_Off[key];
+    bool changed = false;
+    auto bump = [&](int vk, float* dst, float delta) {
+        if (!vm_numpad::RepeatEdge(vk, now))
+            return;
+        *dst += delta;
+        changed = true;
+    };
+    if (ctrl)
+    {
+        bump(VK_NUMPAD8, &o.ax, astep);
+        bump(VK_UP, &o.ax, astep);
+        bump(VK_NUMPAD2, &o.ax, -astep);
+        bump(VK_DOWN, &o.ax, -astep);
+        bump(VK_NUMPAD6, &o.ay, astep);
+        bump(VK_RIGHT, &o.ay, astep);
+        bump(VK_NUMPAD4, &o.ay, -astep);
+        bump(VK_LEFT, &o.ay, -astep);
+        bump(VK_NUMPAD9, &o.az, astep);
+        bump(VK_PRIOR, &o.az, astep);
+        bump(VK_NUMPAD7, &o.az, -astep);
+        bump(VK_HOME, &o.az, -astep);
+    }
+    else
+    {
+        bump(VK_NUMPAD9, &o.ox, pstep);
+        bump(VK_PRIOR, &o.ox, pstep);
+        bump(VK_NUMPAD7, &o.ox, -pstep);
+        bump(VK_HOME, &o.ox, -pstep);
+        bump(VK_NUMPAD6, &o.oy, pstep);
+        bump(VK_RIGHT, &o.oy, pstep);
+        bump(VK_NUMPAD4, &o.oy, -pstep);
+        bump(VK_LEFT, &o.oy, -pstep);
+        bump(VK_NUMPAD8, &o.oz, pstep);
+        bump(VK_UP, &o.oz, pstep);
+        bump(VK_NUMPAD2, &o.oz, -pstep);
+        bump(VK_DOWN, &o.oz, -pstep);
+    }
+    if (vm_numpad::RepeatEdge(VK_NUMPAD0, now) || vm_numpad::RepeatEdge(VK_INSERT, now))
+    {
+        o = {};
+        changed = true;
+        Game::logMsg("Viewmodel numpad reset %s", key.c_str());
+    }
+    static bool s_saveDown = false;
+    const bool saveHeld = vm_numpad::KeyHeld(VK_NUMPAD5) || vm_numpad::KeyHeld(VK_CLEAR);
+    if (saveHeld && !s_saveDown)
+    {
+        vm_numpad::Save();
+        Game::logMsg("Viewmodel numpad %s extra pos=(%.2f,%.2f,%.2f) ang=(%.2f,%.2f,%.2f) saved",
+            key.c_str(), o.ox, o.oy, o.oz, o.ax, o.ay, o.az);
+    }
+    s_saveDown = saveHeld;
+    if (changed)
+    {
+        Game::logMsg("Viewmodel numpad %s extra pos=(%.2f,%.2f,%.2f) ang=(%.2f,%.2f,%.2f)%s",
+            key.c_str(), o.ox, o.oy, o.oz, o.ax, o.ay, o.az, ctrl ? " [ang]" : "");
+    }
 }
 
 void VR::ResolveWeaponViewmodelPose(float& ox, float& oy, float& oz, float& ax, float& ay, float& az) const
@@ -2878,28 +3775,36 @@ void VR::ResolveWeaponViewmodelPose(float& ox, float& oy, float& oz, float& ax, 
         // Plan §7: L4D2 empirical position tables (HMD-tuned starting point).
         // DME bake rest is logged via NoteViewmodelWeaponBake for pivot diagnosis
         // only — not 1:1 with L4D2 offsets (implementation-plan §7 evidence).
+        // 2026-08-28 HMD-saved numpad extras baked into this table. Numpad
+        // extras in VR/viewmodel_offsets.txt still add on top.
         if (has("crowbar") || has("wrench"))
-        { ox = 19.5f; oy = 6.f; oz = -11.f; }
+        { ox = 15.5f; oy = 8.5f; oz = -12.f; }
         else if (has("glock") || has("pistol") || has("9mm") || has("beretta"))
-        { ox = 20.5f; oy = 5.f; oz = -3.5f; }
+        { ox = 16.5f; oy = 4.f; oz = -7.f; }
         else if (has("357") || has("python") || has("revolver"))
-        { ox = 18.f; oy = 5.f; oz = -2.5f; }
+        { ox = 10.f; oy = 3.5f; oz = -5.5f; }
         else if (has("mp5") || has("smg") || has("mp5k"))
-        { ox = 18.5f; oy = 4.f; oz = -4.5f; }
+        { ox = 9.f; oy = 4.5f; oz = -9.f; }
         else if (has("shotgun") || has("spas") || has("pump"))
-        { ox = 16.5f; oy = 5.f; oz = -1.5f; }
+        { ox = 9.f; oy = 8.f; oz = -9.5f; }
         else if (has("crossbow"))
-        { ox = 15.f; oy = 4.f; oz = -4.f; }
+        { ox = 12.5f; oy = 11.5f; oz = -13.f; }
         else if (has("rpg") || has("rocket"))
-        { ox = 14.f; oy = 5.f; oz = -2.f; }
+        { ox = 12.f; oy = 10.5f; oz = -6.5f; }
         else if (has("gauss") || has("tau"))
-        { ox = 18.f; oy = 5.5f; oz = -5.5f; }
+        { ox = 15.f; oy = 11.5f; oz = -16.5f; }
         else if (has("egon") || has("gluon"))
-        { ox = 18.f; oy = 5.5f; oz = -5.5f; }
-        else if (has("hornet") || has("hive"))
-        { ox = 20.f; oy = 4.f; oz = -3.f; }
-        else if (has("grenade") || has("frag") || has("satchel") || has("tripmine") || has("squeak") || has("snark"))
-        { ox = 20.f; oy = 3.f; oz = 0.f; }
+        { ox = 19.f; oy = 8.f; oz = -2.f; }
+        else if (has("hgun") || has("hive") || has("hornet"))
+        { ox = 19.5f; oy = 11.34f; oz = -17.69f; }
+        else if (has("grenade") || has("frag"))
+        { ox = 15.f; oy = 6.5f; oz = -8.f; }
+        else if (has("satchel"))
+        { ox = 19.f; oy = -10.f; oz = -12.f; }
+        else if (has("tripmine") || has("trip"))
+        { ox = 12.5f; oy = 4.5f; oz = -9.5f; }
+        else if (has("squeak") || has("snark"))
+        { ox = 15.f; oy = 7.5f; oz = -6.5f; }
 
         if (has("crowbar") || has("wrench"))
         { ax = -24.5f; ay = -6.5f; az = -6.f; }
@@ -2910,12 +3815,16 @@ void VR::ResolveWeaponViewmodelPose(float& ox, float& oy, float& oz, float& ax, 
         else if (has("mp5") || has("smg") || has("mp5k"))
         { ax = -0.5f; }
         else if (has("shotgun") || has("spas") || has("pump"))
-        { ax = -0.5f; }
+        { ax = -0.5f; ay = -4.f; }
         else if (has("crossbow"))
         { ax = -4.5f; ay = -5.f; }
         else if (has("rpg") || has("rocket"))
         { ax = -1.f; }
-        else if (has("gauss") || has("tau") || has("egon") || has("gluon"))
+        else if (has("gauss") || has("tau"))
+        { ax = -1.5f; ay = -8.f; }
+        else if (has("egon") || has("gluon"))
+        { ax = -1.5f; ay = -2.f; }
+        else if (has("hgun") || has("hive") || has("hornet"))
         { ax = -1.5f; ay = -2.f; }
     }
     ox += bmvr::g_ViewmodelPosOffsetX;
@@ -2924,21 +3833,12 @@ void VR::ResolveWeaponViewmodelPose(float& ox, float& oy, float& oz, float& ax, 
     ax += bmvr::g_ViewmodelAngOffsetX;
     ay += bmvr::g_ViewmodelAngOffsetY;
     az += bmvr::g_ViewmodelAngOffsetZ;
+    vm_numpad::Apply(model, ox, oy, oz, ax, ay, az);
 }
 
 void VR::PulseAimHaptic(unsigned short durationUs)
 {
-    if (!bmvr::g_Haptics || !m_System)
-        return;
-    if (durationUs < 1)
-        durationUs = 1;
-    if (durationUs > 3999)
-        durationUs = 3999;
-    const vr::TrackedDeviceIndex_t idx =
-        m_System->GetTrackedDeviceIndexForControllerRole(AimControllerRole());
-    if (idx == vr::k_unTrackedDeviceIndexInvalid)
-        return;
-    m_System->TriggerHapticPulse(idx, 0, durationUs);
+    PulseHandHaptic(AimControllerRole(), durationUs, 0.6f);
 }
 
 void VR::ApplyVrQualityOfLifeCvars()
@@ -2983,6 +3883,10 @@ void VR::ApplyVrQualityOfLifeCvars()
         setf("cl_viewmodel_lag", 0.f);
         seti("r_jiggle_bones", 0);
     }
+    // Listen-server viewpunch spring still kicks MP5 bullets up after client
+    // netvars are zeroed. Raw ConVar write; FCVAR_CHEAT does not block this.
+    seti("sv_suppress_viewpunch", 1);
+    setf("sv_viewpunch_spring_constant", 0.f);
     // Stereo used to force r_occlusion 0 + r_portalsopenall 1 because two
     // RenderViews reused HW occlusion / areaportals and could latch empty vis.
     // That pair draws every leaf and tanks open/complex maps. Default: restore
@@ -3002,9 +3906,33 @@ void VR::ApplyVrQualityOfLifeCvars()
         seti("r_portalsopenall", 0);
     }
     // BM new-renderer CSM logged 8192x8192 (_rt_gbshadowmaprt) inside each
-    // stereo RenderView. L4D2VR ShadowTweaks uses RTT off + half-rate; BM has
-    // cl_csm_qualitymode / nr_shadow_* instead (materialsystem.dll strings).
+    // stereo RenderView. Lowest quality + 2048 res + one shadow pass.
     // Do not touch r_flashlightdepthtexture — that broke deferred flashlight.
+    // Verified worse on bm_c2a5a (2026-08-28): cl_csm_enabled 0, nr_shadow_active
+    // 0, nr_dev_gb_debug_type 1 (GBuffer_Fast), r_lod 2. Best session so far was
+    // this block only (QoL 27 ok, csmQ=0). Undo the poisoned values so ARCHIVE
+    // / leftover bmvr.cfg writes do not stick.
+    seti("cl_csm_enabled", 1);
+    seti("cl_csm_cascade_dynamic_ignore", 0);
+    seti("nr_shadow_active", 1);
+    seti("nr_dev_gb_debug_type", 2);
+    seti("nr_lights_procedural_disable_all_lights", 0);
+    seti("nr_dev_shoot_lights_enabled", 1);
+    seti("gb_flashlight_shadow_enabled", 1);
+    seti("cl_dlight_manager_enable", 1);
+    seti("r_dynamic", 1);
+    seti("r_maxdlights", 32);
+    seti("r_lod", -1);
+    seti("r_rootlod", 0);
+    seti("r_eyes", 1);
+    seti("r_teeth", 1);
+    seti("flex_smooth", 1);
+    seti("r_drawflecks", 1);
+    seti("mat_reduceparticles", 0);
+    seti("cl_new_impact_effects", 1);
+    seti("nr_allow_hammer_nerfs", 0);
+    seti("nr_allow_hammer_nerfs_4ways", 0);
+    seti("nr_gbuffer_for_refraction_enabled", 1);
     seti("cl_csm_qualitymode", 0);
     seti("nr_shadow_quality", 0);
     seti("nr_shadow_filter_quality", 0);
@@ -3130,7 +4058,7 @@ void VR::UpdateAutoMatQueueMode()
 
 void VR::PollSteamVrRecommendedSize()
 {
-    if (!m_System)
+    if (m_OpenXrHelperBridgeActive || !m_System)
         return;
     uint32_t recW = 0, recH = 0;
     m_System->GetRecommendedRenderTargetSize(&recW, &recH);
@@ -3209,6 +4137,15 @@ void VR::WaitPosesForStereoFrame()
 {
     if (m_PosesWaitedThisFrame)
         return;
+    if (m_OpenXrHelperBridgeActive)
+    {
+        ConsumeOpenXrTracking();
+        UpdateTracking();
+        m_OpenXrStereoRenderPose = m_OpenXrLastHmdPose;
+        m_OpenXrStereoRenderPoseValid = m_OpenXrLastHmdPose.valid != 0;
+        m_PosesWaitedThisFrame = true;
+        return;
+    }
     // NEVER call WaitGetPoses from the render thread: the pose-waiter thread
     // owns it. Concurrent WaitGetPoses races openvr_api compositor state
     // (verified OpenCode 2026-08-25: fps 100<->7 and 0xc0000374 heap
@@ -3250,7 +4187,7 @@ bool VR::RefreshPosesFromCompositor()
 
 void VR::StartPoseWaiter()
 {
-    if (m_PoseWaiterThread)
+    if (m_OpenXrHelperBridgeActive || m_PoseWaiterThread)
         return;
     m_PoseWaiterStop.store(false, std::memory_order_release);
     m_PoseWaiterThread = CreateThread(nullptr, 0, &VR::PoseWaiterThreadMain, this, 0, nullptr);
@@ -3350,6 +4287,9 @@ bool VR::FillSharedTexture(IDirect3DSurface9* surface, SharedTextureHolder& hold
     holder.m_VRTexture.handle = &holder.m_VulkanData;
     holder.m_VRTexture.eType = vr::TextureType_Vulkan;
     holder.m_VRTexture.eColorSpace = vr::ColorSpace_Auto;
+    holder.m_SharedHandle = desc.SharedHandle;
+    holder.m_SharedHandleType = desc.SharedHandleType;
+    holder.m_SharedHandleValid = desc.SharedHandleValid;
     return holder.m_VulkanData.m_nImage != 0;
 }
 
@@ -3950,7 +4890,7 @@ void VR::EnsureHudOverlay()
         return;
     if (!bmvr::TryHudOverlay() || !m_Game || !m_Game->m_MaterialSystem || !m_Game->m_Offsets)
         return;
-    if (m_HUDTopHandle == vr::k_ulOverlayHandleInvalid)
+    if (!m_OpenXrHelperBridgeActive && m_HUDTopHandle == vr::k_ulOverlayHandleInvalid)
         return;
     static DWORD s_lastTry;
     const DWORD now = GetTickCount();
@@ -4085,6 +5025,8 @@ void VR::BlitEngineHudRtToOverlay()
 
 void VR::SubmitHudOverlay()
 {
+    if (m_OpenXrHelperBridgeActive)
+        return;
     if (!m_HudOverlayReady || !m_Overlay || m_HUDTopHandle == vr::k_ulOverlayHandleInvalid)
         return;
     if (!m_VKHUD.m_VRTexture.handle)
@@ -4151,6 +5093,8 @@ void VR::SubmitHudOverlay()
 
 void VR::BindHudOverlayWhileQueueLocked()
 {
+    if (m_OpenXrHelperBridgeActive)
+        return;
     if (!m_HudOverlayReady || !m_Overlay || m_HUDTopHandle == vr::k_ulOverlayHandleInvalid)
         return;
     if (!m_VKHUD.m_VRTexture.handle)
@@ -4565,7 +5509,48 @@ void VR::CaptureFrameBeforePresent()
 
 void VR::SubmitVRTextures()
 {
-    if (!m_Compositor || !g_D3DVR9 || !m_IsVREnabled)
+    if (!g_D3DVR9 || !m_IsVREnabled)
+        return;
+    if (!m_CreatedVRTextures.load(std::memory_order_acquire))
+        return;
+
+    if (m_OpenXrHelperBridgeActive)
+    {
+        const bool haveNewFrame = m_RenderedNewFrame.load(std::memory_order_acquire);
+        if (!haveNewFrame && !m_DirectEyeSubmit)
+            return;
+        if (!PrepareOpenXrEyeSurfacesForRead())
+            return;
+        if (m_OpenXrStereoRenderPoseValid)
+            L4D2VR_PublishOpenXrGameRenderPose(m_OpenXrStereoRenderPose);
+        const uint32_t frameId = m_OpenXrSubmitFrameId.fetch_add(1, std::memory_order_acq_rel);
+        PublishOpenXrResolvedEyeTextures(frameId);
+        if (m_HudOverlayReady && m_D9HUDSurface
+            && m_HudPaintedThisFrame.load(std::memory_order_acquire)
+            && PauseUiActive())
+        {
+            g_D3DVR9->TransferSurface(m_D9HUDSurface, FALSE);
+            FillSharedTexture(m_D9HUDSurface, m_VKHUD);
+            PublishOpenXrHudOverlay(frameId);
+        }
+        else
+            HideOpenXrHudOverlay();
+        if (L4D2VR_OpenXrHelperHasSubmittedFrame() || frameId > 1)
+        {
+            m_HasSubmittedSceneFrame.store(true, std::memory_order_release);
+            ++m_SubmitCount;
+            m_RenderedNewFrame.store(false, std::memory_order_release);
+            if (!m_LoggedFirstSubmit)
+            {
+                m_LoggedFirstSubmit = true;
+                Game::logMsg("[VR][OpenXRHelper] published shared eye frame %u gameRenderPose=%d",
+                    frameId, m_OpenXrStereoRenderPoseValid ? 1 : 0);
+            }
+        }
+        return;
+    }
+
+    if (!m_Compositor)
         return;
     if (!m_CreatedVRTextures.load(std::memory_order_acquire))
         return;
@@ -4878,7 +5863,10 @@ void VR::Update()
     if (!m_Game)
         return;
 
-    if (!m_IsVREnabled && m_OpenVRInitAttempts < 8)
+    if (!m_IsVREnabled && m_RequestedRuntimeBackend != VrRuntimeBackend::OpenXR && m_OpenVRInitAttempts < 8)
+        m_IsInitialized = InitOpenVR();
+    if (!m_IsVREnabled && m_RequestedRuntimeBackend == VrRuntimeBackend::OpenXR && m_RuntimeBackend == VrRuntimeBackend::OpenVR
+        && m_OpenVRInitAttempts < 8)
         m_IsInitialized = InitOpenVR();
     if (!m_IsVREnabled)
         return;
@@ -4890,6 +5878,9 @@ void VR::Update()
     // material precache, and overnight Update work is not what unblocks it.
     if (m_GameplayEligible && !inGame)
         return;
+
+    if (m_OpenXrHelperBridgeActive)
+        ConsumeOpenXrTracking();
 
     TickCompositorFocus();
 
@@ -5021,7 +6012,7 @@ void VR::Update()
 
     const DWORD poseTick = m_WaitedPoseTick.load(std::memory_order_acquire);
     const DWORD poseAge = poseTick ? (GetTickCount() - poseTick) : 0xffffffffu;
-    if (poseTick == 0 || poseAge > 500)
+    if (poseTick == 0 || (!m_OpenXrHelperBridgeActive && poseAge > 500))
     {
         static int s_staleLog;
         if (s_staleLog < 6)

@@ -25,6 +25,7 @@ If you already tuned VR\config.txt, keep your copy (do not overwrite it).
 This zip also includes:
 
   Black Mesa\VR\hands\          HEV glove meshes
+  Black Mesa\VR\openxr_helper64\  L4D2VR x64 OpenXR helper (if built)
   Black Mesa\bms\cfg\bmvr.cfg   crosshair off / VR QoL cvars
 
 If bms\cfg\autoexec.cfg exists, add this line (once):
@@ -121,6 +122,9 @@ Those take effect on the next launch (config is read at DLL load).
 Also in VR\config.txt (defaults):
 
   AutoMatQueueMode=false  leave engine mat_queue_mode alone (menu still 0)
+  VRRuntimeBackend=openxr  L4D2VR x64 OpenXR helper (openvr = SteamVR compositor)
+  OpenXRHelper=true
+  OpenXRHelperSubmitTestFrames=0
   ForceOpenVis=false      keep PVS/occlusion (true = old whole-map vis)
   StereoBlitGpuFlush=false  do not CPU-wait GPU between stereo eyes
   IPDScale=1.0            HeightOffset=0.0

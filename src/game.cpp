@@ -216,20 +216,96 @@ C_BaseEntity* Game::GetActiveWeaponEntity()
     return static_cast<C_BaseEntity*>(m_ClientEntityList->GetClientEntityFromHandle(static_cast<int>(h)));
 }
 
-const char* Game::GetActiveWeaponModelName()
+const char* Game::GetEntityModelName(C_BaseEntity* entity)
 {
-    C_BaseEntity* weapon = GetActiveWeaponEntity();
-    if (!weapon || !m_ModelInfo)
+    if (!entity || !m_ModelInfo)
         return nullptr;
-    // DT_BaseEntity m_nModelIndex +0x94 (Ghidra FUN_100a4cb0).
-    const short modelIndex = *reinterpret_cast<const short*>(
-        reinterpret_cast<uintptr_t>(weapon) + 0x94);
+    short modelIndex = 0;
+    __try
+    {
+        modelIndex = *reinterpret_cast<const short*>(
+            reinterpret_cast<uintptr_t>(entity) + 0x94);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
     if (modelIndex <= 0)
         return nullptr;
     void* model = m_ModelInfo->GetModel(modelIndex);
     if (!model)
         return nullptr;
     return m_ModelInfo->GetModelName(model);
+}
+
+const char* Game::GetActiveWeaponModelName()
+{
+    return GetEntityModelName(GetActiveWeaponEntity());
+}
+
+C_BaseEntity* Game::GetViewModelEntity()
+{
+    if (!m_EngineClient || !m_ClientEntityList)
+        return nullptr;
+    const int local = m_EngineClient->GetLocalPlayer();
+    if (local <= 0)
+        return nullptr;
+    void* player = m_ClientEntityList->GetClientEntity(local);
+    if (!player)
+        return nullptr;
+    // DT_BasePlayer m_hViewModel[0] +0x13F0, count 2 (Ghidra FUN_100b6a00).
+    constexpr int kViewModel0 = 0x13F0;
+    constexpr uint32_t kInvalid = 0xFFFFFFFFu;
+    uint32_t h = 0;
+    __try
+    {
+        h = *reinterpret_cast<const uint32_t*>(
+            reinterpret_cast<uintptr_t>(player) + kViewModel0);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+    if (h == 0 || h == kInvalid)
+        return nullptr;
+    return static_cast<C_BaseEntity*>(m_ClientEntityList->GetClientEntityFromHandle(static_cast<int>(h)));
+}
+
+const char* Game::GetEntityNetworkName(int entityIndex)
+{
+    if (!m_ClientEntityList || entityIndex <= 0)
+        return nullptr;
+    void* net = nullptr;
+    __try
+    {
+        net = m_ClientEntityList->GetClientNetworkable(entityIndex);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+    if (!net)
+        return nullptr;
+    struct ClientClassLite
+    {
+        void* createFn;
+        void* createEventFn;
+        const char* networkName;
+    };
+    const char* name = nullptr;
+    __try
+    {
+        void** vt = *reinterpret_cast<void***>(net);
+        using tGetClientClass = ClientClassLite*(__thiscall*)(void*);
+        ClientClassLite* cc = reinterpret_cast<tGetClientClass>(vt[2])(net);
+        if (cc)
+            name = cc->networkName;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+    return name;
 }
 
 // Wrist HUD netvars.
@@ -361,6 +437,27 @@ void Game::ScanWristHudNetVars()
         g_nvHealth, g_nvArmor, g_nvClip1, g_nvAmmoBase, g_nvPrimaryAmmoType);
 }
 
+int Game::ReadWeaponClip(C_BaseEntity* weapon)
+{
+    if (!weapon)
+        return -1;
+    if (!g_nvScanned)
+        ScanWristHudNetVars();
+    if (g_nvClip1 < 0)
+        return -1;
+    int clip = -1;
+    __try
+    {
+        clip = *reinterpret_cast<volatile int*>(
+            reinterpret_cast<unsigned char*>(weapon) + g_nvClip1);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return -1;
+    }
+    return clip;
+}
+
 bool Game::ReadWristHudValues(int& health, int& armor, int& clip, int& reserve)
 {
     ScanWristHudNetVars();
@@ -469,6 +566,65 @@ int Game::CycleWeaponSelect(int direction)
     else
         next = direction > 0 ? 0 : n - 1;
     return indices[next];
+}
+
+int Game::CollectInventoryWeapons(InventoryWeapon* out, int maxCount)
+{
+    if (!out || maxCount <= 0 || !m_EngineClient || !m_ClientEntityList)
+        return 0;
+    const int local = m_EngineClient->GetLocalPlayer();
+    if (local <= 0)
+        return 0;
+    void* player = m_ClientEntityList->GetClientEntity(local);
+    if (!player)
+        return 0;
+
+    constexpr int kMyWeapons = 0xEE4;
+    constexpr int kMaxWeapons = 48;
+    constexpr uint32_t kInvalid = 0xFFFFFFFFu;
+    constexpr uint32_t kEntryMask = 0x1FFFu;
+
+    const auto* handles = reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<uintptr_t>(player) + kMyWeapons);
+    int n = 0;
+    for (int i = 0; i < kMaxWeapons && n < maxCount; ++i)
+    {
+        uint32_t h = 0;
+        __try
+        {
+            h = handles[i];
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            break;
+        }
+        if (h == 0 || h == kInvalid)
+            continue;
+        void* weapon = m_ClientEntityList->GetClientEntityFromHandle(static_cast<int>(h));
+        if (!weapon)
+            continue;
+        int idx = static_cast<int>(h & kEntryMask);
+        if (m_ClientEntityList->GetClientEntity(idx) != weapon)
+        {
+            idx = 0;
+            const int hi = m_ClientEntityList->GetHighestEntityIndex();
+            for (int e = 1; e <= hi; ++e)
+            {
+                if (m_ClientEntityList->GetClientEntity(e) == weapon)
+                {
+                    idx = e;
+                    break;
+                }
+            }
+        }
+        if (idx <= 0)
+            continue;
+        out[n].entityIndex = idx;
+        out[n].modelName = GetEntityModelName(static_cast<C_BaseEntity*>(weapon));
+        out[n].networkName = GetEntityNetworkName(idx);
+        ++n;
+    }
+    return n;
 }
 
 bool Game::ClientCmd(const char* szCmdString)

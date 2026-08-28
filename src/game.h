@@ -67,9 +67,20 @@ public:
     void* GetInterface(const char* dllname, const char* interfacename);
     C_BaseEntity* GetClientEntity(int entityIndex);
     C_BaseEntity* GetActiveWeaponEntity();
+    C_BaseEntity* GetViewModelEntity();
     void ScanWristHudNetVars();
     bool ReadWristHudValues(int& health, int& armor, int& clip, int& reserve);
+    int ReadWeaponClip(C_BaseEntity* weapon);
     const char* GetActiveWeaponModelName();
+    const char* GetEntityModelName(C_BaseEntity* entity);
+    const char* GetEntityNetworkName(int entityIndex);
+    struct InventoryWeapon
+    {
+        int entityIndex = 0;
+        const char* modelName = nullptr;
+        const char* networkName = nullptr;
+    };
+    int CollectInventoryWeapons(InventoryWeapon* out, int maxCount);
     int CycleWeaponSelect(int direction);
     bool ClientCmd(const char* szCmdString);
     bool ClientCmd_Unrestricted(const char* szCmdString);

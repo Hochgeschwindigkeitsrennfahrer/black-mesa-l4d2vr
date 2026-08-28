@@ -42,12 +42,26 @@ d3d9.deviceLossOnFocusLoss = False
 $VrDst = Join-Path $Stage "VR"
 New-Item -ItemType Directory -Force -Path $VrDst | Out-Null
 Copy-Item -Force (Join-Path $VrSrc "config.txt") (Join-Path $VrDst "config.txt")
+$OffSrc = Join-Path $VrSrc "viewmodel_offsets.txt"
+if (Test-Path $OffSrc) {
+  Copy-Item -Force $OffSrc (Join-Path $VrDst "viewmodel_offsets.txt")
+}
 Copy-Item -Recurse -Force (Join-Path $VrSrc "SteamVRActionManifest") (Join-Path $VrDst "SteamVRActionManifest")
 $HandsSrc = Join-Path $VrSrc "hands"
 if (Test-Path $HandsSrc) {
   $HandsDst = Join-Path $VrDst "hands"
   New-Item -ItemType Directory -Force -Path $HandsDst | Out-Null
   Copy-Item -Force (Join-Path $HandsSrc "*.glb") $HandsDst
+}
+$HelperSrc = Join-Path $Root "build\Release\openxr_helper64"
+if (Test-Path (Join-Path $HelperSrc "OpenXRHelper64.exe")) {
+  $HelperDst = Join-Path $VrDst "openxr_helper64"
+  New-Item -ItemType Directory -Force -Path $HelperDst | Out-Null
+  Copy-Item -Force (Join-Path $HelperSrc "OpenXRHelper64.exe") $HelperDst
+  $Loader = Join-Path $HelperSrc "openxr_loader.dll"
+  if (Test-Path $Loader) {
+    Copy-Item -Force $Loader $HelperDst
+  }
 }
 $BmvrCfgSrc = Join-Path $VrSrc "bmvr.cfg"
 if (Test-Path $BmvrCfgSrc) {

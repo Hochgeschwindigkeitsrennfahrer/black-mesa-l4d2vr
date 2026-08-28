@@ -1,4 +1,5 @@
 build/
+build_openxr_helper64/
 dist/
 .vs/
 out/
@@ -13,3 +14,5 @@ bmvr_in_*.flag
 probe_logs/
 CMakeUserPresets.json
 .git.upstream/
+third_party/l4d2vr-openxr/
+third_party/openxr/loader/

@@ -54,7 +54,7 @@ namespace bmvr
     // Hands lower in view (controller local +Y = up). Separate from weapon.
     float g_VrHandsPoseOffX = 0.f;
     float g_VrHandsPoseOffY = -0.035f;
-    float g_VrHandsPoseOffZ = 0.f;
+    float g_VrHandsPoseOffZ = -0.10f;
     float g_VrHandsLeftPoseOffX = 0.f;
     float g_VrHandsLeftPoseOffY = 0.f;
     float g_VrHandsLeftPoseOffZ = 0.f;

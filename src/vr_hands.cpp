@@ -401,18 +401,15 @@ bool BmVrGloves::WarmupGpu(IDirect3DDevice9* device)
             ++s_warmLog;
         }
     }
-    if (bmvr::g_VrHandsRightEnabled)
+    std::string rightError;
+    if (!m_Impl->renderer.EnsureHandMesh(device, 1, m_Impl->hands[1].asset, rightError)
+        && !rightError.empty())
     {
-        std::string rightError;
-        if (!m_Impl->renderer.EnsureHandMesh(device, 1, m_Impl->hands[1].asset, rightError)
-            && !rightError.empty())
+        static int s_warmRightLog;
+        if (s_warmRightLog < 4)
         {
-            static int s_warmRightLog;
-            if (s_warmRightLog < 4)
-            {
-                Game::logMsg("VR glove warmup hand=1: %s", rightError.c_str());
-                ++s_warmRightLog;
-            }
+            Game::logMsg("VR glove warmup hand=1: %s", rightError.c_str());
+            ++s_warmRightLog;
         }
     }
     return ok;
@@ -455,7 +452,10 @@ bool BmVrGloves::DrawForEye(
     for (int i = 0; i < 2; ++i)
     {
         const bool rightHand = (i == 1);
-        if (rightHand && !bmvr::g_VrHandsRightEnabled)
+        const bool showRight = g_Game && g_Game->m_VR
+            ? g_Game->m_VR->WantsRightGloveVisible()
+            : bmvr::g_VrHandsRightEnabled;
+        if (rightHand && !showRight)
             continue;
         if (!valid[i])
             continue;

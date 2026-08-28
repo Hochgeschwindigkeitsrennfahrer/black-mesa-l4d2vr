@@ -36,6 +36,8 @@ SnapTurnAngle=45.0
 # Fallback viewmodel pos if the per-weapon L4D2VR table has no match.
 # Per-weapon pos/ang (including crowbar 19.5,6,-13.5 / -24.5,-6.5,-6) are
 # applied in code. These are extra global tweaks on top.
+# Numpad (NumLock on): 4/6 Y, 8/2 Z, 7/9 X, Ctrl+those for angles,
+# 5 save to VR/viewmodel_offsets.txt, 0 reset this weapon, Shift = fine.
 ViewmodelPosOffsetX=0.0
 ViewmodelPosOffsetY=0.0
 ViewmodelPosOffsetZ=0.0
@@ -48,6 +50,20 @@ ControllerPitchTilt=-35.0
 # 0.91 was BM/L4D2 scale; user 2026-08-25: ~25% smaller than that → 0.68.
 # Crowbar forced to 1.0 in DME. Hands use VrHandsModelScale separately.
 ViewmodelScale=0.68
+
+# L4D2VR openxr branch: a 64-bit helper owns the OpenXR session because
+# 32-bit SteamVR/Meta OpenXR Vulkan is unreliable. The Win32 d3d9.dll still
+# renders through DXVK and publishes OPAQUE_WIN32_KMT eye handles.
+# openvr = SteamVR compositor (fallback if the helper is missing).
+VRRuntimeBackend=openxr
+OpenXRHelper=true
+# 0 = keep submitting until the game exits. A positive count is a self-test.
+OpenXRHelperSubmitTestFrames=0
+OpenXRHelperWaitReadySeconds=45
+# Pair xrEndFrame projection poses with the pose the game actually rendered.
+# Default OpenXR locate-at-submit on a late eye image jitters when you turn
+# your head. SteamVR Motion Smoothing does not apply on this helper path.
+OpenXRHelperUseGameRenderPoseForProjection=true
 
 # Compositor timing: true = L4D2VR app PostPresentHandoff (WaitGetPoses off the
 # Vulkan queue; ~90fps). false = runtime handoff (waiter WaitGetPoses ~110ms / ~20fps).
@@ -95,9 +111,10 @@ VrHandsGlovesEnabled=true
 VrHandsModelScale=0.85
 # SteamVR glove local Rx,Ry,Rz. Yaw 180 points fingers with the controller.
 VrHandsPoseRotationOffset=0,180,0
-# Negative Y lowers both hands in view (separate from weapon oz). Controller
-# tracking position stays; only the GLB mesh offset changes.
-VrHandsPoseOffsetMeters=0,-0.035,0
+# Negative Y lowers both hands in view (separate from weapon oz). Negative
+# Z is along aim (controller basis Z is -forward). -0.10 m is ~60% of a
+# scaled HEV glove along the controller so the mesh sits on the tracked pose.
+VrHandsPoseOffsetMeters=0,-0.035,-0.10
 VrHandsUseHevGloves=true
 VrHandsDebugBoxes=false
 VrHandHud=true

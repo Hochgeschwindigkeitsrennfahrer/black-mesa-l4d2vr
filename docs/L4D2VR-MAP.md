@@ -23,6 +23,12 @@ OpenVR scene app, `WaitGetPoses`, `Submit` + `LockSubmissionQueue`. Vulkan Y-fli
 
 `CreateDevice` retries L4D2VR `VR_Init` + HMD swapchain size (no `ExitProcess` on failure).
 
+OpenXR (L4D2VR `openxr` branch, not the old BM in-process prototype): Win32 `d3d9.dll` still renders in DXVK. `OpenXRHelper64.exe` is a 64-bit process that creates the OpenXR session (D3D11 and/or Vulkan), imports OPAQUE_WIN32_KMT eye textures over a shared-memory bridge (`L4D2VROpenXrBridgeState`, magic `0x5258344C`, version 12), and calls `xrEndFrame`. Config: `VRRuntimeBackend=openxr`, `OpenXRHelper=true`, `OpenXRHelperSubmitTestFrames=0`. Helper lives at `{game}\VR\openxr_helper64\` with `openxr_loader.dll` beside the exe. If the helper is missing, this build falls back to OpenVR so the desktop game still launches.
+
+`gamePoseValid=0` in the helper log is expected: BM does not publish a separate game-camera pose (`L4D2VR_PublishOpenXrGameRenderPose`), and `useGameRenderPoseForProjection` is off. The helper submits with the OpenXR-located HMD pose.
+
+OpenXR does not use `VR/SteamVRActionManifest`. Helper suggested bindings follow BM G2 (`bindings_hpmotioncontroller.json`): left-stick click sprint, right-stick click recenter/weapon-menu hold, right grip flashlight, X/Y weapon cycle, stick north/south jump/crouch, left menu pause. L4D2VR’s Touch layout (flashlight on right-stick click, recenter on left) is intentionally not used. Crowbar melee needs controller linear velocity; OpenXR poses have none, so the game differentiates consecutive hand positions (OpenVR supplied `vVelocity`).
+
 ## Stereo / camera
 
 L4D2VR: two `RenderView` calls with per-eye `CViewSetup` into named eye RTs.

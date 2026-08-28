@@ -119,8 +119,8 @@ namespace bmvr
     extern float g_VrHandsPoseRotZ;
     // L4D2VR BuildControllerWorld local translation (meters, before model
     // scale). Controller basis Z is -forward, so a negative local Z moves the
-    // mesh further along aim. HEV GLBs bake the visual front at the origin;
-    // keep this at 0 unless a small +Z pull-back is still needed.
+    // mesh further along aim. HEV gloves sat behind the controller; -0.10 m
+    // is ~60% of a ~16 cm scaled hand along aim.
     extern float g_VrHandsPoseOffX;
     extern float g_VrHandsPoseOffY;
     extern float g_VrHandsPoseOffZ;
