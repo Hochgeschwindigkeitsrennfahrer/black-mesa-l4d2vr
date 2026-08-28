@@ -66,6 +66,9 @@ typedef void(__thiscall* tEndFrame)(void* thisptr);
 typedef void(__thiscall* tTraceRay)(void* thisptr, const Ray_t& ray, unsigned int fMask, CTraceFilter* filter, CGameTrace* pTrace);
 typedef void(__thiscall* tImpulseCommands)(void* thisptr);
 typedef void(__thiscall* tUpdateFlashlightState)(void* thisptr, void* flashlightState);
+typedef Vector*(__thiscall* tWeaponShootPosition)(void* thisptr, Vector* out);
+typedef int(__thiscall* tGetAttachmentVec)(void* thisptr, int number, Vector* origin, QAngle* angles);
+typedef int(__thiscall* tGetAttachmentMatrix)(void* thisptr, int number, float* matrix);
 
 class Hooks
 {
@@ -94,6 +97,10 @@ public:
     static inline Hook<tTraceRay> hkTraceRay;
     static inline Hook<tImpulseCommands> hkImpulseCommands;
     static inline Hook<tUpdateFlashlightState> hkUpdateFlashlightState;
+    static inline Hook<tWeaponShootPosition> hkClientWeaponShootPosition;
+    static inline Hook<tWeaponShootPosition> hkServerWeaponShootPosition;
+    static inline Hook<tGetAttachmentVec> hkGetAttachmentVec;
+    static inline Hook<tGetAttachmentMatrix> hkGetAttachmentMatrix;
 
     Hooks() = default;
     explicit Hooks(Game* game);
@@ -122,7 +129,12 @@ public:
     static void __fastcall dTraceRay(void* ecx, void* edx, const Ray_t& ray, unsigned int fMask, CTraceFilter* filter, CGameTrace* pTrace);
     static void __fastcall dImpulseCommands(void* ecx, void* edx);
     static void __fastcall dUpdateFlashlightState(void* ecx, void* edx, void* flashlightState);
+    static Vector* __fastcall dClientWeaponShootPosition(void* ecx, void* edx, Vector* out);
+    static Vector* __fastcall dServerWeaponShootPosition(void* ecx, void* edx, Vector* out);
+    static int __fastcall dGetAttachmentVec(void* ecx, void* edx, int number, Vector* origin, QAngle* angles);
+    static int __fastcall dGetAttachmentMatrix(void* ecx, void* edx, int number, float* matrix);
     static void EnsureServerFlashlightHook();
     static void EnsureClientFlashlightHook();
+    static void EnsureWeaponShootOriginHooks();
     static void RestoreViewmodelArmHides();
 };

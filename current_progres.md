@@ -136,5 +136,36 @@ Default path is `VRRuntimeBackend=openxr` + helper. SteamVR **Motion Smoothing**
 
 Fix: snapshot the OpenXR HMD pose used for the stereo `RenderView`, publish it with the eye textures, and set `OpenXRHelperUseGameRenderPoseForProjection=true` so `xrEndFrame` uses that pose. Helper binary already supported the flag; d3d9 now publishes the pose. **Not HMD-verified.**
 
+## Pass 2026-08-28f weapon wheel sounds / muzzle origin / fire haptics
+
+**Compiled + installed** (`d3d9.dll` 2736128 bytes) to DXVK folder, `bin\`, and next to `bms.exe`. Install stopped a running `bms.exe`. **Not launched. Not HMD-verified.** Do not claim headset presentation.
+
+| Item | Change |
+|---|---|
+| Weapon wheel sounds | Hover queues `Player.WeaponSelectionMoveSlot` (on hover-index change only). Confirm queues `Player.WeaponSelected` (including empty hands). Played from CreateMove via `CBaseEntity::EmitSound` (`client.dll+0x1D80D0`) on the local player. Not called from Present. |
+| Controller fire haptics | VR `IN_ATTACK` / analog / weaponselect are applied **before** original player CreateMove (FireBullets runs inside it). Mouse already had buttons set; controller fire did not, so clip/parity never updated and rumble was skipped. After CreateMove, clip/parity haptic still runs, plus a trigger-edge pulse for energy weapons that do not decrement clip (hivehand/TAU). |
+| Shoot origin | Hook client `Weapon_ShootPosition` (`+0x7C030`, thunk to EyePosition `+0x268`, **not** EyePosition itself) and listen-server `server.dll+0x11E490`. Rewrite to viewmodel `muzzle`/`Fire01`/`Fire02`, else controller-held VM origin. Hivehand hornets and TAU beam start used this origin. |
+| Muzzle flash align | `SetAbsOrigin` on the viewmodel at CreateMove so attachments are not a frame behind. `GetAttachment` vec/matrix (`+0x97A80` / `+0x979B0`) scale local-VM attachments the same way DME scales the mesh (`ViewmodelScale`). |
+
+Log tags: `Weapon_ShootPosition VR muzzle`, `Hook enabled: client Weapon_ShootPosition`, `Hook enabled: server Weapon_ShootPosition`, `Hook enabled: GetAttachment`.
+
+**HMD checklist:** wheel hover/select uses the game HUD sounds; muzzle flash sits on the barrel; hivehand hornets leave the held model; TAU beam starts at the gun; shooting with the trigger rumbles the aim controller (mouse fire should still rumble).
+
+Do not claim HMD success on 28f.
+
+## Pass 2026-08-28g fire rumble / wheel draw sound / HUD scale / secondary ammo
+
+**Compiled + installed this pass** (`d3d9.dll` 2739200 bytes). **Not launched. Not HMD-verified.** Do not claim headset presentation.
+
+| Item | Change |
+|---|---|
+| Fire rumble | CreateMove only *sets* `m_PendingFireHaptic` (clip/parity + trigger edge). Pulse runs from ProcessInput (Present thread), which is the path that already rumbles reload/use. OpenXR duration maps OpenVR µs clicks to 60–160 ms (`xrApplyHapticFeedback`); 2.2 ms was below SteamVR's feelable floor. |
+| Weapon wheel sound | Hover is 2D `common/wpn_moveselect.wav` via `IEngineSound::EmitAmbientSound`. Select plays `weapon_*.Draw` on the weapon entity (the gun's own deploy wav from `bms_misc`). Empty hands: `common/wpn_hudoff.wav`. No more `CBaseEntity::EmitSound(Player.WeaponSelected)` on the player (that is the spatialized HUD emit). |
+| Honeycomb size | Menu origin still latches to body + stick yaw. Hex plane billboards to the HMD every frame so head tilt does not foreshorten. Pixel radius is `kHexRadiusHu / z / tanHalf` (constant world size). |
+| Wrist HUD size | Digit size is the same world-HU projection (not a fixed fraction of the RT). Head tilt no longer changes apparent size vs the glove. |
+| Wrist secondary ammo | `m_iSecondaryAmmoType` + `m_iAmmo[]`, else `m_iClip2` (Ghidra `DT_LocalWeaponData` 0xA60 / 0xA68). Drawn as `SEC` next to reserve (MP5 grenades). |
+
+Do not claim HMD success on 28g.
+
 
 

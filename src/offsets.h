@@ -69,6 +69,32 @@ public:
     static constexpr int kCBaseEntity_SetAbsOrigin = 0xAF720;
     static constexpr int kCBaseEntity_SetAbsAngles = 0xAF600;
 
+    // CBaseEntity::EmitSound(name, soundtime=0, duration=NULL). Ghidra
+    // FUN_101d80d0 (thiscall). Vanilla HUD uses this for Player.WeaponSelected
+    // (common/wpn_select.wav at SNDLVL_75dB — a world emit at the player).
+    // The weapon wheel plays weapon_*.Draw on the weapon instead, and HUD
+    // ticks go through IEngineSound::EmitAmbientSound (2D).
+    static constexpr int kCBaseEntity_EmitSound = 0x1D80D0;
+
+    // C_BlackMesaPlayer vtable +0x414. Thunk: call EyePosition (+0x268) and
+    // return that vector. Distinct from EyePosition (do not hook +0x268 —
+    // that moves the camera). Bytes: 55 8B EC 8B 11 FF 75 08 FF 92 68 02 00 00.
+    static constexpr int kCBasePlayer_Weapon_ShootPosition = 0x7C030;
+
+    // server.dll CBlackMesaPlayer vtable +0x23C. Same thunk onto EyePosition
+    // at +0x230. Bytes: 55 8B EC 8B 11 FF 75 08 FF 92 30 02 00 00.
+    static constexpr int kCBasePlayer_Weapon_ShootPosition_Server = 0x11E490;
+
+    // C_BaseAnimating IClientRenderable GetAttachment. `this` is entity+4.
+    // Vec: FUN_10097a80 (index, Vector*, QAngle*). Matrix: FUN_100979b0.
+    static constexpr int kCBaseAnimating_GetAttachmentVec = 0x97A80;
+    static constexpr int kCBaseAnimating_GetAttachmentMatrix = 0x979B0;
+
+    // IClientRenderable (entity+4) vtable: LookupAttachment +0x90, GetAttachment
+    // origin/angles +0x98. Ghidra TAU Fire02 path (FUN_10234330).
+    static constexpr int kIClientRenderable_LookupAttachment = 0x90;
+    static constexpr int kIClientRenderable_GetAttachmentVec = 0x98;
+
     // IClientMode slot 32. Reads viewmodel_fov_override then weapon GetViewModelFOV
     // (~54). That is why console fov does not change gun/near scale in VR.
     Offset GetViewModelFOV{ "client.dll", 0x216510,

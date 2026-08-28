@@ -37,6 +37,7 @@ public:
     IModelRender* m_ModelRender = nullptr;
     IInput* m_VguiInput = nullptr;
     ISurface* m_VguiSurface = nullptr;
+    void* m_EngineSound = nullptr;
     void* m_Cvar = nullptr;
 
     uintptr_t m_BaseEngine = 0;
@@ -66,10 +67,15 @@ public:
 
     void* GetInterface(const char* dllname, const char* interfacename);
     C_BaseEntity* GetClientEntity(int entityIndex);
+    C_BaseEntity* GetLocalPlayerEntity();
     C_BaseEntity* GetActiveWeaponEntity();
     C_BaseEntity* GetViewModelEntity();
+    bool GetEntityAttachment(C_BaseEntity* entity, const char* name, Vector& origin, QAngle& angles);
+    void EmitPlayerSound(const char* soundName);
+    void EmitEntitySound(C_BaseEntity* entity, const char* soundName);
+    void PlayUiSound(const char* sample);
     void ScanWristHudNetVars();
-    bool ReadWristHudValues(int& health, int& armor, int& clip, int& reserve);
+    bool ReadWristHudValues(int& health, int& armor, int& clip, int& reserve, int& secondary);
     int ReadWeaponClip(C_BaseEntity* weapon);
     const char* GetActiveWeaponModelName();
     const char* GetEntityModelName(C_BaseEntity* entity);

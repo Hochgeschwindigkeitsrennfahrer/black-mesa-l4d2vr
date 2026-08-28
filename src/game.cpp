@@ -108,6 +108,8 @@ Game::Game()
     // Do not bind ISurface until IsCursorVisible's vtable slot is verified on BM.
     // DXVK Present helpers call it when m_VguiSurface is non-null.
     m_VguiSurface = nullptr;
+    m_EngineSound = GetInterfaceAny("engine.dll", { "IEngineSoundClient003", "IEngineSoundClient002" });
+    Game::logMsg("IEngineSound=%p", m_EngineSound);
     // BM vstdlib only exports VEngineCvar004 (not 007). 007 FindVar slots
     // were what the 2026-08-18 probe called into until load hung.
     m_Cvar = GetInterfaceSafe("vstdlib.dll", "VEngineCvar004");
@@ -197,14 +199,19 @@ C_BaseEntity* Game::GetClientEntity(int entityIndex)
     return static_cast<C_BaseEntity*>(m_ClientEntityList->GetClientEntity(entityIndex));
 }
 
-C_BaseEntity* Game::GetActiveWeaponEntity()
+C_BaseEntity* Game::GetLocalPlayerEntity()
 {
     if (!m_EngineClient || !m_ClientEntityList)
         return nullptr;
     const int local = m_EngineClient->GetLocalPlayer();
     if (local <= 0)
         return nullptr;
-    void* player = m_ClientEntityList->GetClientEntity(local);
+    return static_cast<C_BaseEntity*>(m_ClientEntityList->GetClientEntity(local));
+}
+
+C_BaseEntity* Game::GetActiveWeaponEntity()
+{
+    void* player = GetLocalPlayerEntity();
     if (!player)
         return nullptr;
     constexpr int kActiveWeapon = 0xFA4;
@@ -245,12 +252,7 @@ const char* Game::GetActiveWeaponModelName()
 
 C_BaseEntity* Game::GetViewModelEntity()
 {
-    if (!m_EngineClient || !m_ClientEntityList)
-        return nullptr;
-    const int local = m_EngineClient->GetLocalPlayer();
-    if (local <= 0)
-        return nullptr;
-    void* player = m_ClientEntityList->GetClientEntity(local);
+    void* player = GetLocalPlayerEntity();
     if (!player)
         return nullptr;
     // DT_BasePlayer m_hViewModel[0] +0x13F0, count 2 (Ghidra FUN_100b6a00).
@@ -269,6 +271,104 @@ C_BaseEntity* Game::GetViewModelEntity()
     if (h == 0 || h == kInvalid)
         return nullptr;
     return static_cast<C_BaseEntity*>(m_ClientEntityList->GetClientEntityFromHandle(static_cast<int>(h)));
+}
+
+bool Game::GetEntityAttachment(C_BaseEntity* entity, const char* name, Vector& origin, QAngle& angles)
+{
+    if (!entity || !name || !name[0])
+        return false;
+    int ok = 0;
+    __try
+    {
+        unsigned char* rend = reinterpret_cast<unsigned char*>(entity) + 4;
+        void** vt = *reinterpret_cast<void***>(rend);
+        using LookupFn = int(__thiscall*)(void*, const char*);
+        using GetFn = int(__thiscall*)(void*, int, Vector*, QAngle*);
+        auto lookup = reinterpret_cast<LookupFn>(vt[Offsets::kIClientRenderable_LookupAttachment / 4]);
+        auto get = reinterpret_cast<GetFn>(vt[Offsets::kIClientRenderable_GetAttachmentVec / 4]);
+        if (!lookup || !get)
+            return false;
+        const int idx = lookup(rend, name);
+        if (idx <= 0)
+            return false;
+        ok = get(rend, idx, &origin, &angles);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    return ok != 0;
+}
+
+void Game::EmitEntitySound(C_BaseEntity* entity, const char* soundName)
+{
+    if (!entity || !soundName || !soundName[0])
+        return;
+    HMODULE client = GetModuleHandleA("client.dll");
+    if (!client)
+        return;
+    using EmitFn = void(__thiscall*)(void*, const char*, float, float*);
+    auto emit = reinterpret_cast<EmitFn>(
+        reinterpret_cast<uintptr_t>(client) + Offsets::kCBaseEntity_EmitSound);
+    __try
+    {
+        emit(entity, soundName, 0.f, nullptr);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+}
+
+void Game::EmitPlayerSound(const char* soundName)
+{
+    EmitEntitySound(GetLocalPlayerEntity(), soundName);
+}
+
+void Game::PlayUiSound(const char* sample)
+{
+    if (!sample || !sample[0])
+        return;
+    if (!m_EngineSound)
+        m_EngineSound = GetInterfaceAny("engine.dll", { "IEngineSoundClient003", "IEngineSoundClient002" });
+    if (!m_EngineSound)
+        return;
+    void** vt = nullptr;
+    __try
+    {
+        vt = *reinterpret_cast<void***>(m_EngineSound);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return;
+    }
+    if (!vt)
+        return;
+    // Source 2013 IEngineSoundClient003: PrecacheSound=0, EmitAmbientSound=11.
+    using PrecacheFn = bool(__thiscall*)(void*, const char*, bool, bool);
+    using AmbientFn = void(__thiscall*)(void*, const char*, float, int, int, float);
+    static int s_logged;
+    __try
+    {
+        auto precache = reinterpret_cast<PrecacheFn>(vt[0]);
+        if (precache)
+            precache(m_EngineSound, sample, false, true);
+        auto ambient = reinterpret_cast<AmbientFn>(vt[11]);
+        if (ambient)
+            ambient(m_EngineSound, sample, 1.f, 100, 0, 0.f);
+        if (s_logged < 4)
+        {
+            Game::logMsg("PlayUiSound '%s' engine=%p slot11=%p", sample, m_EngineSound, vt[11]);
+            ++s_logged;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        if (s_logged < 4)
+        {
+            Game::logMsg("PlayUiSound SEH for '%s'", sample);
+            ++s_logged;
+        }
+    }
 }
 
 const char* Game::GetEntityNetworkName(int entityIndex)
@@ -320,8 +420,10 @@ namespace
     int g_nvHealth = -1;
     int g_nvArmor = -1;
     int g_nvClip1 = -1;
+    int g_nvClip2 = -1;
     int g_nvAmmoBase = -1;
     int g_nvPrimaryAmmoType = -1;
+    int g_nvSecondaryAmmoType = -1;
     bool g_nvScanned = false;
 
     const char* FindStringInImage(const unsigned char* base, size_t size, const char* s)
@@ -431,10 +533,23 @@ void Game::ScanWristHudNetVars()
     if (g_nvArmor < 0)
         g_nvArmor = 0x17C0;
     g_nvClip1 = FindRecvPropOffsetPlus4(base, imgSize, "m_iClip1", 0x800, 0x3000);
+    g_nvClip2 = FindRecvPropOffsetPlus4(base, imgSize, "m_iClip2", 0x800, 0x3000);
     g_nvAmmoBase = FindRecvPropOffsetPlus4(base, imgSize, "m_iAmmo", 0x800, 0x3000);
     g_nvPrimaryAmmoType = FindRecvPropOffsetPlus4(base, imgSize, "m_iPrimaryAmmoType", 0x400, 0x3000);
-    Game::logMsg("Wrist HUD netvars health=%d armor=%d clip1=%d ammo=%d primType=%d",
-        g_nvHealth, g_nvArmor, g_nvClip1, g_nvAmmoBase, g_nvPrimaryAmmoType);
+    g_nvSecondaryAmmoType = FindRecvPropOffsetPlus4(base, imgSize, "m_iSecondaryAmmoType", 0x400, 0x3000);
+    // Ghidra DT_LocalWeaponData FUN_10070f80: clip1=0xa64 clip2=0xa68
+    // primaryType=0xa5c secondaryType=0xa60.
+    if (g_nvClip1 < 0)
+        g_nvClip1 = 0xA64;
+    if (g_nvClip2 < 0)
+        g_nvClip2 = 0xA68;
+    if (g_nvPrimaryAmmoType < 0)
+        g_nvPrimaryAmmoType = 0xA5C;
+    if (g_nvSecondaryAmmoType < 0)
+        g_nvSecondaryAmmoType = 0xA60;
+    Game::logMsg("Wrist HUD netvars health=%d armor=%d clip1=%d clip2=%d ammo=%d primType=%d secType=%d",
+        g_nvHealth, g_nvArmor, g_nvClip1, g_nvClip2, g_nvAmmoBase, g_nvPrimaryAmmoType,
+        g_nvSecondaryAmmoType);
 }
 
 int Game::ReadWeaponClip(C_BaseEntity* weapon)
@@ -458,10 +573,10 @@ int Game::ReadWeaponClip(C_BaseEntity* weapon)
     return clip;
 }
 
-bool Game::ReadWristHudValues(int& health, int& armor, int& clip, int& reserve)
+bool Game::ReadWristHudValues(int& health, int& armor, int& clip, int& reserve, int& secondary)
 {
     ScanWristHudNetVars();
-    health = armor = clip = reserve = -1;
+    health = armor = clip = reserve = secondary = -1;
     if (!m_EngineClient || !m_ClientEntityList)
         return false;
     const int local = m_EngineClient->GetLocalPlayer();
@@ -489,11 +604,17 @@ bool Game::ReadWristHudValues(int& health, int& armor, int& clip, int& reserve)
     const int ammoType = rdInt(weapon, g_nvPrimaryAmmoType);
     if (player && g_nvAmmoBase >= 0 && ammoType >= 0 && ammoType < 32)
         reserve = rdInt(player, g_nvAmmoBase + 4 * ammoType);
+    const int secType = rdInt(weapon, g_nvSecondaryAmmoType);
+    const int clip2 = rdInt(weapon, g_nvClip2);
+    if (secType >= 0 && secType < 32 && player && g_nvAmmoBase >= 0)
+        secondary = rdInt(player, g_nvAmmoBase + 4 * secType);
+    else if (clip2 >= 0 && clip2 <= 255)
+        secondary = clip2;
     static int s_hudLog;
     if (s_hudLog < 4)
     {
-        Game::logMsg("WristHUD values health=%d armor=%d clip=%d reserve=%d (off h=%d a=%d)",
-            health, armor, clip, reserve, g_nvHealth, g_nvArmor);
+        Game::logMsg("WristHUD values health=%d armor=%d clip=%d reserve=%d sec=%d (off h=%d a=%d clip2=%d secType=%d)",
+            health, armor, clip, reserve, secondary, g_nvHealth, g_nvArmor, g_nvClip2, g_nvSecondaryAmmoType);
         ++s_hudLog;
     }
     return true;

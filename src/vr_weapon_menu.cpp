@@ -37,6 +37,23 @@ namespace
             body = vr->m_SetupOrigin;
         return body;
     }
+
+    void BillboardFacingEye(const Vector& origin, const Vector& eye, const Vector& hintUp,
+        const Vector& hintRight, Vector& fwd, Vector& right, Vector& up)
+    {
+        fwd = eye - origin;
+        const float len = fwd.Length();
+        if (len < 0.5f)
+            fwd = CrossProduct(hintRight, hintUp);
+        else
+            fwd *= (1.f / len);
+        right = CrossProduct(hintUp, fwd);
+        if (right.LengthSqr() < 1e-4f)
+            right = hintRight;
+        VectorNormalize(right);
+        up = CrossProduct(fwd, right);
+        VectorNormalize(up);
+    }
     constexpr float kHexRadiusHu = 3.55f;
     constexpr float kHexGutter = 0.97f;
     constexpr float kSqrt3 = 1.73205078f;
@@ -166,6 +183,25 @@ namespace
         case KindTripmine: return "TRIP";
         case KindSnark: return "SNARK";
         default: return "WEAPON";
+        }
+    }
+
+    const char* DrawSoundForKind(WeaponKind kind)
+    {
+        // scripts/game_sounds from bms_misc_000.vpk. Missing names fall back
+        // to 2D common/wpn_select.wav in FlushPendingWeaponSounds.
+        switch (kind)
+        {
+        case KindGlock: return "weapon_glock.Draw";
+        case KindRevolver: return "weapon_357.draw";
+        case KindMp5: return "weapon_mp5.Draw";
+        case KindShotgun: return "weapon_shotgun.draw";
+        case KindCrossbow: return "weapon_crossbow.Draw";
+        case KindRpg: return "weapon_rpg.Draw";
+        case KindGauss: return "weapon_tau.Draw";
+        case KindGrenade: return "weapon_frag.Draw";
+        case KindSnark: return "weapon_snark.draw";
+        default: return nullptr;
         }
     }
 
@@ -986,17 +1022,12 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             const float yawDelta = m_RotationOffsetY.load(std::memory_order_acquire)
                 - m_WeaponMenuLatchYaw;
             Vector delta = m_WeaponMenuLatchDelta;
-            Vector fwd = m_WeaponMenuLatchFwd;
-            Vector right = m_WeaponMenuLatchRight;
-            Vector up = m_WeaponMenuLatchUp;
             YawAroundZ(delta, yawDelta);
-            YawAroundZ(fwd, yawDelta);
-            YawAroundZ(right, yawDelta);
-            YawAroundZ(up, yawDelta);
             m_WeaponMenuOrigin = body + delta;
-            m_WeaponMenuFwd = fwd;
-            m_WeaponMenuRight = right;
-            m_WeaponMenuUp = up;
+            Vector hmdF, hmdR, hmdU;
+            GetViewBasis(&hmdF, &hmdR, &hmdU);
+            BillboardFacingEye(m_WeaponMenuOrigin, GetViewOrigin(body), hmdU, hmdR,
+                m_WeaponMenuFwd, m_WeaponMenuRight, m_WeaponMenuUp);
         }
 
         Game::InventoryWeapon inv[kMaxMenuSlots]{};
@@ -1090,6 +1121,7 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             rayOrig = ControllerTrackingToWorld(body, m_PhysicalRightPosAbs);
             QAngle::AngleVectors(m_PhysicalRightAngAbs, &rayDir, nullptr, nullptr);
         }
+        const int prevHover = m_WeaponMenuHover;
         m_WeaponMenuHover = -1;
         float bestT = 1.0e9f;
         for (int i = 0; i < m_WeaponMenuCount; ++i)
@@ -1105,6 +1137,8 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
                 m_WeaponMenuHover = i;
             }
         }
+        if (m_WeaponMenuHover >= 0 && m_WeaponMenuHover != prevHover)
+            QueueWeaponMenuSound(kWeaponSoundHover);
     }
 
     if (!stickClickHeld && m_WeaponMenuClickHeld)
@@ -1117,6 +1151,7 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
                 if (slot.emptyHand)
                 {
                     m_EmptyHands = true;
+                    QueueWeaponMenuSound(kWeaponSoundSelect, 0, 0);
                     PulseHandHaptic(vr::TrackedControllerRole_RightHand, 1400, 0.55f);
                     Game::logMsg("Weapon menu select empty hands");
                 }
@@ -1124,6 +1159,7 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
                 {
                     m_EmptyHands = false;
                     m_PendingWeaponSelect.store(slot.entityIndex, std::memory_order_release);
+                    QueueWeaponMenuSound(kWeaponSoundSelect, slot.kind, slot.entityIndex);
                     PulseHandHaptic(vr::TrackedControllerRole_RightHand, 1400, 0.55f);
                     Game::logMsg("Weapon menu select entity=%d %s",
                         slot.entityIndex, slot.label);
@@ -1198,12 +1234,18 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
 
     float packedRadius = 0.f;
     {
-        float c0x = 0.f, c0y = 0.f, n0x = 0.f, n0y = 0.f;
-        if (project(m_WeaponMenuOrigin, c0x, c0y)
-            && project(m_WeaponMenuOrigin + m_WeaponMenuRight * (kHexRadiusHu * kSqrt3), n0x, n0y))
+        const float z = (m_WeaponMenuOrigin - eyeOrig).Dot(fwd);
+        if (z > 3.f)
+            packedRadius = (kHexRadiusHu / z) / tanHalf * (static_cast<float>(w) * 0.5f) * kHexGutter;
+        if (!(packedRadius > 4.f))
         {
-            const float neighbor = sqrtf((n0x - c0x) * (n0x - c0x) + (n0y - c0y) * (n0y - c0y));
-            packedRadius = neighbor / kSqrt3 * kHexGutter;
+            float c0x = 0.f, c0y = 0.f, n0x = 0.f, n0y = 0.f;
+            if (project(m_WeaponMenuOrigin, c0x, c0y)
+                && project(m_WeaponMenuOrigin + m_WeaponMenuRight * (kHexRadiusHu * kSqrt3), n0x, n0y))
+            {
+                const float neighbor = sqrtf((n0x - c0x) * (n0x - c0x) + (n0y - c0y) * (n0y - c0y));
+                packedRadius = neighbor / kSqrt3 * kHexGutter;
+            }
         }
     }
 
@@ -1215,6 +1257,12 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
         if (!project(slot.center, cx, cy))
             continue;
         float radius = packedRadius;
+        if (!(radius > 4.f))
+        {
+            const float z = (slot.center - eyeOrig).Dot(fwd);
+            if (z > 3.f)
+                radius = (kHexRadiusHu / z) / tanHalf * (static_cast<float>(w) * 0.5f) * kHexGutter;
+        }
         if (!(radius > 4.f))
         {
             float ex = 0.f, ey = 0.f;
@@ -1277,10 +1325,10 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
     device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 }
 
-void VR::UpdateWeaponFireHaptics()
+bool VR::UpdateWeaponFireHaptics()
 {
     if (!m_Game || !m_GameplayEligible || PauseUiActive())
-        return;
+        return false;
     C_BaseEntity* vm = m_Game->GetViewModelEntity();
     C_BaseEntity* weapon = m_Game->GetActiveWeaponEntity();
     if (weapon != m_LastFireWeapon)
@@ -1314,7 +1362,7 @@ void VR::UpdateWeaponFireHaptics()
     }
 
     if (!fired)
-        return;
+        return false;
 
     bool melee = false;
     {
@@ -1323,8 +1371,27 @@ void VR::UpdateWeaponFireHaptics()
             || m_LastViewmodelModel.find("wrench") != std::string::npos;
     }
     if (melee)
+        return false;
+    m_PendingFireHaptic.store(1, std::memory_order_release);
+    return true;
+}
+
+void VR::AfterCreateMoveFireHaptics()
+{
+    const uint32_t held = HeldButtons();
+    const bool attackEdge = (held & IN_ATTACK) && !(m_PrevHeldButtons & IN_ATTACK);
+    m_PrevHeldButtons = held;
+    UpdateWeaponFireHaptics();
+    if (!attackEdge || EmptyHands())
         return;
-    PulseAimHaptic(2200);
+    bool melee = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
+        melee = m_LastViewmodelModel.find("crowbar") != std::string::npos
+            || m_LastViewmodelModel.find("wrench") != std::string::npos;
+    }
+    if (!melee)
+        m_PendingFireHaptic.store(1, std::memory_order_release);
 }
 
 void VR::PulseHandHaptic(vr::ETrackedControllerRole hand, unsigned short durationUs, float amplitude)
@@ -1335,7 +1402,11 @@ void VR::PulseHandHaptic(vr::ETrackedControllerRole hand, unsigned short duratio
         ? L4D2VR_OPENXR_HAND_LEFT : L4D2VR_OPENXR_HAND_RIGHT;
     if (m_OpenXrHelperBridgeActive)
     {
-        const float seconds = std::clamp(durationUs / 1000000.0f, 0.001f, 0.5f);
+        // OpenVR TriggerHapticPulse units are microseconds of a click (1-3999).
+        // OpenXR duration is real vibration time; 2ms is below SteamVR's floor.
+        float seconds = durationUs / 1000000.0f;
+        if (durationUs <= 3999)
+            seconds = std::clamp(durationUs / 3999.0f * 0.14f, 0.06f, 0.16f);
         L4D2VR_PublishOpenXrHapticRequest(openXrHand, seconds, 0.0f, amplitude);
         return;
     }
@@ -1349,4 +1420,9 @@ void VR::PulseHandHaptic(vr::ETrackedControllerRole hand, unsigned short duratio
     if (idx == vr::k_unTrackedDeviceIndexInvalid)
         return;
     m_System->TriggerHapticPulse(idx, 0, durationUs);
+}
+
+const char* VR::WeaponMenuDrawSoundName(int kind) const
+{
+    return DrawSoundForKind(static_cast<WeaponKind>(kind));
 }

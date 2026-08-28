@@ -185,6 +185,7 @@ int Hooks::initSourceHooks()
     }
 
     EnsureClientFlashlightHook();
+    EnsureWeaponShootOriginHooks();
 
     return 1;
 }
@@ -1465,6 +1466,25 @@ namespace
         }
     }
 
+    void SnapLocalViewmodelForFire()
+    {
+        if (!Hooks::m_VR || !Hooks::m_Game || !Hooks::m_VR->m_IsVREnabled)
+            return;
+        if (!Hooks::m_VR->m_ControllerPoseValid || !Hooks::m_VR->IsGameplayEligible())
+            return;
+        C_BaseEntity* vm = Hooks::m_Game->GetViewModelEntity();
+        if (!vm)
+            return;
+        Vector body = Hooks::m_VR->m_HasStereoBodyOrigin ? Hooks::m_VR->m_StereoBodyOrigin : Hooks::m_VR->m_SetupOrigin;
+        if (body.LengthSqr() <= 1.f)
+            body = Hooks::m_VR->m_SetupOrigin;
+        const Vector targetOrigin = Hooks::m_VR->GetRecommendedViewmodelAbsPos(body);
+        const QAngle targetAng = Hooks::m_VR->GetRecommendedViewmodelAbsAngle();
+        const float origin3[3] = { targetOrigin.x, targetOrigin.y, targetOrigin.z };
+        const float angles3[3] = { targetAng.x, targetAng.y, targetAng.z };
+        CallSetAbsOriginAngles(vm, origin3, angles3);
+    }
+
     void CallCalcViewModelViewOriginal(void* ecx, void* owner, const Vector& eyePosition, const QAngle& eyeAngles)
     {
         if (!Hooks::hkCalcViewModelView.fOriginal)
@@ -2300,9 +2320,73 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
         cmd->buttons &= ~(IN_ATTACK | IN_ATTACK2);
     if (mp5)
         ZeroPlayerViewRecoil(localPlayer);
-    // FireBullets runs inside original CreateMove. Aim and MP5 punch must
-    // be applied before that, not after (post-hook was too late for bullets).
+    // FireBullets / ItemPostFrame run inside original player CreateMove.
+    // Aim, VR buttons, and weaponselect must be applied before that.
     applyControllerAim();
+
+    auto applyVrUserCmd = [&]() {
+        if (!m_VR || !m_VR->m_IsVREnabled)
+            return;
+        m_VR->FlushPendingWeaponSounds();
+        m_VR->FlushPendingGameUi();
+        EnsureServerFlashlightHook();
+        EnsureWeaponShootOriginHooks();
+        SnapLocalViewmodelForFire();
+
+        if (!m_VR->m_ProcessInputEnabled)
+            return;
+
+        const uint32_t impulse = m_VR->m_PendingImpulse.load(std::memory_order_acquire);
+        if (impulse)
+        {
+            cmd->impulse = static_cast<byte>(impulse);
+            m_VR->m_PendingImpulse.store(0, std::memory_order_release);
+            Game::logMsg("CreateMove applied impulse %u cmd=%d buttons=0x%x",
+                impulse, cmd->command_number, cmd->buttons);
+        }
+
+        const float maxSpeed = 450.f;
+        const float analogF = m_VR->m_WalkForward.load(std::memory_order_acquire) * maxSpeed;
+        const float analogS = m_VR->m_WalkSide.load(std::memory_order_acquire) * maxSpeed;
+        if (m_VR->m_ControllerPoseValid && m_VR->m_HmdPoseValid)
+        {
+            const Vector hmdVa = m_VR->GetViewAngle();
+            const QAngle aim = m_VR->GetRightControllerAbsAngle();
+            Vector hmdF, hmdR, hmdU, cF, cR, cU;
+            QAngle::AngleVectors(QAngle(0.f, hmdVa.y, 0.f), &hmdF, &hmdR, &hmdU);
+            QAngle::AngleVectors(QAngle(0.f, aim.y, 0.f), &cF, &cR, &cU);
+            const Vector wish = hmdF * analogF + hmdR * analogS;
+            cmd->forwardmove += DotProduct2D(wish, cF);
+            cmd->sidemove += DotProduct2D(wish, cR);
+        }
+        else
+        {
+            cmd->forwardmove += analogF;
+            cmd->sidemove += analogS;
+        }
+        cmd->buttons |= static_cast<int>(m_VR->HeldButtons());
+        const int inv = m_VR->m_PendingInvDelta.exchange(0, std::memory_order_acq_rel);
+        if (inv != 0 && m_Game)
+        {
+            const int weap = m_Game->CycleWeaponSelect(inv > 0 ? 1 : -1);
+            if (weap > 0)
+            {
+                cmd->weaponselect = weap;
+                Game::logMsg("Weapon cycle via CUserCmd weaponselect=%d dir=%d", weap, inv);
+            }
+            else
+                Game::logMsg("Weapon cycle skipped (no other weapon) dir=%d", inv);
+        }
+        const int menuWeap = m_VR->m_PendingWeaponSelect.exchange(0, std::memory_order_acq_rel);
+        if (menuWeap > 0)
+        {
+            cmd->weaponselect = menuWeap;
+            Game::logMsg("Weapon menu via CUserCmd weaponselect=%d", menuWeap);
+        }
+    };
+
+    if (m_VR && m_VR->m_IsVREnabled && cmd->command_number)
+        applyVrUserCmd();
 
     bool result = hkCreateMove.fOriginal(ecx, flInputSampleTime, cmd);
 
@@ -2313,74 +2397,19 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
         return result;
 
     // Camera stays HMD on RenderView copies. Shooting uses controller
-    // viewangles (sd805 FireTerrorBullets / Portal 2 EyeAngles-around-fire).
-    // BM has no FireTerror / Weapon_ShootPosition yet, so cmd viewangles is
-    // the aim. Stick walk stays HMD-relative by rotating analog into the
-    // controller yaw frame. Do not hook EyePosition (that would move the camera).
+    // viewangles. Do not hook EyePosition (that would move the camera).
     applyControllerAim();
     if (mp5)
         ZeroPlayerViewRecoil(localPlayer);
     if (m_VR && m_VR->EmptyHands())
         cmd->buttons &= ~(IN_ATTACK | IN_ATTACK2);
-
-    if (m_VR)
-        m_VR->FlushPendingGameUi();
+    else
+        cmd->buttons |= static_cast<int>(m_VR->HeldButtons());
 
     EnsureServerFlashlightHook();
+    EnsureWeaponShootOriginHooks();
 
-    if (m_VR)
-    {
-        const uint32_t impulse = m_VR->m_PendingImpulse.load(std::memory_order_acquire);
-        if (impulse)
-        {
-            cmd->impulse = static_cast<byte>(impulse);
-            m_VR->m_PendingImpulse.store(0, std::memory_order_release);
-            Game::logMsg("CreateMove applied impulse %u cmd=%d buttons=0x%x",
-                impulse, cmd->command_number, cmd->buttons);
-        }
-    }
-
-    if (!m_VR->m_ProcessInputEnabled)
-        return result;
-
-    const float maxSpeed = 450.f;
-    const float analogF = m_VR->m_WalkForward.load(std::memory_order_acquire) * maxSpeed;
-    const float analogS = m_VR->m_WalkSide.load(std::memory_order_acquire) * maxSpeed;
-    if (m_VR->m_ControllerPoseValid && m_VR->m_HmdPoseValid)
-    {
-        const Vector hmdVa = m_VR->GetViewAngle();
-        const QAngle aim = m_VR->GetRightControllerAbsAngle();
-        Vector hmdF, hmdR, hmdU, cF, cR, cU;
-        QAngle::AngleVectors(QAngle(0.f, hmdVa.y, 0.f), &hmdF, &hmdR, &hmdU);
-        QAngle::AngleVectors(QAngle(0.f, aim.y, 0.f), &cF, &cR, &cU);
-        const Vector wish = hmdF * analogF + hmdR * analogS;
-        cmd->forwardmove += DotProduct2D(wish, cF);
-        cmd->sidemove += DotProduct2D(wish, cR);
-    }
-    else
-    {
-        cmd->forwardmove += analogF;
-        cmd->sidemove += analogS;
-    }
-    cmd->buttons |= static_cast<int>(m_VR->HeldButtons());
-    const int inv = m_VR->m_PendingInvDelta.exchange(0, std::memory_order_acq_rel);
-    if (inv != 0 && m_Game)
-    {
-        const int weap = m_Game->CycleWeaponSelect(inv > 0 ? 1 : -1);
-        if (weap > 0)
-        {
-            cmd->weaponselect = weap;
-            Game::logMsg("Weapon cycle via CUserCmd weaponselect=%d dir=%d", weap, inv);
-        }
-        else
-            Game::logMsg("Weapon cycle skipped (no other weapon) dir=%d", inv);
-    }
-    const int menuWeap = m_VR->m_PendingWeaponSelect.exchange(0, std::memory_order_acq_rel);
-    if (menuWeap > 0)
-    {
-        cmd->weaponselect = menuWeap;
-        Game::logMsg("Weapon menu via CUserCmd weaponselect=%d", menuWeap);
-    }
+    m_VR->AfterCreateMoveFireHaptics();
     return result;
 }
 
@@ -2389,6 +2418,7 @@ void __fastcall Hooks::dLevelInit(void* ecx, void* edx, const char* newmap)
     (void)edx;
     EnsureServerFlashlightHook();
     EnsureClientFlashlightHook();
+    EnsureWeaponShootOriginHooks();
     if (m_VR)
     {
         m_VR->OnLevelInit(newmap);
@@ -3054,6 +3084,240 @@ void __fastcall Hooks::dUpdateFlashlightState(void* ecx, void* edx, void* flashl
     }
     if (hkUpdateFlashlightState.fOriginal)
         hkUpdateFlashlightState.fOriginal(ecx, flashlightState);
+}
+
+namespace
+{
+    bool CodeBytesMatch(const unsigned char* p, const char* hex)
+    {
+        auto nibble = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            return -1;
+        };
+        int i = 0;
+        while (hex[0] && hex[1])
+        {
+            if (hex[0] == ' ')
+            {
+                ++hex;
+                continue;
+            }
+            const int hi = nibble(hex[0]);
+            const int lo = nibble(hex[1]);
+            if (hi < 0 || lo < 0)
+                return false;
+            if (p[i] != static_cast<unsigned char>((hi << 4) | lo))
+                return false;
+            ++i;
+            hex += 2;
+        }
+        return i > 0;
+    }
+
+    int ServerEntityIndex(void* ent)
+    {
+        if (!ent)
+            return 0;
+        int idx = 0;
+        __try
+        {
+            unsigned char* net = reinterpret_cast<unsigned char*>(ent) + 8;
+            void** vt = *reinterpret_cast<void***>(net);
+            using Fn = int(__thiscall*)(void*);
+            idx = reinterpret_cast<Fn>(vt[0x24 / 4])(net);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            idx = 0;
+        }
+        return idx;
+    }
+
+    bool ShouldRewriteShootOrigin(void* player, const Vector* current)
+    {
+        if (!Hooks::m_VR || !Hooks::m_VR->m_IsVREnabled || !Hooks::m_VR->m_ControllerPoseValid)
+            return false;
+        if (!Hooks::m_VR->IsGameplayEligible() || !EngineInGame())
+            return false;
+        if (!Hooks::m_Game)
+            return false;
+        C_BaseEntity* local = Hooks::m_Game->GetLocalPlayerEntity();
+        if (local && player == local)
+            return true;
+        if (Hooks::m_Game->m_EngineClient)
+        {
+            const int want = Hooks::m_Game->m_EngineClient->GetLocalPlayer();
+            const int have = ServerEntityIndex(player);
+            if (want > 0 && have == want)
+                return true;
+        }
+        if (current)
+        {
+            Vector body = Hooks::m_VR->m_HasStereoBodyOrigin ? Hooks::m_VR->m_StereoBodyOrigin : Hooks::m_VR->m_SetupOrigin;
+            if (body.LengthSqr() > 1.f)
+            {
+                const Vector d = *current - body;
+                if (d.LengthSqr() < 96.f * 96.f)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    Vector* RewriteShootOrigin(void* player, Vector* out, tWeaponShootPosition original)
+    {
+        if (original && out)
+            original(player, out);
+        else if (out)
+        {
+            out->x = 0.f;
+            out->y = 0.f;
+            out->z = 0.f;
+        }
+        if (!out)
+            return out;
+        if (!ShouldRewriteShootOrigin(player, out))
+            return out;
+        Vector muzzle{};
+        if (!Hooks::m_VR->TryGetVrMuzzleWorld(muzzle))
+            return out;
+        static int s_log;
+        if (s_log < 8)
+        {
+            Game::logMsg("Weapon_ShootPosition VR muzzle (%.1f,%.1f,%.1f) was (%.1f,%.1f,%.1f)",
+                muzzle.x, muzzle.y, muzzle.z, out->x, out->y, out->z);
+            ++s_log;
+        }
+        *out = muzzle;
+        return out;
+    }
+}
+
+void Hooks::EnsureWeaponShootOriginHooks()
+{
+    HMODULE client = GetModuleHandleA("client.dll");
+    if (client && !hkClientWeaponShootPosition.pTarget)
+    {
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCBasePlayer_Weapon_ShootPosition;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            && CodeBytesMatch(p, "558BEC8B11FF7508FF9268020000"))
+        {
+            if (hkClientWeaponShootPosition.createHook(p, &dClientWeaponShootPosition) == 0
+                && hkClientWeaponShootPosition.enableHook() == 0)
+                Game::logMsg("Hook enabled: client Weapon_ShootPosition rva=0x%X", Offsets::kCBasePlayer_Weapon_ShootPosition);
+            else
+                Game::logMsg("client Weapon_ShootPosition hook failed");
+        }
+        else if (!hkClientWeaponShootPosition.pTarget)
+        {
+            Game::logMsg("client Weapon_ShootPosition skipped (bytes/rva 0x%X)", Offsets::kCBasePlayer_Weapon_ShootPosition);
+            hkClientWeaponShootPosition.pTarget = p;
+        }
+    }
+    if (client && !hkGetAttachmentVec.pTarget)
+    {
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCBaseAnimating_GetAttachmentVec;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            && CodeBytesMatch(p, "558BEC56578B7D088BF183FF01"))
+        {
+            if (hkGetAttachmentVec.createHook(p, &dGetAttachmentVec) == 0
+                && hkGetAttachmentVec.enableHook() == 0)
+                Game::logMsg("Hook enabled: GetAttachment vec rva=0x%X", Offsets::kCBaseAnimating_GetAttachmentVec);
+            else
+                Game::logMsg("GetAttachment vec hook failed");
+        }
+        else
+        {
+            Game::logMsg("GetAttachment vec skipped (bytes/rva 0x%X)", Offsets::kCBaseAnimating_GetAttachmentVec);
+            hkGetAttachmentVec.pTarget = p;
+        }
+    }
+    if (client && !hkGetAttachmentMatrix.pTarget)
+    {
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCBaseAnimating_GetAttachmentMatrix;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            && CodeBytesMatch(p, "558BEC568B7508578BF983FE01"))
+        {
+            if (hkGetAttachmentMatrix.createHook(p, &dGetAttachmentMatrix) == 0
+                && hkGetAttachmentMatrix.enableHook() == 0)
+                Game::logMsg("Hook enabled: GetAttachment matrix rva=0x%X", Offsets::kCBaseAnimating_GetAttachmentMatrix);
+            else
+                Game::logMsg("GetAttachment matrix hook failed");
+        }
+        else
+        {
+            Game::logMsg("GetAttachment matrix skipped (bytes/rva 0x%X)", Offsets::kCBaseAnimating_GetAttachmentMatrix);
+            hkGetAttachmentMatrix.pTarget = p;
+        }
+    }
+
+    HMODULE server = GetModuleHandleA("server.dll");
+    if (server && !hkServerWeaponShootPosition.pTarget)
+    {
+        auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kCBasePlayer_Weapon_ShootPosition_Server;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            && CodeBytesMatch(p, "558BEC8B11FF7508FF9230020000"))
+        {
+            if (hkServerWeaponShootPosition.createHook(p, &dServerWeaponShootPosition) == 0
+                && hkServerWeaponShootPosition.enableHook() == 0)
+                Game::logMsg("Hook enabled: server Weapon_ShootPosition rva=0x%X", Offsets::kCBasePlayer_Weapon_ShootPosition_Server);
+            else
+                Game::logMsg("server Weapon_ShootPosition hook failed");
+        }
+        else
+        {
+            Game::logMsg("server Weapon_ShootPosition skipped (bytes/rva 0x%X)", Offsets::kCBasePlayer_Weapon_ShootPosition_Server);
+            hkServerWeaponShootPosition.pTarget = p;
+        }
+    }
+}
+
+Vector* __fastcall Hooks::dClientWeaponShootPosition(void* ecx, void* edx, Vector* out)
+{
+    (void)edx;
+    return RewriteShootOrigin(ecx, out, hkClientWeaponShootPosition.fOriginal);
+}
+
+Vector* __fastcall Hooks::dServerWeaponShootPosition(void* ecx, void* edx, Vector* out)
+{
+    (void)edx;
+    return RewriteShootOrigin(ecx, out, hkServerWeaponShootPosition.fOriginal);
+}
+
+int __fastcall Hooks::dGetAttachmentVec(void* ecx, void* edx, int number, Vector* origin, QAngle* angles)
+{
+    (void)edx;
+    int result = 0;
+    if (hkGetAttachmentVec.fOriginal)
+        result = hkGetAttachmentVec.fOriginal(ecx, number, origin, angles);
+    if (result && origin && m_VR)
+        m_VR->ScaleViewmodelRenderableAttachment(ecx, *origin);
+    return result;
+}
+
+int __fastcall Hooks::dGetAttachmentMatrix(void* ecx, void* edx, int number, float* matrix)
+{
+    (void)edx;
+    int result = 0;
+    if (hkGetAttachmentMatrix.fOriginal)
+        result = hkGetAttachmentMatrix.fOriginal(ecx, number, matrix);
+    if (result && matrix && m_VR)
+    {
+        Vector origin(matrix[3], matrix[7], matrix[11]);
+        if (m_VR->ScaleViewmodelRenderableAttachment(ecx, origin))
+        {
+            matrix[3] = origin.x;
+            matrix[7] = origin.y;
+            matrix[11] = origin.z;
+        }
+    }
+    return result;
 }
 
 void __fastcall Hooks::dGetBackBufferDimensions(void* ecx, void* edx, int& width, int& height)

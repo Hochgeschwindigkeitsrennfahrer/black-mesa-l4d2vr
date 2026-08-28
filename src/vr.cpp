@@ -1641,7 +1641,11 @@ void VR::ProcessInput()
     if (!paused && !m_WeaponMenuOpen)
         UpdateCrowbarMelee();
     if (!paused)
+    {
         UpdateWeaponFireHaptics();
+        if (m_PendingFireHaptic.exchange(0, std::memory_order_acq_rel))
+            PulseAimHaptic(3999);
+    }
 
     uint32_t buttons = 0;
     if (!paused && !m_GameUiVisible)
@@ -2174,6 +2178,131 @@ Vector VR::GetRecommendedViewmodelAbsPos(const Vector& eyePosition) const
     p0 -= m_ViewmodelRight * oy;
     p0 -= m_ViewmodelUp * oz;
     return p0;
+}
+
+float VR::ViewmodelVisualScale() const
+{
+    std::string model;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
+        model = m_LastViewmodelModel;
+    }
+    const char* modelName = model.c_str();
+    float s = bmvr::g_ViewmodelScale;
+    if (std::strstr(modelName, "crowbar") || std::strstr(modelName, "wrench")
+        || std::strstr(modelName, "Crowbar") || std::strstr(modelName, "Wrench"))
+        s = 1.f;
+    if (std::strstr(modelName, "shotgun") || std::strstr(modelName, "spas")
+        || std::strstr(modelName, "pump"))
+        s = 0.64f;
+    if (std::strstr(modelName, "grenade") || std::strstr(modelName, "Grenade")
+        || std::strstr(modelName, "frag") || std::strstr(modelName, "Frag"))
+        s *= 1.25f;
+    if (std::strstr(modelName, "357") || std::strstr(modelName, "python")
+        || std::strstr(modelName, "revolver") || std::strstr(modelName, "Revolver"))
+        s *= 1.15f;
+    if (s < 0.2f)
+        s = 0.2f;
+    if (s > 1.5f)
+        s = 1.5f;
+    return s;
+}
+
+void VR::ApplyViewmodelVisualScale(Vector& world) const
+{
+    const float scale = ViewmodelVisualScale();
+    if (fabsf(scale - 1.f) <= 0.001f)
+        return;
+    Vector body = m_HasStereoBodyOrigin ? m_StereoBodyOrigin : m_SetupOrigin;
+    if (body.LengthSqr() <= 1.f)
+        body = m_SetupOrigin;
+    const Vector pivot = GetRightControllerAbsPos(body);
+    world.x = pivot.x + (world.x - pivot.x) * scale;
+    world.y = pivot.y + (world.y - pivot.y) * scale;
+    world.z = pivot.z + (world.z - pivot.z) * scale;
+}
+
+bool VR::ScaleViewmodelRenderableAttachment(void* renderable, Vector& origin) const
+{
+    if (!renderable || !m_IsVREnabled || !m_ControllerPoseValid || !IsGameplayEligible())
+        return false;
+    if (!m_Game)
+        return false;
+    C_BaseEntity* vm = m_Game->GetViewModelEntity();
+    if (!vm)
+        return false;
+    if (renderable != reinterpret_cast<unsigned char*>(vm) + 4)
+        return false;
+    ApplyViewmodelVisualScale(origin);
+    return true;
+}
+
+bool VR::TryGetVrMuzzleWorld(Vector& origin) const
+{
+    if (!m_IsVREnabled || !m_ControllerPoseValid || !m_Game)
+        return false;
+    Vector body = m_HasStereoBodyOrigin ? m_StereoBodyOrigin : m_SetupOrigin;
+    if (body.LengthSqr() <= 1.f)
+        body = m_SetupOrigin;
+    if (body.LengthSqr() <= 1.f)
+        return false;
+
+    C_BaseEntity* vm = m_Game->GetViewModelEntity();
+    QAngle ang{};
+    static const char* kNames[] = { "muzzle", "Fire01", "Fire02" };
+    if (vm)
+    {
+        for (const char* name : kNames)
+        {
+            if (m_Game->GetEntityAttachment(vm, name, origin, ang) && origin.LengthSqr() > 1.f)
+                return true;
+        }
+    }
+
+    origin = GetRecommendedViewmodelAbsPos(body);
+    ApplyViewmodelVisualScale(origin);
+    const QAngle aim = GetRecommendedViewmodelAbsAngle();
+    Vector fwd, right, up;
+    QAngle::AngleVectors(aim, &fwd, &right, &up);
+    origin += fwd * (8.f * ViewmodelVisualScale());
+    return origin.LengthSqr() > 1.f;
+}
+
+void VR::QueueWeaponMenuSound(uint32_t bit, int kind, int entityIndex)
+{
+    if (!bit)
+        return;
+    m_PendingWeaponSounds.fetch_or(bit, std::memory_order_acq_rel);
+    if (bit & kWeaponSoundSelect)
+    {
+        m_PendingWeaponSoundKind.store(kind, std::memory_order_release);
+        m_PendingWeaponSoundEntity.store(entityIndex, std::memory_order_release);
+    }
+}
+
+void VR::FlushPendingWeaponSounds()
+{
+    const uint32_t bits = m_PendingWeaponSounds.exchange(0, std::memory_order_acq_rel);
+    if (!bits || !m_Game)
+        return;
+    if (bits & kWeaponSoundHover)
+        m_Game->PlayUiSound("common/wpn_moveselect.wav");
+    if (bits & kWeaponSoundSelect)
+    {
+        const int kind = m_PendingWeaponSoundKind.exchange(0, std::memory_order_acq_rel);
+        const int ent = m_PendingWeaponSoundEntity.exchange(0, std::memory_order_acq_rel);
+        if (ent <= 0)
+            m_Game->PlayUiSound("common/wpn_hudoff.wav");
+        else
+        {
+            const char* draw = WeaponMenuDrawSoundName(kind);
+            C_BaseEntity* wpn = m_Game->GetClientEntity(ent);
+            if (draw && draw[0] && wpn)
+                m_Game->EmitEntitySound(wpn, draw);
+            else
+                m_Game->PlayUiSound("common/wpn_select.wav");
+        }
+    }
 }
 
 QAngle VR::GetRightControllerAbsAngle() const
@@ -3269,8 +3398,8 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
     (void)stereoEye;
     if (!m_Game || !device)
         return;
-    int health = -1, armor = -1, clip = -1, reserve = -1;
-    if (!m_Game->ReadWristHudValues(health, armor, clip, reserve))
+    int health = -1, armor = -1, clip = -1, reserve = -1, secondary = -1;
+    if (!m_Game->ReadWristHudValues(health, armor, clip, reserve, secondary))
         return;
     const float aspect = (h > 0) ? (static_cast<float>(w) / static_cast<float>(h)) : m_Aspect;
     const float projFov = HorizontalFovForAspect(aspect);
@@ -3290,38 +3419,66 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         sy = (-ndcY * 0.5f + 0.5f) * static_cast<float>(h);
         return sx > -80.f && sy > -80.f && sx < static_cast<float>(w) + 80.f && sy < static_cast<float>(h) + 80.f;
     };
+    auto worldPx = [&](const Vector& world, float hu) -> float {
+        const float z = (world - eyeOrig).Dot(fwd);
+        if (z < 4.f)
+            return 0.f;
+        return (hu / z) / tanHalf * (static_cast<float>(w) * 0.5f);
+    };
 
-    const float s = static_cast<float>(h) / 1440.f;
     const D3DCOLOR amber = D3DCOLOR_RGBA(255, 176, 0, 230);
     const D3DCOLOR dim = D3DCOLOR_RGBA(255, 176, 0, 160);
 
     // Health/suit: C_BaseEntity::m_iHealth 0x98, C_BlackMesaPlayer::m_ArmorValue
-    // 0x17C0. Only draw plausible 0..200 values.
+    // 0x17C0. Only draw plausible 0..200 values. Size is world-constant (HU)
+    // so head tilt does not foreshorten the digits relative to the glove.
     if (leftOk && health >= 0 && health <= 200)
     {
         float px = 0.f, py = 0.f;
-        if (project(leftWrist, px, py))
+        const float ch = worldPx(leftWrist, 2.6f);
+        if (ch > 2.f && project(leftWrist, px, py))
         {
-            HudNumber(device, px + 46.f * s, py - 30.f * s, 20.f * s, 36.f * s, 5.f * s, health, 2, amber);
-            HudLabel(device, px - 44.f * s, py + 12.f * s, 2.6f * s, "HEALTH", amber);
+            const float cw = ch * (20.f / 36.f);
+            const float t = ch * (5.f / 36.f);
+            const float label = ch * (2.6f / 36.f);
+            HudNumber(device, px + cw * 2.3f, py - ch * 0.83f, cw, ch, t, health, 2, amber);
+            HudLabel(device, px - cw * 2.2f, py + ch * 0.33f, label, "HEALTH", amber);
             if (armor >= 0 && armor <= 200)
             {
-                HudNumber(device, px + 30.f * s, py + 34.f * s, 13.f * s, 24.f * s, 3.5f * s, armor, 2, dim);
-                HudLabel(device, px - 44.f * s, py + 42.f * s, 2.2f * s, "SUIT", dim);
+                const float ch2 = ch * (24.f / 36.f);
+                const float cw2 = ch2 * (13.f / 24.f);
+                const float t2 = ch2 * (3.5f / 24.f);
+                HudNumber(device, px + cw2 * 2.3f, py + ch * 0.94f, cw2, ch2, t2, armor, 2, dim);
+                HudLabel(device, px - cw * 2.2f, py + ch * 1.17f, label * 0.85f, "SUIT", dim);
             }
         }
     }
     if (rightOk && clip >= 0 && clip <= 255)
     {
         float px = 0.f, py = 0.f;
-        if (project(rightWrist, px, py))
+        const float ch = worldPx(rightWrist, 2.6f);
+        if (ch > 2.f && project(rightWrist, px, py))
         {
-            HudNumber(device, px + 46.f * s, py - 30.f * s, 20.f * s, 36.f * s, 5.f * s, clip, 2, amber);
-            HudLabel(device, px - 44.f * s, py + 12.f * s, 2.6f * s, "AMMO", amber);
+            const float cw = ch * (20.f / 36.f);
+            const float t = ch * (5.f / 36.f);
+            const float label = ch * (2.6f / 36.f);
+            HudNumber(device, px + cw * 2.3f, py - ch * 0.83f, cw, ch, t, clip, 2, amber);
+            HudLabel(device, px - cw * 2.2f, py + ch * 0.33f, label, "AMMO", amber);
             if (reserve >= 0 && reserve <= 999)
             {
-                HudNumber(device, px + 30.f * s, py + 34.f * s, 13.f * s, 24.f * s, 3.5f * s, reserve, 2, dim);
-                HudLabel(device, px - 44.f * s, py + 42.f * s, 2.2f * s, "RES", dim);
+                const float ch2 = ch * (24.f / 36.f);
+                const float cw2 = ch2 * (13.f / 24.f);
+                const float t2 = ch2 * (3.5f / 24.f);
+                HudNumber(device, px + cw2 * 2.3f, py + ch * 0.94f, cw2, ch2, t2, reserve, 2, dim);
+                HudLabel(device, px - cw * 2.2f, py + ch * 1.17f, label * 0.85f, "RES", dim);
+            }
+            if (secondary >= 0 && secondary <= 255)
+            {
+                const float ch2 = ch * (24.f / 36.f);
+                const float cw2 = ch2 * (13.f / 24.f);
+                const float t2 = ch2 * (3.5f / 24.f);
+                HudNumber(device, px + cw2 * 6.4f, py + ch * 0.94f, cw2, ch2, t2, secondary, 2, dim);
+                HudLabel(device, px + cw2 * 2.6f, py + ch * 1.17f, label * 0.85f, "SEC", dim);
             }
         }
     }

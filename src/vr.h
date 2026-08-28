@@ -383,6 +383,10 @@ public:
     std::atomic<uint32_t> m_PendingImpulse{ 0 };
     std::atomic<int> m_PendingInvDelta{ 0 };
     std::atomic<int> m_PendingWeaponSelect{ 0 };
+    std::atomic<uint32_t> m_PendingWeaponSounds{ 0 };
+    std::atomic<int> m_PendingWeaponSoundKind{ 0 };
+    std::atomic<int> m_PendingWeaponSoundEntity{ 0 };
+    std::atomic<uint32_t> m_PendingFireHaptic{ 0 };
     std::atomic<int> m_PendingGameUi{ 0 };
     bool m_GameUiVisible = false;
     bool m_PressedTurn = false;
@@ -516,7 +520,15 @@ public:
     void UpdateWeaponMenu(bool stickClickHeld, float deltaMs);
     void DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
         const Vector& eyeOrig, const Vector& fwd, const Vector& right, const Vector& up);
-    void UpdateWeaponFireHaptics();
+    bool UpdateWeaponFireHaptics();
+    void AfterCreateMoveFireHaptics();
+    bool TryGetVrMuzzleWorld(Vector& origin) const;
+    bool ScaleViewmodelRenderableAttachment(void* renderable, Vector& origin) const;
+    void FlushPendingWeaponSounds();
+    void QueueWeaponMenuSound(uint32_t bit, int kind = 0, int entityIndex = 0);
+    const char* WeaponMenuDrawSoundName(int kind) const;
+    float ViewmodelVisualScale() const;
+    void ApplyViewmodelVisualScale(Vector& world) const;
     bool IsPerformingMelee() const { return m_PerformingMelee; }
     bool TryGetMeleeBladeViewAngles(QAngle& out) const;
     bool TryGetMeleeTraceOrigin(Vector& origin) const;
@@ -533,6 +545,8 @@ public:
     void ClearHudSurface(bool opaque);
     void TickMatQueueFromRenderView();
     uint32_t HeldButtons() const { return m_HeldButtons.load(std::memory_order_acquire); }
+    static constexpr uint32_t kWeaponSoundHover = 1u;
+    static constexpr uint32_t kWeaponSoundSelect = 2u;
     void NoteViewmodelModel(const char* modelName);
     void NoteViewmodelWeaponBake(const char* modelName, const char* boneName, float restX, float restY, float restZ);
     vr::ETrackedControllerRole AimControllerRole() const;
@@ -639,6 +653,7 @@ private:
     bool m_EmptyHands = false;
     DWORD m_WeaponMenuClickStartMs = 0;
     int m_WeaponMenuHover = -1;
+    uint32_t m_PrevHeldButtons = 0;
     int m_WeaponMenuCount = 0;
     Vector m_WeaponMenuOrigin{};
     Vector m_WeaponMenuFwd{};
