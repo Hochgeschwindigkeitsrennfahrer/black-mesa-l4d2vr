@@ -28,6 +28,8 @@ namespace bmvr
     float g_ViewmodelAngOffsetY = 0.f;
     float g_ViewmodelAngOffsetZ = 0.f;
     float g_ControllerPitchTilt = -35.f;
+    float g_AimPitchOffset = 0.f;
+    bool g_DisableRecoilAim = true;
     float g_IPDScale = 1.f;
     float g_HeightOffset = 0.f;
     bool g_AutoMatQueueMode = false;
@@ -278,6 +280,10 @@ namespace bmvr
                 g_ViewmodelAngOffsetZ = static_cast<float>(atof(val));
             else if (std::strcmp(n, "ControllerPitchTilt") == 0)
                 g_ControllerPitchTilt = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "AimPitchOffset") == 0)
+                g_AimPitchOffset = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "DisableRecoilAim") == 0)
+                g_DisableRecoilAim = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "IPDScale") == 0)
             {
                 const float s = static_cast<float>(atof(val));

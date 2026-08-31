@@ -85,6 +85,18 @@ public:
     // at +0x230. Bytes: 55 8B EC 8B 11 FF 75 08 FF 92 30 02 00 00.
     static constexpr int kCBasePlayer_Weapon_ShootPosition_Server = 0x11E490;
 
+    // server.dll CBlackMesaPlayer::GetShootAngles, vtable +0x240. Verified by
+    // disassembling all 0x8C bytes at this RVA in the shipped server.dll: it
+    // writes EyeAngles() (vtable +0x234) into the QAngle* stack arg, then adds
+    // m_Local.m_vecPunchAngle (+0x934/938/93C) and m_recoilPunchAngles
+    // (+0x14BC/14C0/14C4), and returns with `ret 4`. Every weapon's attack
+    // builds its bullet direction from this call, and the weapon's ApplyRecoil
+    // runs after the shot, so the recoil term is exactly what walks sustained
+    // fire upward. These are server offsets; the client copies the mod already
+    // zeroes live at different addresses and only drive the viewmodel.
+    static constexpr int kBlackMesaPlayer_GetShootAngles_Server = 0x47EC90;
+    static constexpr int kBlackMesaPlayer_RecoilPunchAngles_Server = 0x14BC;
+
     // C_BaseAnimating IClientRenderable GetAttachment. `this` is entity+4.
     // Vec: FUN_10097a80 (index, Vector*, QAngle*). Matrix: FUN_100979b0.
     static constexpr int kCBaseAnimating_GetAttachmentVec = 0x97A80;

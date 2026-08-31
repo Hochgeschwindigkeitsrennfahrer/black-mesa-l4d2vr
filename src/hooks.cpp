@@ -2293,18 +2293,27 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
             return;
         if (!(m_VR->IsGameplayEligible() && EngineInGame() && m_VR->m_HmdPoseValid))
             return;
-        const Vector hmdVa = m_VR->GetViewAngle();
+        // Falling back to the headset angle sends shots wherever the player is
+        // looking, which is normally well above where the gun is pointed, and
+        // it sticks for as long as the controller pose stays flagged invalid.
+        // Hold the last good controller aim across dropouts instead, and only
+        // use the headset before any controller aim has been seen.
+        static bool s_haveLastAim = false;
+        static QAngle s_lastAim{};
         if (m_VR->m_ControllerPoseValid)
         {
-            QAngle aim = m_VR->GetRightControllerAbsAngle();
-            if (aim.x > 180.f) aim.x -= 360.f;
-            if (aim.x < -180.f) aim.x += 360.f;
-            if (aim.x > 89.f) aim.x = 89.f;
-            if (aim.x < -89.f) aim.x = -89.f;
+            const QAngle aim = m_VR->GetAimAngles();
+            s_lastAim = aim;
+            s_haveLastAim = true;
             cmd->viewangles.Init(aim.x, aim.y, 0.f);
         }
+        else if (s_haveLastAim)
+            cmd->viewangles.Init(s_lastAim.x, s_lastAim.y, 0.f);
         else
+        {
+            const Vector hmdVa = m_VR->GetViewAngle();
             cmd->viewangles.Init(hmdVa.x, hmdVa.y, 0.f);
+        }
     };
 
     void* localPlayer = nullptr;
@@ -3183,7 +3192,7 @@ namespace
         if (!ShouldRewriteShootOrigin(player, out))
             return out;
         Vector muzzle{};
-        if (!Hooks::m_VR->TryGetVrMuzzleWorld(muzzle))
+        if (!Hooks::m_VR->TryGetVrShootOrigin(muzzle))
             return out;
         static int s_log;
         if (s_log < 8)
@@ -3277,6 +3286,51 @@ void Hooks::EnsureWeaponShootOriginHooks()
             Game::logMsg("server Weapon_ShootPosition skipped (bytes/rva 0x%X)", Offsets::kCBasePlayer_Weapon_ShootPosition_Server);
             hkServerWeaponShootPosition.pTarget = p;
         }
+    }
+    if (server && !hkGetShootAngles.pTarget)
+    {
+        auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kBlackMesaPlayer_GetShootAngles_Server;
+        MEMORY_BASIC_INFORMATION mbi{};
+        // prologue, mov esi/ecx, call vtable+0x234 (EyeAngles), fetch the out arg
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            && CodeBytesMatch(p, "558BEC568BF18B06FF90340200008B5508"))
+        {
+            if (hkGetShootAngles.createHook(p, &dGetShootAngles) == 0
+                && hkGetShootAngles.enableHook() == 0)
+                Game::logMsg("Hook enabled: server GetShootAngles rva=0x%X", Offsets::kBlackMesaPlayer_GetShootAngles_Server);
+            else
+                Game::logMsg("server GetShootAngles hook failed");
+        }
+        else
+        {
+            Game::logMsg("server GetShootAngles skipped (bytes/rva 0x%X)", Offsets::kBlackMesaPlayer_GetShootAngles_Server);
+            hkGetShootAngles.pTarget = p;
+        }
+    }
+}
+
+void __fastcall Hooks::dGetShootAngles(void* ecx, void* edx, QAngle* out)
+{
+    (void)edx;
+    if (!hkGetShootAngles.fOriginal)
+        return;
+    hkGetShootAngles.fOriginal(ecx, out);
+    if (!ecx || !out || !bmvr::g_DisableRecoilAim)
+        return;
+    // The original returns EyeAngles + m_vecPunchAngle + m_recoilPunchAngles.
+    // Subtract back exactly the recoil term it added, so bullets fly along the
+    // aim instead of climbing as recoil accumulates over sustained fire. The
+    // client keeps its own recoil state, so the gun still kicks on screen.
+    __try
+    {
+        const float* recoil = reinterpret_cast<const float*>(
+            static_cast<char*>(ecx) + Offsets::kBlackMesaPlayer_RecoilPunchAngles_Server);
+        out->x -= recoil[0];
+        out->y -= recoil[1];
+        out->z -= recoil[2];
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
     }
 }
 

@@ -479,6 +479,7 @@ public:
     Vector ControllerTrackingToWorld(const Vector& setupOrigin, const Vector& trackingPos) const;
     Vector GetRightControllerAbsPos(const Vector& eyePosition) const;
     QAngle GetRightControllerAbsAngle() const;
+    QAngle GetAimAngles() const;
     Vector GetRecommendedViewmodelAbsPos(const Vector& eyePosition) const;
     QAngle GetRecommendedViewmodelAbsAngle() const;
     float HorizontalFovForAspect(float targetAspect) const;
@@ -563,6 +564,7 @@ public:
     bool UpdateWeaponFireHaptics();
     void AfterCreateMoveFireHaptics();
     bool TryGetVrMuzzleWorld(Vector& origin) const;
+    bool TryGetVrShootOrigin(Vector& origin) const;
     bool ScaleViewmodelRenderableAttachment(void* renderable, Vector& origin) const;
     void FlushPendingWeaponSounds();
     void QueueWeaponMenuSound(uint32_t bit, int kind = 0, int entityIndex = 0);

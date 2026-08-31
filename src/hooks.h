@@ -67,6 +67,7 @@ typedef void(__thiscall* tTraceRay)(void* thisptr, const Ray_t& ray, unsigned in
 typedef void(__thiscall* tImpulseCommands)(void* thisptr);
 typedef void(__thiscall* tUpdateFlashlightState)(void* thisptr, void* flashlightState);
 typedef Vector*(__thiscall* tWeaponShootPosition)(void* thisptr, Vector* out);
+typedef void(__thiscall* tGetShootAngles)(void* thisptr, QAngle* out);
 typedef int(__thiscall* tGetAttachmentVec)(void* thisptr, int number, Vector* origin, QAngle* angles);
 typedef int(__thiscall* tGetAttachmentMatrix)(void* thisptr, int number, float* matrix);
 
@@ -99,6 +100,7 @@ public:
     static inline Hook<tUpdateFlashlightState> hkUpdateFlashlightState;
     static inline Hook<tWeaponShootPosition> hkClientWeaponShootPosition;
     static inline Hook<tWeaponShootPosition> hkServerWeaponShootPosition;
+    static inline Hook<tGetShootAngles> hkGetShootAngles;
     static inline Hook<tGetAttachmentVec> hkGetAttachmentVec;
     static inline Hook<tGetAttachmentMatrix> hkGetAttachmentMatrix;
 
@@ -131,6 +133,7 @@ public:
     static void __fastcall dUpdateFlashlightState(void* ecx, void* edx, void* flashlightState);
     static Vector* __fastcall dClientWeaponShootPosition(void* ecx, void* edx, Vector* out);
     static Vector* __fastcall dServerWeaponShootPosition(void* ecx, void* edx, Vector* out);
+    static void __fastcall dGetShootAngles(void* ecx, void* edx, QAngle* out);
     static int __fastcall dGetAttachmentVec(void* ecx, void* edx, int number, Vector* origin, QAngle* angles);
     static int __fastcall dGetAttachmentMatrix(void* ecx, void* edx, int number, float* matrix);
     static void EnsureServerFlashlightHook();

@@ -10,6 +10,7 @@
 #include "trace.h"
 #include "texture.h"
 #include "vr_hands.h"
+#include "vr_hud_icons.h"
 #include "openxr_helper_bridge.h"
 
 #include <algorithm>
@@ -1019,18 +1020,30 @@ namespace
         return pose;
     }
 
-    void FillOpenXrLinearVelocity(
-        vr::TrackedDevicePose_t& pose,
+    // Differences a position sample into a cached velocity. Leaves the previous
+    // value untouched when the sample is unusable, so a bad dt cannot blank a
+    // good velocity.
+    void DiffLinearVelocity(
         const float* position,
         const float* prevPosition,
-        double dtSeconds)
+        double dtSeconds,
+        float* velocity)
     {
-        if (!pose.bPoseIsValid || !position || !prevPosition || dtSeconds < 0.001 || dtSeconds > 0.25)
+        if (!position || !prevPosition || !velocity || dtSeconds < 0.0005 || dtSeconds > 0.25)
             return;
         const float dt = static_cast<float>(dtSeconds);
-        pose.vVelocity.v[0] = (position[0] - prevPosition[0]) / dt;
-        pose.vVelocity.v[1] = (position[1] - prevPosition[1]) / dt;
-        pose.vVelocity.v[2] = (position[2] - prevPosition[2]) / dt;
+        velocity[0] = (position[0] - prevPosition[0]) / dt;
+        velocity[1] = (position[1] - prevPosition[1]) / dt;
+        velocity[2] = (position[2] - prevPosition[2]) / dt;
+    }
+
+    void ApplyLinearVelocity(vr::TrackedDevicePose_t& pose, const float* velocity)
+    {
+        if (!pose.bPoseIsValid || !velocity)
+            return;
+        pose.vVelocity.v[0] = velocity[0];
+        pose.vVelocity.v[1] = velocity[1];
+        pose.vVelocity.v[2] = velocity[2];
     }
 
     const L4D2VROpenXrControllerPoseDesc& PickOpenXrHandPose(
@@ -1110,53 +1123,91 @@ bool VR::ConsumeOpenXrTracking()
         physicalRight.position, physicalRight.orientation,
         physicalRight.valid != 0 && physicalRight.active != 0);
 
-    // OpenXR controller poses have no velocity. Crowbar melee needs |v| > 1.1 m/s.
+    // OpenXR controller poses carry no velocity, so it is differenced from
+    // position. This runs several times per rendered frame
+    // (WaitPosesForStereoFrame, BeginStereoFramePose, Update); the repeat calls
+    // read the same bridge sample, so differencing them produced dt ~= 0 and a
+    // zero velocity that stuck for the rest of the frame. Crowbar melee reads
+    // that velocity, so swinging silently stopped registering. Only
+    // re-difference when the bridge has actually published a new sample, and
+    // reuse the last result on the repeat calls.
+    // Head and hand samples carry independent generations, so each is
+    // differenced against its own previous sample and timestamp. Keying both
+    // off one counter would re-difference unchanged hand positions whenever
+    // only the head pose advanced, which is what zeroed the swing velocity.
     static struct
     {
-        bool have = false;
-        LARGE_INTEGER qpc{};
+        bool haveHmd = false;
+        LARGE_INTEGER hmdQpc{};
+        uint32_t hmdGeneration = 0;
         float hmd[3]{};
-        float left[3]{};
-        float right[3]{};
+        float velHmd[3]{};
+
         bool haveLeft = false;
         bool haveRight = false;
+        LARGE_INTEGER handQpc{};
+        uint32_t inputGeneration = 0;
+        float left[3]{};
+        float right[3]{};
+        float velLeft[3]{};
+        float velRight[3]{};
     } s_openXrVel;
     LARGE_INTEGER nowQpc{};
     LARGE_INTEGER freq{};
     QueryPerformanceCounter(&nowQpc);
     QueryPerformanceFrequency(&freq);
-    if (s_openXrVel.have && freq.QuadPart > 0)
-    {
-        const double dt = static_cast<double>(nowQpc.QuadPart - s_openXrVel.qpc.QuadPart) /
+    auto elapsedSeconds = [&freq, &nowQpc](const LARGE_INTEGER& then) -> double {
+        if (freq.QuadPart <= 0)
+            return 0.0;
+        return static_cast<double>(nowQpc.QuadPart - then.QuadPart) /
             static_cast<double>(freq.QuadPart);
-        FillOpenXrLinearVelocity(hmdPose, openXrPose.position, s_openXrVel.hmd, dt);
+    };
+
+    if (generation != s_openXrVel.hmdGeneration)
+    {
+        if (s_openXrVel.haveHmd)
+            DiffLinearVelocity(openXrPose.position, s_openXrVel.hmd,
+                elapsedSeconds(s_openXrVel.hmdQpc), s_openXrVel.velHmd);
+        if (openXrPose.valid)
+        {
+            s_openXrVel.hmd[0] = openXrPose.position[0];
+            s_openXrVel.hmd[1] = openXrPose.position[1];
+            s_openXrVel.hmd[2] = openXrPose.position[2];
+            s_openXrVel.haveHmd = true;
+            s_openXrVel.hmdQpc = nowQpc;
+        }
+        s_openXrVel.hmdGeneration = generation;
+    }
+
+    if (m_OpenXrLastInputStateGeneration != s_openXrVel.inputGeneration)
+    {
+        const double dt = elapsedSeconds(s_openXrVel.handQpc);
         if (s_openXrVel.haveLeft)
-            FillOpenXrLinearVelocity(leftPose, physicalLeft.position, s_openXrVel.left, dt);
+            DiffLinearVelocity(physicalLeft.position, s_openXrVel.left, dt, s_openXrVel.velLeft);
         if (s_openXrVel.haveRight)
-            FillOpenXrLinearVelocity(rightPose, physicalRight.position, s_openXrVel.right, dt);
+            DiffLinearVelocity(physicalRight.position, s_openXrVel.right, dt, s_openXrVel.velRight);
+        s_openXrVel.haveLeft = physicalLeft.valid && physicalLeft.active;
+        if (s_openXrVel.haveLeft)
+        {
+            s_openXrVel.left[0] = physicalLeft.position[0];
+            s_openXrVel.left[1] = physicalLeft.position[1];
+            s_openXrVel.left[2] = physicalLeft.position[2];
+        }
+        s_openXrVel.haveRight = physicalRight.valid && physicalRight.active;
+        if (s_openXrVel.haveRight)
+        {
+            s_openXrVel.right[0] = physicalRight.position[0];
+            s_openXrVel.right[1] = physicalRight.position[1];
+            s_openXrVel.right[2] = physicalRight.position[2];
+        }
+        s_openXrVel.handQpc = nowQpc;
+        s_openXrVel.inputGeneration = m_OpenXrLastInputStateGeneration;
     }
-    if (openXrPose.valid)
-    {
-        s_openXrVel.hmd[0] = openXrPose.position[0];
-        s_openXrVel.hmd[1] = openXrPose.position[1];
-        s_openXrVel.hmd[2] = openXrPose.position[2];
-        s_openXrVel.have = true;
-        s_openXrVel.qpc = nowQpc;
-    }
-    s_openXrVel.haveLeft = physicalLeft.valid && physicalLeft.active;
+    ApplyLinearVelocity(hmdPose, s_openXrVel.velHmd);
     if (s_openXrVel.haveLeft)
-    {
-        s_openXrVel.left[0] = physicalLeft.position[0];
-        s_openXrVel.left[1] = physicalLeft.position[1];
-        s_openXrVel.left[2] = physicalLeft.position[2];
-    }
-    s_openXrVel.haveRight = physicalRight.valid && physicalRight.active;
+        ApplyLinearVelocity(leftPose, s_openXrVel.velLeft);
     if (s_openXrVel.haveRight)
-    {
-        s_openXrVel.right[0] = physicalRight.position[0];
-        s_openXrVel.right[1] = physicalRight.position[1];
-        s_openXrVel.right[2] = physicalRight.position[2];
-    }
+        ApplyLinearVelocity(rightPose, s_openXrVel.velRight);
 
     if (bmvr::g_LeftHanded)
         std::swap(leftPose, rightPose);
@@ -2357,6 +2408,22 @@ Vector VR::GetRightControllerAbsPos(const Vector& eyePosition) const
     return ControllerTrackingToWorld(eyePosition, m_RightControllerPosAbs);
 }
 
+QAngle VR::GetAimAngles() const
+{
+    // The one place the firing direction is defined. Both cmd->viewangles and
+    // the shot origin projection read this, so they cannot drift apart.
+    QAngle aim = GetRightControllerAbsAngle();
+    // Trim the shot direction only. The viewmodel keeps its tuned pose, so a
+    // grip that consistently lands low is corrected without rotating models.
+    aim.x -= bmvr::g_AimPitchOffset;
+    if (aim.x > 180.f) aim.x -= 360.f;
+    if (aim.x < -180.f) aim.x += 360.f;
+    if (aim.x > 89.f) aim.x = 89.f;
+    if (aim.x < -89.f) aim.x = -89.f;
+    aim.z = 0.f;
+    return aim;
+}
+
 Vector VR::GetRecommendedViewmodelAbsPos(const Vector& eyePosition) const
 {
     Vector base = eyePosition;
@@ -2472,6 +2539,43 @@ bool VR::TryGetVrMuzzleWorld(Vector& origin) const
     QAngle::AngleVectors(aim, &fwd, &right, &up);
     origin += fwd * (8.f * ViewmodelVisualScale());
     return origin.LengthSqr() > 1.f;
+}
+
+bool VR::TryGetVrShootOrigin(Vector& origin) const
+{
+    Vector muzzle{};
+    if (!TryGetVrMuzzleWorld(muzzle))
+        return false;
+
+    // Bullets fly along cmd->viewangles, which is the controller aim, but they
+    // start at the muzzle. The muzzle sits off that axis by the per-weapon
+    // viewmodel offset and visual scale, so every shot lands a fixed distance
+    // off target. It is worst on the revolver, whose 1.15x scale pushes the
+    // muzzle furthest from the controller pivot. Slide the origin onto the aim
+    // ray, keeping its distance along the barrel, so the shot goes where the
+    // controller points regardless of how the model is posed.
+    Vector body = m_HasStereoBodyOrigin ? m_StereoBodyOrigin : m_SetupOrigin;
+    if (body.LengthSqr() <= 1.f)
+        body = m_SetupOrigin;
+    const Vector aimOrigin = GetRightControllerAbsPos(body);
+    if (aimOrigin.LengthSqr() <= 1.f)
+    {
+        origin = muzzle;
+        return true;
+    }
+    const QAngle aim = GetAimAngles();
+    Vector fwd, right, up;
+    QAngle::AngleVectors(aim, &fwd, &right, &up);
+    if (VectorNormalize(fwd) <= 0.01f)
+    {
+        origin = muzzle;
+        return true;
+    }
+    float along = (muzzle - aimOrigin).Dot(fwd);
+    if (along < 0.f)
+        along = 0.f;
+    origin = aimOrigin + fwd * along;
+    return true;
 }
 
 void VR::QueueWeaponMenuSound(uint32_t bit, int kind, int entityIndex)
@@ -2745,14 +2849,35 @@ void VR::UpdateCrowbarMelee()
     }
 
     // L4D2VR used |vel| > 1.1 m/s with NewSwing reset on every drop below
-    // that, which machine-gunned BM's IN_ATTACK pulse. Higher on-threshold,
-    // hysteresis off-threshold, and a cooldown between swings.
-    constexpr float kSwingOnMs = 2.4f;
-    constexpr float kSwingOffMs = 0.9f;
+    // that, which machine-gunned BM's IN_ATTACK pulse. Hysteresis plus the
+    // cooldown below already stop the machine-gunning, so the on-threshold does
+    // not also need to be high: 2.4 was set while OpenXR velocity was stuck at
+    // zero, and it only reads as "swinging does nothing" now that velocity
+    // works again.
+    constexpr float kSwingOnMs = 1.5f;
+    constexpr float kSwingOffMs = 0.8f;
     constexpr DWORD kSwingCooldownMs = 400;
     constexpr DWORD kAttackPulseMs = 120;
     const bool heldSwing = !m_MeleeNewSwing || attackWindow;
     const bool swinging = speedMs > (heldSwing ? kSwingOffMs : kSwingOnMs);
+
+    // Peak speed while the crowbar is out, so a swing that never crosses the
+    // threshold can still be told apart from velocity being dead.
+    {
+        static float s_peakSpeed = 0.f;
+        static DWORD s_peakLogMs = 0;
+        const DWORD nowMs = GetTickCount();
+        s_peakSpeed = (std::max)(s_peakSpeed, speedMs);
+        if (s_peakLogMs == 0)
+            s_peakLogMs = nowMs;
+        else if (nowMs - s_peakLogMs >= 5000)
+        {
+            Game::logMsg("Crowbar swing peak speed=%.2f m/s over 5s (on=%.2f off=%.2f)",
+                s_peakSpeed, kSwingOnMs, kSwingOffMs);
+            s_peakSpeed = 0.f;
+            s_peakLogMs = nowMs;
+        }
+    }
 
     Vector body = m_HasStereoBodyOrigin ? m_StereoBodyOrigin : m_SetupOrigin;
     if (body.LengthSqr() <= 1.f)
@@ -3578,25 +3703,6 @@ namespace
         }
     }
 
-    float HudTextWidth(const char* text, float cell)
-    {
-        int n = 0;
-        for (const char* p = text; p && *p; ++p)
-            ++n;
-        return n * 6.f * cell;
-    }
-
-    void HudText(IDirect3DDevice9* device, float x, float y, float cell, const char* text, D3DCOLOR color)
-    {
-        float cx = x;
-        for (const char* p = text; p && *p; ++p)
-        {
-            if (*p != ' ')
-                HudGlyph(device, cx, y, cell, *p, color);
-            cx += 6.f * cell;
-        }
-    }
-
     void HudNumber(IDirect3DDevice9* device, float xRight, float y, float cell, int value, int minDigits, D3DCOLOR color)
     {
         char buf[8];
@@ -3614,6 +3720,80 @@ namespace
             HudGlyph(device, x, y, cell, buf[i], color);
             x += 6.f * cell;
         }
+    }
+
+    // HEV style: the digit cells the value does not reach are filled with a dim
+    // "0". Only the unused leading cells are drawn, so a bright digit never sits
+    // on top of a dim one. A backing alpha of zero disables the field entirely.
+    void HudNumberField(IDirect3DDevice9* device, float xRight, float y, float cell,
+        int value, int fieldDigits, D3DCOLOR color, D3DCOLOR backing)
+    {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d", value < 0 ? 0 : value);
+        const int len = static_cast<int>(strlen(buf));
+        const float advance = 6.f * cell;
+        const float x = xRight - fieldDigits * advance;
+        if ((backing >> 24) != 0)
+        {
+            for (int i = 0; i < fieldDigits - len; ++i)
+                HudGlyph(device, x + i * advance, y, cell, '0', backing);
+        }
+        HudNumber(device, xRight, y, cell, value, 1, color);
+    }
+
+    struct HudVertTex
+    {
+        float x, y, z, rhw;
+        D3DCOLOR color;
+        float u, v;
+    };
+
+    // Same texture-stage dance the weapon wheel uses, restoring the untextured
+    // diffuse setup the rest of the hand overlay draws with. The icon is fitted
+    // inside the box rather than stretched to it: the source art is cropped to
+    // its alpha bounds, so it is rarely square.
+    void HudIcon(IDirect3DDevice9* device, IDirect3DTexture9* tex,
+        float x, float y, float w, float h, D3DCOLOR tint)
+    {
+        if (!tex)
+            return;
+        D3DSURFACE_DESC desc{};
+        if (SUCCEEDED(tex->GetLevelDesc(0, &desc)) && desc.Width > 0 && desc.Height > 0)
+        {
+            const float srcAspect = static_cast<float>(desc.Width) / static_cast<float>(desc.Height);
+            float fitW = w;
+            float fitH = w / srcAspect;
+            if (fitH > h)
+            {
+                fitH = h;
+                fitW = h * srcAspect;
+            }
+            x += (w - fitW) * 0.5f;
+            y += (h - fitH) * 0.5f;
+            w = fitW;
+            h = fitH;
+        }
+        device->SetTexture(0, tex);
+        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+        device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+        device->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
+        device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_MODULATE);
+        device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_TEXTURE);
+        device->SetTextureStageState(0, D3DTSS_ALPHAARG2, D3DTA_DIFFUSE);
+        device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
+        HudVertTex v[4] = {
+            { x, y, 0.f, 1.f, tint, 0.f, 0.f },
+            { x + w, y, 0.f, 1.f, tint, 1.f, 0.f },
+            { x, y + h, 0.f, 1.f, tint, 0.f, 1.f },
+            { x + w, y + h, 0.f, 1.f, tint, 1.f, 1.f }
+        };
+        device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(HudVertTex));
+        device->SetTexture(0, nullptr);
+        device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+        device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+        device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+        device->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+        device->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
     }
 }
 
@@ -3646,20 +3826,42 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         return sx > -80.f && sy > -80.f && sx < static_cast<float>(w) + 80.f && sy < static_cast<float>(h) + 80.f;
     };
 
-    const float s = static_cast<float>(h) / 1440.f * 1.44f;
-    const float cell = 3.2f * s;
-    const float gap = 10.f * s;
-    const D3DCOLOR amber = D3DCOLOR_RGBA(255, 176, 0, 230);
-    const D3DCOLOR dim = D3DCOLOR_RGBA(255, 176, 0, 160);
+    // The hand overlay draws opaque, but the wrist HUD needs real alpha: the
+    // icons carry their shape in the alpha channel (white RGB), so without
+    // blending they fill as solid blocks, and the dim backing digits would draw
+    // at full strength. Restored before returning.
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    device->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+    device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
 
-    auto drawRow = [&](float labX, float y, const char* label, int value, int minDigits,
-        D3DCOLOR labColor, D3DCOLOR numColor) {
-        HudText(device, labX, y, cell, label, labColor);
-        // Health/suit can be 100. Always reserve three digit columns so the
-        // extra glyph does not walk left into the caption.
-        const float numCols = (minDigits < 3) ? 3.f : static_cast<float>(minDigits);
-        const float numRight = labX + HudTextWidth(label, cell) + gap + numCols * 6.f * cell;
-        HudNumber(device, numRight, y, cell, value, minDigits, numColor);
+    const float s = static_cast<float>(h) / 1440.f * 1.44f;
+    const float cell = 3.6f * s;
+    const float smallCell = cell * 0.62f;
+    const float fieldW = 3.f * 6.f * cell;
+    const float smallFieldW = 3.f * 6.f * smallCell;
+    const float glyphH = 7.f * cell;
+    const float smallGlyphH = 7.f * smallCell;
+    const float iconS = 30.f * s;
+    const float smallIconS = iconS * 0.66f;
+    const float gap = 7.f * s;
+
+    const D3DCOLOR amber = D3DCOLOR_RGBA(255, 176, 0, 235);
+    const D3DCOLOR amberDim = D3DCOLOR_RGBA(255, 176, 0, 170);
+    const D3DCOLOR amberBack = D3DCOLOR_RGBA(255, 176, 0, 55);
+    const D3DCOLOR red = D3DCOLOR_RGBA(255, 48, 32, 240);
+    const D3DCOLOR redBack = D3DCOLOR_RGBA(255, 48, 32, 60);
+    // Black Mesa's own HUD warns below 25 (scripts/hudlayout.res warnIfLessThan).
+    constexpr int kLowHealth = 25;
+
+    // One "000"-backed value with its icon to the right, centred on cx.
+    auto drawValueIcon = [&](float cx, float yTop, float valueCell, float fieldWidth,
+        float rowH, float size, int value, D3DCOLOR color, D3DCOLOR backing,
+        IDirect3DTexture9* icon) {
+        const float total = fieldWidth + gap + size;
+        const float x0 = cx - total * 0.5f;
+        HudNumberField(device, x0 + fieldWidth, yTop, valueCell, value, 3, color, backing);
+        HudIcon(device, icon, x0 + fieldWidth + gap, yTop + (rowH - size) * 0.5f,
+            size, size, color);
     };
 
     if (leftOk && health >= 0 && health <= 200)
@@ -3667,12 +3869,17 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         float px = 0.f, py = 0.f;
         if (project(leftWrist, px, py))
         {
-            const float labX = px - 78.f * s;
-            drawRow(labX, py - 14.f * s, "HEALTH", health, 2, amber, amber);
+            const bool low = health <= kLowHealth;
+            drawValueIcon(px, py - glyphH - gap * 0.5f, cell, fieldW, glyphH, iconS,
+                health, low ? red : amber, low ? redBack : amberBack,
+                bmvr::AcquireHudIcon(device, "hud_health_overlay.vtf"));
             if (armor >= 0 && armor <= 200)
-                drawRow(labX, py + 16.f * s, "SUIT", armor, 2, dim, dim);
+                drawValueIcon(px, py + gap * 0.5f, cell, fieldW, glyphH, iconS,
+                    armor, amber, amberBack,
+                    bmvr::AcquireHudIcon(device, "hud_hev_overlay.vtf"));
         }
     }
+
     const bool hasAmmoHud = rightOk
         && ((clip >= 0 && clip <= 999) || (reserve >= 0 && reserve <= 999)
             || (secondary >= 0 && secondary <= 999));
@@ -3681,29 +3888,48 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         float px = 0.f, py = 0.f;
         if (project(rightWrist, px, py))
         {
-            const float labX = px - 90.f * s;
+            std::string weaponModel;
+            {
+                std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
+                weaponModel = m_LastViewmodelModel;
+            }
+            const char* model = weaponModel.c_str();
+            IDirect3DTexture9* ammoIcon =
+                bmvr::AcquireHudIcon(device, bmvr::PrimaryAmmoIconVtf(model, nullptr));
+
             const bool showClip = clip >= 0 && clip <= 999;
-            const int ammoPrimary = showClip ? clip : reserve;
-            if (ammoPrimary >= 0 && ammoPrimary <= 999)
-                drawRow(labX, py - 14.f * s, "AMMO", ammoPrimary, 2, amber, amber);
-            const float y1 = py + 16.f * s;
-            float cursor = labX;
-            if (showClip && reserve >= 0 && reserve <= 999)
+            const int primary = showClip ? clip : reserve;
+            if (primary >= 0 && primary <= 999)
+                drawValueIcon(px, py - glyphH - gap * 0.5f, cell, fieldW, glyphH, iconS,
+                    primary, amber, amberBack, ammoIcon);
+
+            // Reserve and secondary share the lower row at reduced size. Only
+            // the big primary counter gets the dim "000" field; these two read
+            // as clutter with it.
+            const bool showRes = showClip && reserve >= 0 && reserve <= 999;
+            const bool showSec = secondary >= 0 && secondary <= 999;
+            const float cellW = smallFieldW + gap + smallIconS;
+            float total = 0.f;
+            if (showRes)
+                total += cellW;
+            if (showSec)
+                total += (total > 0.f ? gap * 2.f : 0.f) + cellW;
+            float cursor = px - total * 0.5f + cellW * 0.5f;
+            const float y1 = py + gap * 0.5f;
+            if (showRes)
             {
-                HudText(device, cursor, y1, cell, "RES", dim);
-                cursor += HudTextWidth("RES", cell) + gap;
-                const float resRight = cursor + 3.f * 6.f * cell;
-                HudNumber(device, resRight, y1, cell, reserve, 2, dim);
-                cursor = resRight + gap;
+                drawValueIcon(cursor, y1, smallCell, smallFieldW, smallGlyphH, smallIconS,
+                    reserve, amberDim, 0, ammoIcon);
+                cursor += cellW + gap * 2.f;
             }
-            if (secondary >= 0 && secondary <= 999)
-            {
-                HudText(device, cursor, y1, cell, "SEC", dim);
-                cursor += HudTextWidth("SEC", cell) + gap;
-                HudNumber(device, cursor + 2.f * 6.f * cell, y1, cell, secondary, 2, dim);
-            }
+            if (showSec)
+                drawValueIcon(cursor, y1, smallCell, smallFieldW, smallGlyphH, smallIconS,
+                    secondary, amberDim, 0,
+                    bmvr::AcquireHudIcon(device, bmvr::SecondaryAmmoIconVtf(model, nullptr)));
         }
     }
+
+    device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 }
 
 void VR::DrawIndependentHandsOnDesktop()
@@ -3812,14 +4038,21 @@ void VR::ApplyTwoHandShotgunAim()
     const float dist = (m_LeftControllerPosAbs - forend).Length();
     const float enterR = 0.18f * scale;
     const float stayR = 0.32f * scale;
+    // Distance alone kept two-hand mode latched when the off-hand just dropped
+    // to the player's side: the barrel then tracked the lowered hand and the
+    // shotgun looked like it was lowering itself. Also require the off-hand to
+    // stay ahead of the gun hand along the barrel.
+    const float aheadHu = (m_LeftControllerPosAbs - m_RightControllerPosAbs).Dot(m_ViewmodelForward);
+    const float enterAhead = 0.12f * scale;
+    const float stayAhead = 0.06f * scale;
     const bool was = m_TwoHandShotgunActive;
     if (m_TwoHandShotgunActive)
-        m_TwoHandShotgunActive = dist < stayR;
+        m_TwoHandShotgunActive = dist < stayR && aheadHu > stayAhead;
     else
-        m_TwoHandShotgunActive = dist < enterR;
+        m_TwoHandShotgunActive = dist < enterR && aheadHu > enterAhead;
     if (m_TwoHandShotgunActive != was)
-        Game::logMsg("Two-hand shotgun %s dist=%.1f hu enter=%.1f stay=%.1f",
-            m_TwoHandShotgunActive ? "on" : "off", dist, enterR, stayR);
+        Game::logMsg("Two-hand shotgun %s dist=%.1f hu ahead=%.1f enter=%.1f stay=%.1f",
+            m_TwoHandShotgunActive ? "on" : "off", dist, aheadHu, enterR, stayR);
     if (!m_TwoHandShotgunActive)
         return;
 
@@ -3830,9 +4063,14 @@ void VR::ApplyTwoHandShotgunAim()
     if (VectorNormalize(two) <= 0.01f)
         return;
     const float strength = 0.85f;
-    m_ViewmodelForward = m_ViewmodelForward * (1.f - strength) + two * strength;
-    if (VectorNormalize(m_ViewmodelForward) <= 0.01f)
+    Vector blended = m_ViewmodelForward * (1.f - strength) + two * strength;
+    if (VectorNormalize(blended) <= 0.01f)
         return;
+    // A marginal off-hand position must not be able to swing the barrel far
+    // from where the gun hand points. ~50 degrees.
+    if (blended.Dot(m_ViewmodelForward) < 0.64f)
+        return;
+    m_ViewmodelForward = blended;
     m_ViewmodelRight = CrossProduct(m_ViewmodelForward, m_ViewmodelUp);
     if (VectorNormalize(m_ViewmodelRight) <= 0.01f)
         return;
@@ -4059,6 +4297,27 @@ void VR::UpdateViewmodelNumpadAdjust(bool paused)
     vm_numpad::Load();
     if (paused || !m_GameplayEligible)
         return;
+
+    // Aim pitch trim is global, so it is tuned before the per-weapon key check
+    // below bails out. Ctrl+Numpad+ shoots higher, Ctrl+Numpad- lower; the
+    // logged value goes into AimPitchOffset in VR/config.txt to persist.
+    {
+        const DWORD nowMs = GetTickCount();
+        const bool ctrlHeld = vm_numpad::KeyHeld(VK_CONTROL);
+        const float step = vm_numpad::KeyHeld(VK_SHIFT) ? 0.1f : 0.5f;
+        float delta = 0.f;
+        if (ctrlHeld && vm_numpad::RepeatEdge(VK_ADD, nowMs))
+            delta = step;
+        else if (ctrlHeld && vm_numpad::RepeatEdge(VK_SUBTRACT, nowMs))
+            delta = -step;
+        if (delta != 0.f)
+        {
+            bmvr::g_AimPitchOffset += delta;
+            Game::logMsg("Aim pitch trim %+.2f deg (put AimPitchOffset=%.2f in VR/config.txt)",
+                delta, bmvr::g_AimPitchOffset);
+        }
+    }
+
     std::string model;
     {
         std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
@@ -4262,8 +4521,12 @@ void VR::ApplyVrQualityOfLifeCvars()
         setf("cl_viewmodel_lag", 0.f);
         seti("r_jiggle_bones", 0);
     }
-    // Listen-server viewpunch spring still kicks MP5 bullets up after client
-    // netvars are zeroed. Raw ConVar write; FCVAR_CHEAT does not block this.
+    // These gate only CBasePlayer::ViewPunch, the legacy m_vecPunchAngleVel
+    // spring behind damage flinch and env_viewpunch. That angle is summed into
+    // the server's shot direction, so suppressing it keeps a hit from throwing
+    // aim off. It is not what makes MP5 fire climb: Black Mesa's weapon recoil
+    // runs through AddRecoil, which reads no cvar at all. The climb is removed
+    // in dGetShootAngles instead. Raw ConVar write; FCVAR_CHEAT does not block.
     seti("sv_suppress_viewpunch", 1);
     setf("sv_viewpunch_spring_constant", 0.f);
     // Stereo used to force r_occlusion 0 + r_portalsopenall 1 because two

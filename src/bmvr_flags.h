@@ -87,6 +87,13 @@ namespace bmvr
     extern float g_ViewmodelAngOffsetZ;
     // L4D2VR tilts Vive wands -45°. G2 points more forward; default -35.
     extern float g_ControllerPitchTilt;
+    // Trim applied to the firing pitch only, in degrees, positive = shoot
+    // higher. Leaves the viewmodel alone, so it corrects a grip that aims low
+    // without disturbing tuned weapon poses. Live-tune with Ctrl+Numpad +/-.
+    extern float g_AimPitchOffset;
+    // Drop the weapon-recoil term from the server's shot direction so sustained
+    // fire stops walking upward. The viewmodel still kicks.
+    extern bool g_DisableRecoilAim;
     extern float g_IPDScale;
     extern float g_HeightOffset;
     extern bool g_AutoMatQueueMode;

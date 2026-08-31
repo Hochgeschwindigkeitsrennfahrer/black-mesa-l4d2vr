@@ -2,6 +2,7 @@
 #include "game.h"
 #include "in_buttons.h"
 #include "bmvr_flags.h"
+#include "vr_hud_icons.h"
 #include "openxr_helper_bridge.h"
 
 #include <algorithm>
@@ -54,9 +55,11 @@ namespace
         up = CrossProduct(fwd, right);
         VectorNormalize(up);
     }
-    constexpr float kHexRadiusPxAt1440 = 76.f;
+    // Hex draw radius also drives hover hit-testing (both are screen space), so
+    // shrinking this scales the wheel and its targets together.
+    constexpr float kHexRadiusPxAt1440 = 60.f;
     constexpr float kHexPackScale = 1.20f;
-    constexpr float kHexWorldHu = 3.55f;
+    constexpr float kHexWorldHu = 2.80f;
     constexpr float kSqrt3 = 1.73205078f;
 
     int ReadMuzzleFlashParity(void* vm)
@@ -798,6 +801,8 @@ namespace
     IDirect3DDevice9* g_WeaponIconDevice = nullptr;
     bool g_WeaponIconTried = false;
 
+    void ReleaseHudIconCache();
+
     void ReleaseWeaponIcons()
     {
         for (int i = 0; i < KindCount; ++i)
@@ -810,6 +815,7 @@ namespace
         }
         g_WeaponIconDevice = nullptr;
         g_WeaponIconTried = false;
+        ReleaseHudIconCache();
     }
 
     std::vector<std::wstring> HudVpkPaths()
@@ -837,11 +843,10 @@ namespace
         return out;
     }
 
-    bool ExtractHudVtf(const std::vector<std::wstring>& vpks, WeaponKind kind,
+    bool ExtractHudVtfByName(const std::vector<std::wstring>& vpks, const char* name,
         std::vector<unsigned char>& vtf)
     {
-        const char* name = HudVtfNameForKind(kind);
-        if (!name)
+        if (!name || !*name)
             return false;
         char rels[4][96]{};
         sprintf_s(rels[0], "materials/vgui/hud/%s", name);
@@ -860,6 +865,12 @@ namespace
             }
         }
         return false;
+    }
+
+    bool ExtractHudVtf(const std::vector<std::wstring>& vpks, WeaponKind kind,
+        std::vector<unsigned char>& vtf)
+    {
+        return ExtractHudVtfByName(vpks, HudVtfNameForKind(kind), vtf);
     }
 
     void EnsureWeaponIcons(IDirect3DDevice9* device)
@@ -908,6 +919,31 @@ namespace
             ++loaded;
         }
         Game::logMsg("Weapon menu HUD icons loaded=%d vpks=%d", loaded, static_cast<int>(vpks.size()));
+    }
+
+    // Name-keyed cache for HUD icons the wrist HUD asks for by filename
+    // (health cross, HEV figure, ammo types). Separate from the weapon-kind
+    // array above because those are indexed by WeaponKind.
+    struct HudIconEntry
+    {
+        char name[64]{};
+        IDirect3DTexture9* tex = nullptr;
+    };
+    constexpr int kHudIconCacheMax = 24;
+    HudIconEntry g_HudIconCache[kHudIconCacheMax]{};
+    int g_HudIconCount = 0;
+    IDirect3DDevice9* g_HudIconDevice = nullptr;
+
+    void ReleaseHudIconCache()
+    {
+        for (int i = 0; i < g_HudIconCount; ++i)
+        {
+            if (g_HudIconCache[i].tex)
+                g_HudIconCache[i].tex->Release();
+            g_HudIconCache[i] = HudIconEntry{};
+        }
+        g_HudIconCount = 0;
+        g_HudIconDevice = nullptr;
     }
 
     void DrawKindIcon(IDirect3DDevice9* device, float x, float y, float s, WeaponKind kind, D3DCOLOR color)
@@ -986,6 +1022,83 @@ namespace
         if (hitOut)
             *hitOut = hit;
         return true;
+    }
+}
+
+IDirect3DTexture9* bmvr::AcquireHudIcon(IDirect3DDevice9* device, const char* vtfName)
+{
+    if (!device || !vtfName || !*vtfName)
+        return nullptr;
+    if (g_HudIconDevice && g_HudIconDevice != device)
+        ReleaseHudIconCache();
+    g_HudIconDevice = device;
+    for (int i = 0; i < g_HudIconCount; ++i)
+    {
+        if (_stricmp(g_HudIconCache[i].name, vtfName) == 0)
+            return g_HudIconCache[i].tex;
+    }
+    if (g_HudIconCount >= kHudIconCacheMax)
+        return nullptr;
+
+    // Claim the slot before loading so a missing asset is only attempted once.
+    HudIconEntry& entry = g_HudIconCache[g_HudIconCount++];
+    strncpy_s(entry.name, vtfName, _TRUNCATE);
+
+    const auto vpks = HudVpkPaths();
+    std::vector<unsigned char> vtf;
+    if (vpks.empty() || !ExtractHudVtfByName(vpks, vtfName, vtf))
+    {
+        Game::logMsg("Wrist HUD icon missing %s", vtfName);
+        return nullptr;
+    }
+    int iw = 0, ih = 0;
+    unsigned format = 0;
+    std::vector<unsigned char> bgra;
+    if (!DecodeVtfToBgra(vtf, iw, ih, bgra, &format))
+    {
+        Game::logMsg("Wrist HUD icon decode fail %s fmt=%u", vtfName, format);
+        return nullptr;
+    }
+    CropBgraToAlpha(iw, ih, bgra);
+    IDirect3DTexture9* tex = nullptr;
+    if (!UploadBgraTexture(device, iw, ih, bgra, &tex) || !tex)
+    {
+        Game::logMsg("Wrist HUD icon upload fail %s %dx%d", vtfName, iw, ih);
+        return nullptr;
+    }
+    entry.tex = tex;
+    Game::logMsg("Wrist HUD icon loaded %s %dx%d", vtfName, iw, ih);
+    return tex;
+}
+
+const char* bmvr::PrimaryAmmoIconVtf(const char* model, const char* net)
+{
+    switch (KindFromNames(model, net))
+    {
+    case KindRevolver: return "ammo_357.vtf";
+    case KindShotgun: return "ammo_buckshot.vtf";
+    case KindCrossbow: return "ammo_bolt.vtf";
+    case KindGauss:
+    case KindGluon: return "ammo_energy.vtf";
+    case KindRpg: return "ammo_grenade_rpg.vtf";
+    // Black Mesa ships no hornet .vtf, only the .vmt. The lookup fails once,
+    // logs, and the counter then draws without an icon.
+    case KindHivehand: return "ammo_grenade_hornet.vtf";
+    case KindGrenade: return "ammo_grenade_frag.vtf";
+    case KindSatchel: return "ammo_grenade_satchel.vtf";
+    case KindTripmine: return "ammo_grenade_tripmine.vtf";
+    case KindSnark: return "ammo_snark.vtf";
+    default: return "ammo_9mm.vtf";
+    }
+}
+
+const char* bmvr::SecondaryAmmoIconVtf(const char* model, const char* net)
+{
+    switch (KindFromNames(model, net))
+    {
+    case KindMp5: return "ammo_grenade_mp5.vtf";
+    case KindShotgun: return "ammo_buckshot.vtf";
+    default: return "ammo_grenade_frag.vtf";
     }
 }
 
