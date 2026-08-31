@@ -3,7 +3,6 @@
 L4D2VR’s VR architecture adapted to Steam **Black Mesa** (Win32, DXVK).
 
 Primary reference: https://github.com/keyou91/l4d2vr  
-Secondary (BM-specific evidence only): https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr
 
 This is **not** a new VR design. The shipped artifact is a combined `d3d9.dll` (L4D2VR’s DXVK fork + OpenVR or L4D2VR’s x64 OpenXR helper + Black Mesa hooks).
 
