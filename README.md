@@ -19,6 +19,20 @@ https://github.com/keyou91/l4d2vr
 * Wrist HUD with game icons — Done
 * Start-to-finish gameplay — Working
 
+## Known Issues
+
+The VR experience is fully playable, but several features are still a work in progress:
+
+* Crowbar swinging can be unreliable.
+* Performance can be poor in open and complex scenes.
+* Controls are still a work in progress. Bindings can be configured through the SteamVR controller settings.
+* TAU cannon effects can emit from the player's eyes and may glitch out.
+* Crossbow scope aiming does not currently work.
+* The left hand is visible even during the intro sequence, before the HEV suit is acquired.
+* There are currently no HUD elements indicating Long Jump Module usage.
+* Two-handed weapons are planned for a later update.
+* Manual reloading is not currently implemented and is planned for a future update.
+
 ## Black Mesa: Blue Shift
 
 Black Mesa VR also supports **Black Mesa: Blue Shift**.
@@ -56,20 +70,6 @@ The project uses OpenXR for VR headset and controller integration.
 ### Wrist HUD
 
 A VR wrist HUD displays useful game information and game icons while keeping the player's view clear.
-
-## Known Issues
-
-The VR experience is fully playable, but several features are still a work in progress:
-
-* Crowbar swinging can be unreliable.
-* Performance can be poor in open and complex scenes.
-* Controls are still a work in progress. Bindings can be configured through the SteamVR controller settings.
-* TAU cannon effects can emit from the player's eyes and may glitch out.
-* Crossbow scope aiming does not currently work.
-* The left hand is visible even during the intro sequence, before the HEV suit is acquired.
-* There are currently no HUD elements indicating Long Jump Module usage.
-* Two-handed weapons are planned for a later update.
-* Manual reloading is not currently implemented and is planned for a future update.
 
 ## Project Status
 
