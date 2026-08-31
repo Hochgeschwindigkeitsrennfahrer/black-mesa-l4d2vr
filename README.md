@@ -1,5 +1,9 @@
 # Black Mesa VR
 
+<a href="https://www.youtube.com/watch?v=5oqQ8akfu3s">
+  <img src="https://i.imgur.com/t7A5Mot.png" alt="Black Mesa VR">
+</a>
+
 A VR mod for the Steam version of **Black Mesa**, bringing 6DOF motion controls, true stereo rendering, OpenXR, and VR-first weapon interaction to the game.
 
 The foundation of the VR implementation is based heavily on the approach pioneered by **L4D2VR**, adapted and extended for Black Mesa.
