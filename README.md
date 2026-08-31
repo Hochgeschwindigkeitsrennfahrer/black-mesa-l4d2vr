@@ -1,93 +1,61 @@
 # Black Mesa VR
 
-L4D2VR’s VR architecture adapted to Steam **Black Mesa** (Win32, DXVK).
+A VR mod for the Steam version of **Black Mesa**, bringing 6DOF motion controls, true stereo rendering, OpenXR, and VR-first weapon interaction to the game.
 
-Primary reference: https://github.com/keyou91/l4d2vr  
+## Current Status
 
-This is **not** a new VR design. The shipped artifact is a combined `d3d9.dll` (L4D2VR’s DXVK fork + OpenVR or L4D2VR’s x64 OpenXR helper + Black Mesa hooks).
+**The project is working start-to-finish and is playable as a full VR mod.**
 
-Sources live in `src/`. The `L4D2VR/` folder is only include shims so DXVK can `#include "L4D2VR/game.h"`.
+* True stereo rendering — Done
+* 6DOF motion controls — Done
+* VR weapon wheel — Half-Life 2 VR style — Done
+* Crowbar melee — Work in progress
+* OpenXR implementation — Done
+* Wrist HUD with game icons — Done
+* Start-to-finish gameplay — Working
 
+## Black Mesa: Blue Shift
 
-## Steam launch options
+Black Mesa VR also supports **Black Mesa: Blue Shift**.
 
-Keep the existing L4D2VR options:
+After installing Blue Shift, launch the game with:
 
-```
--heapsize 524288 -processheap -high -novid -windowed -oldgameui
-```
-
-**Verified UI issue:** Black Mesa's new game UI is upside-down in the headset and gameplay stays black after the load screen. `-oldgameui` is required. Do not drop the L4D2VR options above.
-
-**Verified load issue:** the in-game/launcher video default can be native Direct3D 9. This DLL is DXVK. If the desktop session is not DXVK, nothing in the headset is expected.
-
-If the launcher shows Direct3D 9, add:
-
-```
--enabledxvk
+```text
+-game bshift
 ```
 
-That does not replace the options above; it forces the launcher to AddDllDirectory the DXVK folder. We also install `d3d9.dll` next to `bms.exe` and in `bin\` so `LoadLibrary("d3d9.dll")` can still find us.
+The same VR setup can then be used with the Blue Shift campaign.
 
-## Build
+## VR Features
 
-Win32 only. From a Developer PowerShell or with VS 2022 Build Tools:
+### True Stereo Rendering
 
-```powershell
-.\scripts\build.ps1
-```
+Black Mesa is rendered in true stereoscopic VR for the headset rather than simply displaying the desktop image.
 
-Output: `build\Release\d3d9.dll` and `build\Release\openxr_helper64\OpenXRHelper64.exe`
+### 6DOF Motion Controls
 
-Drag-and-drop zip (DLL in all three load paths, `VR\`, SteamVR bindings, resolution notes):
+Full HMD and motion-controller 6DOF tracking for immersive gameplay.
 
-```powershell
-.\scripts\pack_release.ps1
-```
+### VR Weapon Wheel
 
-Output: `dist\Black-Mesa-VR-drop-in.zip` — copy the folder contents into `Steam\steamapps\common\Black Mesa` (next to `bms.exe`). Read `BMVR_README.txt` in the zip for launch options and `RenderScale`.
+A Half-Life 2 VR-style weapon wheel provides quick weapon selection using the VR controllers.
 
-## Install
+### Crowbar Melee
 
-```powershell
-.\scripts\install.ps1
-```
+Motion-controlled crowbar melee is implemented and currently being refined.
 
-Copies `d3d9.dll` and SteamVR’s 32-bit `openvr_api.dll` into:
+### OpenXR
 
-1. `Black Mesa\bin\thirdparty\dxvk-windows-x86\` (DXVK folder)
-2. `Black Mesa\bin\`
-3. next to `bms.exe`
+The project uses OpenXR for VR headset and controller integration.
 
-and copies `OpenXRHelper64.exe` + `openxr_loader.dll` to `Black Mesa\VR\openxr_helper64\`.
+### Wrist HUD
 
-Proof the new DLL loaded: `Black Mesa\bmvr_log.txt` appears **this session** (and a DXVK log whose build line is MSVC `x86`, not stock gcc 2.6.2).
+A VR wrist HUD displays useful game information and game icons while keeping the player's view clear.
 
-## Test
+## Project Status
 
-1. Quit the game if it is running.
-2. Run `.\scripts\install.ps1`.
-3. Start **SteamVR**.
-4. Launch Black Mesa from Steam. Prefer Vulkan/DXVK in the launcher, or `-enabledxvk`.
-5. Confirm `bmvr_log.txt` starts with `BMVR d3d9.dll loaded`.
-6. Look in the headset. Do not treat compile/load/tracking as success.
+The core VR experience is functional from launch through normal gameplay. Development is continuing on features and polish, with physical crowbar melee currently marked as work in progress.
 
-## Resolution and controllers
+## Repository
 
-`scripts\install.ps1` copies `VR\SteamVRActionManifest` next to `bms.exe` and creates `VR\config.txt` if it is missing (existing config is kept).
-
-- **RenderScale** (restart required): `1.0` is SteamVR’s recommended per-eye size (can be taller than the game window). `GetScreenSize` and the swapchain stay at the HWND. World G-buffers stay at the window (`hmd_world` persist-skip); the window scene is scaled into the eyes. Crash-sticky `hmd_offscreen` for eye size. SteamVR overlay SS still feeds the recommended size.
-- **HP Reverb G2**: left stick walk, right stick turn, right trigger attack, left trigger alt-fire, right B use, right A jump, right grip crouch, left grip reload, left-stick click recenter, right-stick click flashlight, **left menu/system = pause (ESC)**, **left X = sprint**. Left Y next weapon. Previous weapon stays on the right-stick dpad. Pause is a window `VK_ESCAPE`, not `gameui_activate`.
-- **Uncoupled gun / motion aim** (sd805 L4D2VR + Portal 2 VR, not keyou91 hands): `CalcViewModelView` places the first-person weapon at the right controller (left if `LeftHanded=true`). CreateMove aims with that controller; the headset still drives the camera. Stick walk stays look-relative. Per-weapon viewmodel offsets apply from the `v_` model name; `ViewmodelPosOffset*` is the fallback. Recenter (left-stick click) also zeros snap/smooth yaw if `RecenterResetsYaw=true`. Haptics pulse on fire/use/reload/snap-turn. Bullets still spawn from the eyes until a `Weapon_ShootPosition` hook exists. Tune `ViewmodelPosOffset*` / `ControllerPitchTilt` / `IPDScale` / `HeightOffset` in `VR\config.txt` (restart after edits; config is read at DLL load). Existing `config.txt` is kept on install — missing keys use the DLL defaults. HEV/marine FP arms are hidden; independent SteamVR glove meshes (`VrHandsGlovesEnabled`) draw at each controller. Do not parent the gun to a glove wrist.
-- **Multicore / QoL (compiled, not user-verified):** `GetMatQueueMode` is the real `IMaterialSystem` vfunc 11 so DXVK's queued Present lock can run. `AutoMatQueueMode` switches 0 in menu/load/pause and 2 in gameplay via `SetThreadMode` (never `ClientCmd`). Crash-sticky `mat_queue`. ICvar / `bmvr.cfg` turns off motion blur/grain, `engine_no_focus_sleep 0`, restores vis (not `r_portalsopenall`), and drops BM CSM to quality 0 / `nr_shadow_res` 2048. `DrawModelExecute` scales viewmodels and can hide the local world-model (`HideLocalPlayerModel`).
-- If sticks do nothing, SteamVR Bindings for **Black Mesa** / this app — confirm the G2 layout is the default we installed. Log lines: `SetActionManifestPath … err=0`, `UpdateActionState err=0`, `VR input walk=`.
-
-If the game exits while trying an L4D2VR mechanism, relaunch: crash-sticky `bmvr_in_*.flag` and durable `bmvr_skip.txt` next to `bms.exe` disable only that attempt.
-
-Immediate-crash loop:
-
-```powershell
-.\scripts\boot_probe.ps1
-```
-
-See `docs/` and `AGENTS.md`.
+https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/tree/main
