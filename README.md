@@ -8,26 +8,6 @@ This is **not** a new VR design. The shipped artifact is a combined `d3d9.dll` (
 
 Sources live in `src/`. The `L4D2VR/` folder is only include shims so DXVK can `#include "L4D2VR/game.h"`.
 
-## Status (honest)
-
-| Milestone | State |
-| --- | --- |
-| Implemented | Yes (L4D2VR-style `d3d9.dll`, BM offsets, capture Submit fallback) |
-| Compiled | Yes — `build\Release\d3d9.dll` (Win32) and `build\Release\openxr_helper64\OpenXRHelper64.exe` (x64) |
-| Installed | Yes — next to `bms.exe`, `bin\`, and the DXVK folder |
-| Launched with this DLL | Yes |
-| Runtime-initialized | Yes |
-| Head tracking | User-verified with fused stereo (L4D2VR/Portal2 HMD on view copies + `SetViewAngles` + CreateMove) |
-| Rendering in headset | Yes — fused stereo Submit (`-oldgameui`) |
-| Load / headset-off freeze | Yes — `WaitGetPoses` on a pose-waiter thread (user-verified 2026-08-16) |
-| Stereo | User-verified fused window-fit (~1584×1440 on 1440p) and gbmatch squash-blit from the 2560 window into SteamVR-sized eyes. `steamvr_rt` blacked the world. `hmd_world` (LITERAL FullFrame/G-buffer at rec) warped the HMD — persist-skipped. |
-| Motion controllers | User-verified: uncoupled viewmodel on the aim controller, FP arms hidden, independent hand markers + finger curl. |
-| Weapon in HMD | User-verified 2026-08-19: world-space `v_` gun keeps desktop proportions (view-Y unstretch). Walk-bob/ghosting still open. |
-| Multicore (`mat_queue_mode`) | Compiled: real `GetMatQueueMode` + `SetThreadMode` AutoMatQueueMode. **Not user-verified.** If it dies, next launch skips `mat_queue`. |
-| Gameplay in headset | Yes with `-oldgameui` on the OpenVR path. New game UI is upside-down / black after load. |
-| OpenXR helper (L4D2VR `openxr` branch) | Implemented — **not headset-verified on this DLL** |
-
-Acceptance is **visible fused Black Mesa gameplay in the headset**.
 
 ## Steam launch options
 
@@ -68,8 +48,6 @@ Drag-and-drop zip (DLL in all three load paths, `VR\`, SteamVR bindings, resolut
 Output: `dist\Black-Mesa-VR-drop-in.zip` — copy the folder contents into `Steam\steamapps\common\Black Mesa` (next to `bms.exe`). Read `BMVR_README.txt` in the zip for launch options and `RenderScale`.
 
 ## Install
-
-**Quit Black Mesa first.** `scripts\install.ps1` will stop `bms.exe` if it is still running, because Windows will not replace a mapped DLL.
 
 ```powershell
 .\scripts\install.ps1
