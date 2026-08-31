@@ -17,7 +17,6 @@ https://github.com/keyou91/l4d2vr
 * Crowbar melee — Work in progress
 * OpenXR implementation — Done
 * Wrist HUD with game icons — Done
-* Start-to-finish gameplay — Working
 
 ## Known Issues
 
