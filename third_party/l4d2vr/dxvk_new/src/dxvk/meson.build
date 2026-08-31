@@ -2,6 +2,7 @@ dxvk_shaders = files([
   'shaders/dxvk_blit_frag_1d.frag',
   'shaders/dxvk_blit_frag_2d.frag',
   'shaders/dxvk_blit_frag_3d.frag',
+  'shaders/dxvk_blit_frag_2d_ms.frag',
 
   'shaders/dxvk_buffer_to_image_d.frag',
   'shaders/dxvk_buffer_to_image_ds_export.frag',
@@ -78,7 +79,7 @@ dxvk_src = [
   'dxvk_constant_state.cpp',
   'dxvk_context.cpp',
   'dxvk_cs.cpp',
-  'dxvk_descriptor.cpp',
+  'dxvk_descriptor_pool.cpp',
   'dxvk_device.cpp',
   'dxvk_device_filter.cpp',
   'dxvk_extensions.cpp',
@@ -120,10 +121,12 @@ dxvk_src = [
   'hud/dxvk_hud.cpp',
   'hud/dxvk_hud_font.cpp',
   'hud/dxvk_hud_item.cpp',
+  'hud/dxvk_hud_item_latency.cpp',
   'hud/dxvk_hud_renderer.cpp',
 
   'framepacer/dxvk_framepacer.cpp',
   'framepacer/dxvk_framepacer_mode_low_latency.cpp',
+  'framepacer/dxvk_calibrated_device_timestamps.cpp',
 ]
 
 if platform == 'windows'

@@ -29,7 +29,7 @@ namespace dxvk {
 
     robustness2Supported = devFeatures.extRobustness2.robustBufferAccess2;
 
-    drefScaling         = options.drefScaling;
+    sincosEmulation     = options.sincosEmulation;
   }
 
 }

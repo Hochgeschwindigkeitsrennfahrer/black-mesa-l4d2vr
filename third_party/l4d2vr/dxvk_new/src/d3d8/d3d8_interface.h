@@ -1,7 +1,7 @@
 #pragma once
 
 #include "d3d8_include.h"
-#include "d3d8_d3d9_util.h"
+#include "d3d8_util.h"
 #include "d3d8_options.h"
 #include "d3d8_format.h"
 #include "../d3d9/d3d9_bridge.h"
@@ -17,13 +17,18 @@ namespace dxvk {
   */
   class D3D8Interface final : public ComObjectClamp<IDirect3D8> {
 
+    // These must be valid render target formats, and as per the
+    // D3D8 documentation: "Render target formats are restricted to
+    // D3DFMT_X1R5G5B5, D3DFMT_R5G6B5, D3DFMT_X8R8G8B8, and D3DFMT_A8R8G8B8."
+    //
+    // Additionally, the documentation states: "Applications should not
+    // specify a DisplayFormat that contains an alpha channel."
+    //
+    // While D3DFMT_X1R5G5B5 is technically valid, no drivers list
+    // modes for it, therefore including it in caching queries is redundant.
     static constexpr d3d9::D3DFORMAT ADAPTER_FORMATS[] = {
-      d3d9::D3DFMT_A1R5G5B5,
-      //d3d9::D3DFMT_A2R10G10B10, (not in D3D8)
-      d3d9::D3DFMT_A8R8G8B8,
-      d3d9::D3DFMT_R5G6B5,
-      d3d9::D3DFMT_X1R5G5B5,
-      d3d9::D3DFMT_X8R8G8B8
+      d3d9::D3DFMT_X8R8G8B8,
+      d3d9::D3DFMT_R5G6B5
     };
 
   public:
@@ -54,7 +59,7 @@ namespace dxvk {
       D3DDISPLAYMODE* pMode);
 
     HRESULT STDMETHODCALLTYPE GetAdapterDisplayMode(UINT Adapter, D3DDISPLAYMODE* pMode) {
-      return m_d3d9->GetAdapterDisplayMode(Adapter, (d3d9::D3DDISPLAYMODE*)pMode);
+      return m_d3d9->GetAdapterDisplayMode(Adapter, reinterpret_cast<d3d9::D3DDISPLAYMODE*>(pMode));
     }
 
     HRESULT STDMETHODCALLTYPE CheckDeviceType(
@@ -82,6 +87,12 @@ namespace dxvk {
         DWORD           Usage,
         D3DRESOURCETYPE RType,
         D3DFORMAT       CheckFormat) {
+      if (unlikely(isD3D9ExclusiveFormat(CheckFormat)))
+        return D3DERR_NOTAVAILABLE;
+
+      if (unlikely((Usage & D3DUSAGE_RENDERTARGET) && !isRenderTargetFormat(CheckFormat)))
+        return D3DERR_NOTAVAILABLE;
+
       return m_d3d9->CheckDeviceFormat(
         Adapter,
         (d3d9::D3DDEVTYPE)DeviceType,
@@ -115,16 +126,20 @@ namespace dxvk {
         D3DFORMAT AdapterFormat,
         D3DFORMAT RenderTargetFormat,
         D3DFORMAT DepthStencilFormat) {
-      if (isSupportedDepthStencilFormat(DepthStencilFormat))
-        return m_d3d9->CheckDepthStencilMatch(
-          Adapter,
-          (d3d9::D3DDEVTYPE)DeviceType,
-          (d3d9::D3DFORMAT)AdapterFormat,
-          (d3d9::D3DFORMAT)RenderTargetFormat,
-          (d3d9::D3DFORMAT)DepthStencilFormat
-        );
+      if (unlikely(isD3D9ExclusiveFormat(RenderTargetFormat)
+                || isD3D9ExclusiveFormat(DepthStencilFormat)))
+        return D3DERR_NOTAVAILABLE;
 
-      return D3DERR_NOTAVAILABLE;
+      if (unlikely(!isRenderTargetFormat(RenderTargetFormat)))
+        return D3DERR_NOTAVAILABLE;
+
+      return m_d3d9->CheckDepthStencilMatch(
+        Adapter,
+        (d3d9::D3DDEVTYPE)DeviceType,
+        (d3d9::D3DFORMAT)AdapterFormat,
+        (d3d9::D3DFORMAT)RenderTargetFormat,
+        (d3d9::D3DFORMAT)DepthStencilFormat
+      );
     }
 
     HRESULT STDMETHODCALLTYPE GetDeviceCaps(
@@ -135,12 +150,13 @@ namespace dxvk {
         return D3DERR_INVALIDCALL;
 
       d3d9::D3DCAPS9 caps9;
-      HRESULT res = m_d3d9->GetDeviceCaps(Adapter, (d3d9::D3DDEVTYPE)DeviceType, &caps9);
+      HRESULT res = m_d3d9->GetDeviceCaps(Adapter, d3d9::D3DDEVTYPE(DeviceType), &caps9);
+      if (unlikely(FAILED(res)))
+        return res;
 
-      if (likely(SUCCEEDED(res)))
-        ConvertCaps8(caps9, pCaps);
+      ConvertCaps8(caps9, pCaps);
 
-      return res;
+      return D3D_OK;
     }
 
     HMONITOR STDMETHODCALLTYPE GetAdapterMonitor(UINT Adapter) {
@@ -155,12 +171,14 @@ namespace dxvk {
         D3DPRESENT_PARAMETERS* pPresentationParameters,
         IDirect3DDevice8** ppReturnedDeviceInterface);
 
+    HRESULT ValidatePresentationParameters(
+        const D3DPRESENT_PARAMETERS* pPresentationParameters);
 
-    const D3D8Options& GetOptions() { return m_d3d8Options; }
+    const D3D8Options& GetOptions() const { return m_d3d8Options; }
 
   private:
 
-    UINT                                            m_adapterCount;
+    UINT                                            m_adapterCount = 0;
     std::vector<UINT>                               m_adapterModeCounts;
     std::vector<std::vector<d3d9::D3DDISPLAYMODE>>  m_adapterModes;
 

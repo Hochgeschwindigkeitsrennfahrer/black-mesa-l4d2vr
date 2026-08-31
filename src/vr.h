@@ -75,6 +75,21 @@ public:
     uint32_t m_OpenXrLastInputStateGeneration = 0;
     L4D2VROpenXrSharedTextureDesc m_OpenXrSharedEyeTextures[L4D2VR_OPENXR_EYE_COUNT]{};
     std::atomic<uint32_t> m_OpenXrSharedEyeTextureReadyMask{ 0 };
+    // Dedicated publish copies. Without these the helper blits straight out of
+    // the live engine eye RT, which the next RenderView overwrites mid-copy at
+    // ~200 stereo pairs/s, so its swapchain image mixes several game frames
+    // (ghost edges while the head turns, 2026-08-30). Rotating slots let the
+    // game keep writing while the helper still reads the previous image.
+    static constexpr uint32_t kOpenXrPublishSlots = 3;
+    IDirect3DTexture9* m_D9OpenXrPublishTexture[L4D2VR_OPENXR_EYE_COUNT][kOpenXrPublishSlots]{};
+    IDirect3DSurface9* m_D9OpenXrPublishSurface[L4D2VR_OPENXR_EYE_COUNT][kOpenXrPublishSlots]{};
+    L4D2VROpenXrSharedTextureDesc m_OpenXrPublishDesc[L4D2VR_OPENXR_EYE_COUNT][kOpenXrPublishSlots]{};
+    uint32_t m_OpenXrPublishSlot = 0;
+    uint32_t m_OpenXrPublishWidth = 0;
+    uint32_t m_OpenXrPublishHeight = 0;
+    bool m_OpenXrPublishReady = false;
+    bool m_OpenXrPublishActive = false;
+    double m_OpenXrLastPublishMs = 0.0;
     std::atomic<uint32_t> m_OpenXrLastPublishedSharedTextureFrameId{ 0 };
     std::atomic<uint32_t> m_OpenXrSubmitFrameId{ 1 };
 
@@ -170,7 +185,11 @@ public:
         Texture_Scope,
         Texture_RearMirror,
         Texture_DesktopMirror,
-        Texture_Blank
+        Texture_Blank,
+        // Rotating OpenXR publish copies. Deliberately has no branch in the
+        // DXVK CreateTexture post-create chain: it must only make the texture
+        // exportable, never bind itself to m_D9*EyeSurface / m_VK*.
+        Texture_OpenXrPublish
     };
 
     TextureID m_CreatingTextureID = Texture_None;
@@ -420,7 +439,22 @@ public:
     bool m_DirectEyeSubmit = false;
     bool m_UsedNamedRenderTargets = false;
     bool m_StereoRenderViewActive = false;
+    bool m_StereoFramePoseActive = false;
+    QAngle m_StereoFrameAngles{};
+    Vector m_StereoFrameHmdPosAbs{};
+    bool m_StereoFrameLeftCtrlValid = false;
+    bool m_StereoFrameRightCtrlValid = false;
+    QAngle m_StereoFrameLeftCtrlAng{};
+    QAngle m_StereoFrameRightCtrlAng{};
+    Vector m_StereoFrameLeftCtrlPos{};
+    Vector m_StereoFrameRightCtrlPos{};
     bool m_PosesWaitedThisFrame = false;
+    uint32_t m_OpenXrLastSeenHelperSubmitted = 0;
+    uint32_t m_OpenXrSubmitAttempts = 0;
+    uint32_t m_OpenXrPublishes = 0;
+    uint32_t m_OpenXrSkippedNoNewFrame = 0;
+    uint32_t m_OpenXrSkippedHelperBusy = 0;
+    uint32_t m_OpenXrPublishRateTick = 0;
     bool m_NamedCreateFailed = false;
     uint32_t m_NamedRtReadyPresent = 0;
 
@@ -431,6 +465,12 @@ public:
     void CreateVRTextures();
     void SubmitVRTextures();
     void WaitPosesForStereoFrame();
+    void BeginStereoFramePose();
+    void EndStereoFramePose();
+    void LogOpenXrPublishRate();
+    void LogOpenXrPublishSetupFailure(const char* stage, uint32_t eye, uint32_t slot, unsigned hr);
+    bool EnsureOpenXrPublishTextures(IDirect3DDevice9* device, UINT w, UINT h);
+    void ReleaseOpenXrPublishTextures();
     Vector GetViewAngle() const;
     Vector GetViewOrigin(const Vector& setupOrigin) const;
     void GetViewBasis(Vector* forward, Vector* right, Vector* up) const;
@@ -587,6 +627,7 @@ private:
     void UpdateAutoMatQueueMode();
     void ApplyVrQualityOfLifeCvars();
     void PollSteamVrRecommendedSize();
+    void TryApplySteamVrRecommendedEyeSize();
     void TickCompositorFocus();
     void ReclaimCompositorFocus(const char* reason);
     void PulseAimHaptic(unsigned short durationUs = 2500);
@@ -675,6 +716,7 @@ private:
         char label[16]{};
         bool equipped = false;
         bool emptyHand = false;
+        bool dry = false;
     };
     WeaponMenuSlot m_WeaponMenuSlots[16]{};
     int m_LastMuzzleFlashParity = -1;

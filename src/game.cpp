@@ -209,18 +209,40 @@ C_BaseEntity* Game::GetLocalPlayerEntity()
     return static_cast<C_BaseEntity*>(m_ClientEntityList->GetClientEntity(local));
 }
 
+C_BaseEntity* Game::ResolveEntityFromHandle(uint32_t handle)
+{
+    if (!m_ClientEntityList || handle == 0 || handle == 0xFFFFFFFFu)
+        return nullptr;
+    constexpr uint32_t kEntryMask = 0x1FFFu;
+    void* entity = m_ClientEntityList->GetClientEntityFromHandle(static_cast<int>(handle));
+    if (!entity)
+        return nullptr;
+    int idx = static_cast<int>(handle & kEntryMask);
+    if (m_ClientEntityList->GetClientEntity(idx) != entity)
+    {
+        idx = 0;
+        const int hi = m_ClientEntityList->GetHighestEntityIndex();
+        for (int e = 1; e <= hi; ++e)
+        {
+            if (m_ClientEntityList->GetClientEntity(e) == entity)
+            {
+                idx = e;
+                break;
+            }
+        }
+    }
+    return idx > 0 ? static_cast<C_BaseEntity*>(entity) : nullptr;
+}
+
 C_BaseEntity* Game::GetActiveWeaponEntity()
 {
     void* player = GetLocalPlayerEntity();
     if (!player)
         return nullptr;
     constexpr int kActiveWeapon = 0xFA4;
-    constexpr uint32_t kInvalid = 0xFFFFFFFFu;
     const uint32_t h = *reinterpret_cast<const uint32_t*>(
         reinterpret_cast<uintptr_t>(player) + kActiveWeapon);
-    if (h == 0 || h == kInvalid)
-        return nullptr;
-    return static_cast<C_BaseEntity*>(m_ClientEntityList->GetClientEntityFromHandle(static_cast<int>(h)));
+    return ResolveEntityFromHandle(h);
 }
 
 const char* Game::GetEntityModelName(C_BaseEntity* entity)
@@ -573,6 +595,39 @@ int Game::ReadWeaponClip(C_BaseEntity* weapon)
     return clip;
 }
 
+bool Game::WeaponHasNoAmmo(C_BaseEntity* weapon)
+{
+    if (!weapon)
+        return false;
+    if (!g_nvScanned)
+        ScanWristHudNetVars();
+    auto rdInt = [](void* ent, int off) -> int {
+        if (!ent || off < 0)
+            return -1;
+        __try
+        {
+            return *reinterpret_cast<volatile int*>(reinterpret_cast<unsigned char*>(ent) + off);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return -1;
+        }
+    };
+    const int ammoType = rdInt(weapon, g_nvPrimaryAmmoType);
+    if (ammoType < 0)
+        return false;
+    const int clip = rdInt(weapon, g_nvClip1);
+    int reserve = -1;
+    C_BaseEntity* player = GetLocalPlayerEntity();
+    if (player && g_nvAmmoBase >= 0 && ammoType < 32)
+        reserve = rdInt(player, g_nvAmmoBase + 4 * ammoType);
+    if (clip < 0)
+        return reserve == 0;
+    if (reserve < 0)
+        return clip == 0;
+    return clip <= 0 && reserve <= 0;
+}
+
 bool Game::ReadWristHudValues(int& health, int& armor, int& clip, int& reserve, int& secondary)
 {
     ScanWristHudNetVars();
@@ -601,11 +656,13 @@ bool Game::ReadWristHudValues(int& health, int& armor, int& clip, int& reserve, 
     armor = rdInt(player, g_nvArmor);
     void* weapon = GetActiveWeaponEntity();
     clip = rdInt(weapon, g_nvClip1);
+    const int clip2 = rdInt(weapon, g_nvClip2);
+    if (clip < 0 && clip2 >= 0)
+        clip = clip2;
     const int ammoType = rdInt(weapon, g_nvPrimaryAmmoType);
     if (player && g_nvAmmoBase >= 0 && ammoType >= 0 && ammoType < 32)
         reserve = rdInt(player, g_nvAmmoBase + 4 * ammoType);
     const int secType = rdInt(weapon, g_nvSecondaryAmmoType);
-    const int clip2 = rdInt(weapon, g_nvClip2);
     if (secType >= 0 && secType < 32 && player && g_nvAmmoBase >= 0)
         secondary = rdInt(player, g_nvAmmoBase + 4 * secType);
     else if (clip2 >= 0 && clip2 <= 255)

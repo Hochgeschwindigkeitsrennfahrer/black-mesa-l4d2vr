@@ -2078,6 +2078,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             return;
         }
         m_VR->m_StereoEyesDrawnThisFrame = true;
+        m_VR->BeginStereoFramePose();
         static int s_enterLog;
         if (s_enterLog < 4)
         {
@@ -2157,7 +2158,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                     m_VR->m_D9LeftEyeSurface, bmvr::g_StereoBlitGpuFlush);
                 if (!leftBb)
                     m_VR->BlitCurrentGameColorTo(
-                        m_VR->m_D9LeftEyeSurface, bmvr::g_StereoBlitGpuFlush);
+                        m_VR->m_D9LeftEyeSurface, true);
                 g_Cost.blitTicks += QpcNow() - t0;
             }
             if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud
@@ -2233,6 +2234,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes)
             m_VR->DrawIndependentHandsOnDesktop();
         m_VR->m_HasStereoBodyOrigin = false;
+        m_VR->EndStereoFramePose();
         StereoCostLog();
         // Do not stretch eyes onto the backbuffer. That overwrote the
         // engine's 1584 tram strip with a black A2R10 copy (2026-08-18).

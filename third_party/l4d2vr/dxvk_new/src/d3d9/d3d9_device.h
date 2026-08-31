@@ -11,7 +11,6 @@
 #include "d3d9_adapter.h"
 #include "d3d9_constant_buffer.h"
 #include "d3d9_constant_set.h"
-#include "d3d9_mem.h"
 
 #include "d3d9_state.h"
 
@@ -39,6 +38,7 @@
 
 #include "../util/util_flush.h"
 #include "../util/util_lru.h"
+#include "../util/util_unmap.h"
 
 class VR;
 
@@ -56,44 +56,41 @@ namespace dxvk {
   class D3D9FormatHelper;
   class D3D9UserDefinedAnnotation;
 
-  enum class D3D9DeviceFlag : uint32_t {
-    DirtyFramebuffer,
-    DirtyClipPlanes,
-    DirtyDepthStencilState,
-    DirtyBlendState,
-    DirtyRasterizerState,
-    DirtyDepthBias,
-    DirtyAlphaTestState,
-    DirtyInputLayout,
-    DirtyViewportScissor,
-    DirtyMultiSampleState,
-    DirtyVertexBuffers,
-    DirtyIndexBuffer,
+  enum class D3D9DeviceDirtyFlag : uint32_t {
+    Framebuffer,
+    ClipPlanes,
+    DepthStencilState,
+    BlendState,
+    RasterizerState,
+    DepthBias,
+    AlphaTestState,
+    InputLayout,
+    ViewportScissor,
+    MultiSampleState,
+    VertexBuffers,
+    IndexBuffer,
 
-    DirtyFogState,
-    DirtyFogColor,
-    DirtyFogDensity,
-    DirtyFogScale,
-    DirtyFogEnd,
+    FogState,
+    FogColor,
+    FogDensity,
+    FogScale,
+    FogEnd,
 
-    DirtyFFVertexData,
-    DirtyFFVertexBlend,
-    DirtyFFVertexShader,
-    DirtyFFPixelShader,
-    DirtyFFViewport,
-    DirtyFFPixelData,
-    DirtyProgVertexShader,
-    DirtySharedPixelShaderData,
-    ValidSampleMask,
-    DirtyDepthBounds,
-    DirtyPointScale,
+    FFVertexData,
+    FFVertexBlend,
+    FFVertexShader,
+    FFPixelShader,
+    FFViewport,
+    FFPixelData,
+    ProgVertexShader,
+    SharedPixelShaderData,
+    DepthBounds,
+    PointScale,
 
-    InScene,
-
-    DirtySpecializationEntries,
+    SpecializationEntries,
   };
 
-  using D3D9DeviceFlags = Flags<D3D9DeviceFlag>;
+  using D3D9DeviceDirtyFlags = Flags<D3D9DeviceDirtyFlag>;
 
   enum class D3D9DeviceLostState {
     Ok = 0,
@@ -109,6 +106,110 @@ namespace dxvk {
   struct D3D9BufferSlice {
     DxvkBufferSlice slice = {};
     void*           mapPtr = nullptr;
+  };
+
+  struct D3D9TextureSlotTracking {
+    /* Pixel shaders can access 16 textures/samplers.
+     * Then there's 1 dmap texture/sampler.
+     * Vertex shaders can use 4 textures/samplers.
+     * So unless otherwise noted most bitmasks use 21 bits
+     * and each bit is one texture/sampler slot.
+     * See RemapSamplerState(), IsPSSampler(), IsVSSampler() in d3d9_util.h */
+
+    /** Whether the format of the texture currently bound to each slot is a format that gets fetched in comparison mode. */
+    uint32_t depth = 0;
+
+    /** If a depth texture format isn't supported, we fall back to D32F.
+     * We'll need to clamp the reference value if the original format was an unorm format.
+     * This tracks the texture/sampler slots for which this kind of adjusting needs to be done. */
+    uint32_t drefClamp = 0;
+
+    /** Used to store the type of each bound pixel shader texture.
+     * This is used to generate fixed function shader code
+     * and for PS 1.1 shaders which do not provide this information in the shader bytecode.
+     * SM 1.1 and fixed function doesn't allow sampling textures in the VS, so we only need the 16 PS slots.
+     * There's 3 texture types, so every texture/sampler slot uses 2 bits. */
+    uint32_t textureType = 0;
+
+    /** Whether the type of the texture currently bound to each slot matches the texture type that the shader expects */
+    uint32_t mismatchingTextureType = 0;
+
+    /** Whether projected texture lookup is enabled for each texture/sampler slot. This is only used for generating fixed function shaders. */
+    uint32_t projected = 0;
+
+    /** Whether sampler slots whose state has been changed and bindings in the backend need to be updated */
+    uint32_t samplerStateDirty = 0;
+
+    /** Whether Fetch 4 is enabled for a sampler slot.
+     * This just means the application enabled it using the sampler state.
+     * It does not mean Fetch 4 is actually active, as that depends on other factors
+     * such as the sampling mode and the texture format. */
+    uint32_t fetch4SamplerState = 0;
+
+    /** Whether Fetch 4 is active. */
+    uint32_t fetch4 = 0;
+
+    /** Whether the texture bound to a slot has been changed and bindings in the backend need to be updated */
+    uint32_t textureDirty = 0;
+
+    /** Whether the texture bound to a slot has D3DUSAGE_RENDERTARGET */
+    uint32_t rtUsage = 0;
+
+    /** Whether the texture bound to a slot has D3DUSAGE_DEPTHSTENCIL */
+    uint32_t dsUsage = 0;
+
+    /** Whether the texture bound to a slot is also bound as a render target
+     * and the render target is actually used for writing. */
+    uint32_t unresolvableHazardRT = 0;
+
+    /** Whether the texture bound to a slot is also bound as the depth stencil surface
+     * and depth stencil surface is actually used for depth testing. */
+    uint32_t unresolvableHazardDS = 0;
+
+    /** Whether the texture bound to a slot is also bound as a render target */
+    uint32_t hazardRT = 0;
+
+    /** Whether the texture bound to a slot is also bound as the depth stencil view */
+    uint32_t hazardDS = 0;
+
+    /** Whether there's a texture bound to a slot */
+    uint32_t bound = 0;
+
+    /** Whether there's a texture bound to a slot that needs to be uploaded at draw time */
+    uint32_t needsUpload = 0;
+
+    /** Whether there's a texture bound to a slot that needs to have its mip maps generated */
+    uint32_t needsMipGen = 0;
+  };
+
+  struct D3D9RTSlotTracking {
+    /* D3D9 allows rendering to 4 render targets at the same time.
+     * So all RT bit masks only use the first 4 bits. */
+
+    /** Whether a render target is a D3D9Texture rather than just a D3D9Surface.
+      * Textures can be bound for sampling so there can be a feedback loop if this
+      * RT is also bound for sampling. */
+    uint8_t canBeSampled = 0;
+
+    /** Whether the alpha channel of the format of this RT needs to be manually handled
+      * as part of the blend state. */
+    uint8_t hasAlphaSwizzle = 0;
+  };
+
+  struct D3D9VBSlotTracking {
+    /* D3D9 allows using 16 vertex buffers ('streams'). */
+
+    /** Whether there's a vertex buffer bound to the slot */
+    uint16_t bound = 0;
+
+    /** Whether the vertex buffer at each slot needs to be uploaded at draw time */
+    uint16_t needsUpload = 0;
+
+    /** Whether the vertex buffer for each slot gets copied at draw time to act like DrawUP */
+    uint16_t uploadPerDraw = 0;
+
+    /** Whether instancing is enabled for each slot */
+    uint16_t instanced = 0;
   };
 
   class D3D9DeviceEx final : public ComObjectClamp<IDirect3DDevice9Ex> {
@@ -520,7 +621,7 @@ namespace dxvk {
     HRESULT STDMETHODCALLTYPE GetIndices(IDirect3DIndexBuffer9** ppIndexData);
 
     HRESULT STDMETHODCALLTYPE CreatePixelShader(
-      const DWORD*                  pFunction, 
+      const DWORD*                  pFunction,
             IDirect3DPixelShader9** ppShader);
 
     HRESULT STDMETHODCALLTYPE SetPixelShader(IDirect3DPixelShader9* pShader);
@@ -706,6 +807,8 @@ namespace dxvk {
      */
     bool SupportsSWVP();
 
+    bool SupportsVCacheQuery() const;
+
     bool IsExtended();
 
     HWND GetWindow();
@@ -727,7 +830,7 @@ namespace dxvk {
 
     /**
      * \brief Locks a subresource of an image
-     * 
+     *
      * \param [in] Subresource The subresource of the image to lock
      * \param [out] pLockedBox The returned locked box of the image, containing data ptr and strides
      * \param [in] pBox The region of the subresource to lock. This offsets the returned data ptr
@@ -838,11 +941,11 @@ namespace dxvk {
 
     void UpdateTextureBitmasks(uint32_t index, DWORD combinedUsage);
 
-    void UpdateActiveHazardsRT(uint32_t rtMask);
+    void UpdateActiveHazardsRT(uint32_t texMask);
 
     void UpdateActiveHazardsDS(uint32_t texMask);
 
-    void MarkRenderHazards();
+    void EmitFeedbackLoopBarriers();
 
     void UpdateActiveFetch4(uint32_t stateSampler);
 
@@ -902,42 +1005,29 @@ namespace dxvk {
 
     void BindViewportAndScissor();
 
-    inline bool IsAlphaToCoverageEnabled() {
-      const bool alphaTest = m_state.renderStates[D3DRS_ALPHATESTENABLE] != 0;
+    inline bool IsNVDepthBoundsTestEnabled () {
+      // NVDB is not supported by D3D8
+      if (unlikely(m_isD3D8Compatible))
+        return false;
 
-      return (m_amdATOC || (m_nvATOC && alphaTest)) && m_flags.test(D3D9DeviceFlag::ValidSampleMask);
+      return m_state.renderStates[D3DRS_ADAPTIVETESS_X] == uint32_t(D3D9Format::NVDB);
     }
 
-    inline bool IsDepthBiasEnabled() {
-      const auto& rs = m_state.renderStates;
-
-      float depthBias            = bit::cast<float>(rs[D3DRS_DEPTHBIAS]);
-      float slopeScaledDepthBias = bit::cast<float>(rs[D3DRS_SLOPESCALEDEPTHBIAS]);
-
-      return depthBias != 0.0f || slopeScaledDepthBias != 0.0f;
-    }
-
-    inline bool IsAlphaTestEnabled() {
-      return m_state.renderStates[D3DRS_ALPHATESTENABLE] && !IsAlphaToCoverageEnabled();
-    }
+    void UpdateAlphaToCoverangeAndAlphaTest();
 
     inline bool IsZTestEnabled() {
       return m_state.renderStates[D3DRS_ZENABLE] && m_state.depthStencil != nullptr;
     }
 
-    inline bool IsClipPlaneEnabled() {
-      return m_state.renderStates[D3DRS_CLIPPLANEENABLE] != 0;
-    }
-
     void BindMultiSampleState();
-    
+
     void BindBlendState();
 
     void BindBlendFactor();
 
     void BindDepthStencilState();
 
-    void BindDepthStencilRefrence();
+    void BindDepthStencilReference();
 
     void BindRasterizerState();
 
@@ -949,10 +1039,10 @@ namespace dxvk {
 
     template <DxsoProgramType ShaderStage, typename HardwareLayoutType, typename SoftwareLayoutType, typename ShaderType>
     inline void UploadConstantSet(const SoftwareLayoutType& Src, const D3D9ConstantLayout& Layout, const ShaderType& Shader);
-    
+
     template <DxsoProgramType ShaderStage>
     void UploadConstants();
-    
+
     void UpdateClipPlanes();
 
     /**
@@ -985,6 +1075,8 @@ namespace dxvk {
 
     void MarkTextureBindingDirty(IDirect3DBaseTexture9* texture);
 
+    bool SamplerUsesBorderColor(DWORD Sampler) const;
+
     HRESULT STDMETHODCALLTYPE SetRenderTargetInternal(
             DWORD              RenderTargetIndex,
             IDirect3DSurface9* pRenderTarget);
@@ -993,7 +1085,7 @@ namespace dxvk {
       D3DPRIMITIVETYPE PrimitiveType,
       UINT             PrimitiveCount,
       UINT             InstanceCount);
-    
+
     uint32_t GetInstanceCount() const;
 
     void PrepareDraw(D3DPRIMITIVETYPE PrimitiveType, bool UploadVBOs, bool UploadIBOs);
@@ -1010,6 +1102,13 @@ namespace dxvk {
             UINT                              Slot,
             D3D9VertexBuffer*                 pBuffer,
             UINT                              Offset,
+            UINT                              Length,
+            UINT                              Stride);
+
+    void BindVertexBufferRange(
+            UINT                              Slot,
+            UINT                              Offset,
+            UINT                              Length,
             UINT                              Stride);
 
     void BindIndices();
@@ -1076,7 +1175,7 @@ namespace dxvk {
     /**
      * \brief Returns the allocator used for unmappable system memory texture data
      */
-    D3D9MemoryAllocator* GetAllocator() {
+    MemoryFilePool* GetAllocator() {
       return &m_memoryAllocator;
     }
 
@@ -1191,22 +1290,19 @@ namespace dxvk {
       return DxvkCsChunkRef(chunk, &m_csChunkPool);
     }
 
-    // Called by the queued-render completion transaction before the submit
-    // surfaces are transitioned and published to OpenVR.
-    void DrawQueuedEyeSubmitOverlays(VR* vr);
+    bool Is9On12Device() const {
+      return m_d3d9On12Args.Enable9On12;
+    }
 
-    // Builds a side-by-side, single-sample depth atlas for ReShade's native
-    // OpenVR Vulkan effect runtime. The work is appended to the existing DXVK
-    // command stream and never performs a CPU readback or GPU wait.
+    void DrawQueuedEyeSubmitOverlays(VR* vr);
     void UpdateReShadeVrDepthAtlas(VR* vr);
 
   private:
 
     template<bool AllowFlush = true, typename Cmd>
-    void EmitCs(Cmd&& command, bool disableFlush = false) {
+    void EmitCs(Cmd&& command, bool disableFlush=false) {
       // L4D2VR queued rendering can hit unusual cross-thread Present/EndFrame
-      // timing. Do not assume m_csChunk is always non-null after a move/flush;
-      // recover a fresh chunk instead of dereferencing null in DxvkCsChunk::alloc.
+      // timing. Do not assume m_csChunk is always non-null after a move/flush.
       if (unlikely(!m_csChunk))
         m_csChunk = AllocCsChunk();
 
@@ -1270,7 +1366,9 @@ namespace dxvk {
     /**
      * \brief Waits until the amount of used staging memory is below a certain threshold.
      */
-    void WaitStagingBuffer();
+    void ThrottleAllocation();
+
+    DxvkStagingBufferStats GetStagingMemoryStatistics() const;
 
     HRESULT               CreateShaderModule(
             D3D9CommonShader*     pShaderModule,
@@ -1315,7 +1413,7 @@ namespace dxvk {
 
       switch (ConstantType) {
         default:
-        case D3D9ConstantType::Float:  return isVS ? caps::MaxFloatConstantsSoftware : caps::MaxFloatConstantsPS;
+        case D3D9ConstantType::Float:  return isVS ? caps::MaxFloatConstantsSoftware : caps::MaxSM3FloatConstantsPS;
         case D3D9ConstantType::Int:    return isVS ? caps::MaxOtherConstantsSoftware : caps::MaxOtherConstants;
         case D3D9ConstantType::Bool:   return isVS ? caps::MaxOtherConstantsSoftware : caps::MaxOtherConstants;
       }
@@ -1433,7 +1531,7 @@ namespace dxvk {
 
     void BindSpecConstants();
 
-    void TrackBufferMappingBufferSequenceNumber(
+    void TrackBufferSequenceNumber(
       D3D9CommonBuffer* pResource);
 
     void TrackTextureMappingBufferSequenceNumber(
@@ -1496,7 +1594,21 @@ namespace dxvk {
         && !m_state.renderTargets[Index]->IsNull();
     }
 
+    inline D3D9ShaderMasks VSShaderMasks() const {
+      return m_state.vertexShader != nullptr
+        ? m_state.vertexShader->GetCommonShader()->GetShaderMask()
+        : D3D9ShaderMasks();
+    }
+
+    inline D3D9ShaderMasks PSShaderMasks() const {
+      return m_state.pixelShader != nullptr
+        ? m_state.pixelShader->GetCommonShader()->GetShaderMask()
+        : FixedFunctionMask;
+    }
+
     GpuFlushType GetMaxFlushType() const;
+
+    bool HasFormatsUnlocked() const { return m_unlockAdditionalFormats; }
 
     Com<D3D9InterfaceEx>            m_parent;
     D3DDEVTYPE                      m_deviceType;
@@ -1513,12 +1625,12 @@ namespace dxvk {
     VkSampleCountFlagBits           m_reShadeVrDepthSourceSamples = VK_SAMPLE_COUNT_1_BIT;
     bool                            m_reShadeVrDepthMismatchLogged = false;
 
-    D3D9MemoryAllocator             m_memoryAllocator;
+    MemoryFilePool                  m_memoryAllocator;
 
     // Second memory allocator used for D3D9 shader bytecode.
     // Most games never access the stored bytecode, so putting that
     // into the same chunks as texture memory would waste address space.
-    D3D9MemoryAllocator             m_shaderAllocator;
+    MemoryFilePool                  m_shaderAllocator;
 
     uint32_t                        m_frameLatency = DefaultFrameLatency;
 
@@ -1548,6 +1660,9 @@ namespace dxvk {
     Rc<sync::Fence>                 m_stagingBufferFence;
     VkDeviceSize                    m_stagingMemorySignaled = 0ull;
 
+    VkDeviceSize                    m_discardMemoryCounter = 0u;
+    VkDeviceSize                    m_discardMemoryOnFlush = 0u;
+
     D3D9Cursor                      m_cursor;
 
     Com<D3D9Surface, false>         m_autoDepthStencil;
@@ -1565,60 +1680,33 @@ namespace dxvk {
     D3D9Multithread                 m_multithread;
     D3D9InputAssemblyState          m_iaState;
 
-    D3D9DeviceFlags                 m_flags;
-    // Last state of depth textures. Doesn't update when NULL is bound.
-    // & with m_activeTextures to normalize.
-    uint32_t                        m_instancedData = 0;
+    D3D9DeviceDirtyFlags            m_dirty;
 
-    uint32_t                        m_depthTextures = 0;
-    uint32_t                        m_drefClamp = 0;
-    uint32_t                        m_cubeTextures = 0;
-    uint32_t                        m_textureTypes = 0;
-    uint32_t                        m_mismatchingTextureTypes = 0;
-    uint32_t                        m_projectionBitfield  = 0;
+    D3D9TextureSlotTracking         m_textureSlotTracking;
 
-    uint32_t                        m_dirtySamplerStates = 0;
-    uint32_t                        m_dirtyTextures      = 0;
+    D3D9RTSlotTracking              m_rtSlotTracking;
 
-    uint32_t                        m_activeRTsWhichAreTextures : 4;
-    uint32_t                        m_alphaSwizzleRTs : 4;
-    uint32_t                        m_lastHazardsRT   : 4;
+    D3D9VBSlotTracking              m_vbSlotTracking;
 
-    uint32_t                        m_activeTextureRTs       = 0;
-    uint32_t                        m_activeTextureDSs       = 0;
-    uint32_t                        m_activeHazardsRT        = 0;
-    uint32_t                        m_activeHazardsDS        = 0;
-    uint32_t                        m_activeTextures         = 0;
-    uint32_t                        m_activeTexturesToUpload = 0;
-    uint32_t                        m_activeTexturesToGen    = 0;
-
-    uint32_t                        m_activeVertexBuffers                = 0;
-    uint32_t                        m_activeVertexBuffersToUpload        = 0;
-    uint32_t                        m_activeVertexBuffersToUploadPerDraw = 0;
-
-    // m_fetch4Enabled is whether fetch4 is currently enabled
-    // from the application.
-    //
-    // m_fetch4 is whether it should be enabled in the shader
-    // ie. are we in a correct state to use it
-    // (enabled + texture supports it + point sampled)
-    uint32_t                        m_fetch4Enabled = 0;
-    uint32_t                        m_fetch4        = 0;
-
-    uint32_t                        m_lastHazardsDS = 0;
     uint32_t                        m_lastSamplerTypesFF = 0;
 
     D3D9SpecializationInfo          m_specInfo = D3D9SpecializationInfo();
 
-    D3D9ShaderMasks                 m_vsShaderMasks = D3D9ShaderMasks();
-    D3D9ShaderMasks                 m_psShaderMasks = FixedFunctionMask;
-
     bool                            m_isSWVP;
     bool                            m_isD3D8Compatible;
-    bool                            m_amdATOC          = false;
-    bool                            m_nvATOC           = false;
     bool                            m_ffZTest          = false;
-    
+
+    // the enablement of below features is tracked independently
+    // of render states both due to complexity and to avoid
+    // incurring overhead on all render state changes
+    bool                            m_alphaTestEnabled = false;
+    // vendor hack state tracking
+    bool                            m_atocEnabled      = false;
+    bool                            m_nvdbEnabled      = false;
+
+    bool                            m_inScene          = false;
+    bool                            m_validSampleMask  = false;
+
     VkImageLayout                   m_hazardLayout = VK_IMAGE_LAYOUT_GENERAL;
 
     bool                            m_usingGraphicsPipelines = false;
@@ -1631,8 +1719,8 @@ namespace dxvk {
     uint32_t                        m_robustUBOAlignment      = 1;
 
     D3D9ConstantSets                m_consts[DxsoProgramTypes::Count];
-	
-	D3D9UserDefinedAnnotation*      m_annotation = nullptr;
+
+    D3D9UserDefinedAnnotation*      m_annotation = nullptr;
 
     D3D9ViewportInfo                m_viewportInfo;
 
@@ -1656,7 +1744,7 @@ namespace dxvk {
 
     D3D9SwapChainEx*                m_mostRecentlyUsedSwapchain = nullptr;
 
-#ifdef D3D9_ALLOW_UNMAPPING
+#ifdef DXVK_USE_UNMAPPABLE_MEMORY
     lru_list<D3D9CommonTexture*>    m_mappedTextures;
 #endif
 
@@ -1665,6 +1753,7 @@ namespace dxvk {
     Direct3DState9                  m_state;
 
     D3D9VkInteropDevice             m_d3d9Interop;
+    D3D9ON12_ARGS                   m_d3d9On12Args = { };
     D3D9On12                        m_d3d9On12;
     DxvkD3D8Bridge                  m_d3d8Bridge;
 
@@ -1680,6 +1769,8 @@ namespace dxvk {
     // Written by CS thread
     alignas(CACHE_LINE_SIZE)
     std::atomic<uint64_t>           m_lastSamplerStats = { 0u };
+
+    bool m_unlockAdditionalFormats = false;
   };
 
 }

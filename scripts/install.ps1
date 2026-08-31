@@ -147,7 +147,7 @@ if (-not (Test-Path $CfgGame)) { throw "Missing $CfgGame" }
 $BmvrCfgSrc = Join-Path $VrSrc "bmvr.cfg"
 $BmvrCfgDst = Join-Path $CfgGame "bmvr.cfg"
 Copy-Item -Force $BmvrCfgSrc $BmvrCfgDst
-Write-Host "Installed $BmvrCfgDst (vis restored, CSM quality 0, combat cvar bundle reverted)"
+Write-Host "Installed $BmvrCfgDst (PVS on, r_visocclusion 0, CSM quality 0)"
 $Autoexec = Join-Path $CfgGame "autoexec.cfg"
 if (Test-Path $Autoexec) {
   $autoText = Get-Content -LiteralPath $Autoexec -Raw

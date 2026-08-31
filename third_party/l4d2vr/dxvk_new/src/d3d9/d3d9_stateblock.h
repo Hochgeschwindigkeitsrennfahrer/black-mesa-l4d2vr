@@ -58,7 +58,7 @@ namespace dxvk {
     } vsConsts;
 
     struct {
-      bit::bitset<caps::MaxFloatConstantsPS>            fConsts;
+      bit::bitset<caps::MaxSM3FloatConstantsPS>         fConsts;
       bit::bitset<caps::MaxOtherConstants>              iConsts;
       bit::bitset<caps::MaxOtherConstants>              bConsts;
     } psConsts;
@@ -66,19 +66,20 @@ namespace dxvk {
     bit::bitvector                                      lightEnabledChanges;
   };
 
-  enum class D3D9StateBlockType :uint32_t {
+  enum class D3D9StateBlockType : uint8_t {
     None,
-    VertexState,
+    All,
     PixelState,
-    All
+    VertexState,
+    Unknown
   };
 
   inline D3D9StateBlockType ConvertStateBlockType(D3DSTATEBLOCKTYPE type) {
     switch (type) {
+      case D3DSBT_ALL:         return D3D9StateBlockType::All;
       case D3DSBT_PIXELSTATE:  return D3D9StateBlockType::PixelState;
       case D3DSBT_VERTEXSTATE: return D3D9StateBlockType::VertexState;
-      default:
-      case D3DSBT_ALL:         return D3D9StateBlockType::All;
+      default:                 return D3D9StateBlockType::Unknown;
     }
   }
 
@@ -320,16 +321,18 @@ namespace dxvk {
 
       if (m_captures.flags.test(D3D9CapturedStateFlag::Lights)) {
         for (uint32_t i = 0; i < src->lights.size(); i++) {
-          if (!src->lights[i].has_value())
+          if (!src->lights[i].isValid)
             continue;
 
-          dst->SetLight(i, &src->lights[i].value());
+          dst->SetLight(i, &src->lights[i].light);
         }
+
         for (uint32_t i = 0; i < m_captures.lightEnabledChanges.dwordCount(); i++) {
           for (uint32_t consts : bit::BitMask(m_captures.lightEnabledChanges.dword(i))) {
             uint32_t idx = i * 32 + consts;
 
-            dst->LightEnable(idx, src->IsLightEnabled(idx));
+            if (idx < src->lights.size())
+              dst->LightEnable(idx, src->lights[idx].isEnabled);
           }
         }
       }

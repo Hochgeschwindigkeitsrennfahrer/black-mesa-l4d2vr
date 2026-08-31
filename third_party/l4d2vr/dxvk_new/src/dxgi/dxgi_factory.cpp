@@ -10,6 +10,7 @@
 namespace dxvk {
 
   static Singleton<DxvkInstance>   g_dxvkInstance;
+  static Singleton<DxgiOptions>    g_dxgiOptions;
 
   static dxvk::mutex               s_globalHDRStateMutex;
   static DXVK_VK_GLOBAL_HDR_STATE  s_globalHDRState{};
@@ -81,10 +82,11 @@ namespace dxvk {
   DxgiFactory::DxgiFactory(UINT Flags)
   : m_instance        (g_dxvkInstance.acquire(0)),
     m_interop         (this),
-    m_options         (m_instance->config()),
-    m_monitorInfo     (this, m_options),
+    m_options         (g_dxgiOptions.acquire(m_instance->config())),
+    m_monitorInfo     (this, *m_options),
     m_flags           (Flags),
-    m_monitorFallback (false) {
+    m_monitorFallback (false),
+    m_destructionNotifier(this) {
     // Be robust against situations where some monitors are not
     // associated with any adapter. This can happen if device
     // filter options are used.
@@ -132,6 +134,7 @@ namespace dxvk {
   
   
   DxgiFactory::~DxgiFactory() {
+    g_dxgiOptions.release();
     g_dxvkInstance.release();
   }
   
@@ -166,7 +169,12 @@ namespace dxvk {
       *ppvObject = ref(&m_monitorInfo);
       return S_OK;
     }
-    
+
+    if (riid == __uuidof(ID3DDestructionNotifier)) {
+      *ppvObject = ref(&m_destructionNotifier);
+      return S_OK;
+    }
+
     if (logQueryInterfaceError(__uuidof(IDXGIFactory), riid)) {
       Logger::warn("DxgiFactory::QueryInterface: Unknown interface query");
       Logger::warn(str::format(riid));
@@ -277,7 +285,7 @@ namespace dxvk {
           IDXGISwapChain1**     ppSwapChain) {
     InitReturnPtr(ppSwapChain);
 
-    if (!m_options.enableDummyCompositionSwapchain) {
+    if (!m_options->enableDummyCompositionSwapchain) {
       Logger::err("DxgiFactory::CreateSwapChainForComposition: Not implemented");
       return E_NOTIMPL;
     }
@@ -522,9 +530,11 @@ namespace dxvk {
     // Make sure the back buffer size is not zero
     DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
 
-    wsi::getWindowSize(hWnd,
-      desc.Width  ? nullptr : &desc.Width,
-      desc.Height ? nullptr : &desc.Height);
+    if (hWnd) {
+      wsi::getWindowSize(hWnd,
+        desc.Width  ? nullptr : &desc.Width,
+        desc.Height ? nullptr : &desc.Height);
+    }
 
     // If necessary, set up a default set of
     // fullscreen parameters for the swap chain

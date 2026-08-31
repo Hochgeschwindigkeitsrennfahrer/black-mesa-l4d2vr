@@ -240,6 +240,9 @@ namespace dxvk {
         && CHECK_FEATURE_NEED(vk13.dynamicRendering)
         && CHECK_FEATURE_NEED(vk13.maintenance4)
         && CHECK_FEATURE_NEED(extAttachmentFeedbackLoopLayout.attachmentFeedbackLoopLayout)
+        && CHECK_FEATURE_NEED(extDynamicRenderingUnusedAttachments.dynamicRenderingUnusedAttachments)
+        && CHECK_FEATURE_NEED(extBorderColorSwizzle.borderColorSwizzle)
+        && CHECK_FEATURE_NEED(extBorderColorSwizzle.borderColorSwizzleFromImage)
         && CHECK_FEATURE_NEED(extConservativeRasterization)
         && CHECK_FEATURE_NEED(extCustomBorderColor.customBorderColors)
         && CHECK_FEATURE_NEED(extCustomBorderColor.customBorderColorWithoutFormat)
@@ -255,10 +258,11 @@ namespace dxvk {
         && CHECK_FEATURE_NEED(extRobustness2.robustBufferAccess2)
         && CHECK_FEATURE_NEED(extRobustness2.robustImageAccess2)
         && CHECK_FEATURE_NEED(extRobustness2.nullDescriptor)
+        && CHECK_FEATURE_NEED(extSampleLocations)
         && CHECK_FEATURE_NEED(extShaderModuleIdentifier.shaderModuleIdentifier)
         && CHECK_FEATURE_NEED(extShaderStencilExport)
         && CHECK_FEATURE_NEED(extSwapchainColorSpace)
-        && CHECK_FEATURE_NEED(extSwapchainMaintenance1.swapchainMaintenance1)
+        && CHECK_FEATURE_NEED(khrSwapchainMaintenance1.swapchainMaintenance1)
         && CHECK_FEATURE_NEED(extHdrMetadata)
         && CHECK_FEATURE_NEED(extTransformFeedback.transformFeedback)
         && CHECK_FEATURE_NEED(extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor)
@@ -278,10 +282,10 @@ namespace dxvk {
     DxvkDeviceExtensions devExtensions;
     auto devExtensionList = getExtensionList(devExtensions);
 
-    // Only enable Cuda interop extensions in 64-bit builds in
+    // Only enable Cuda interop extensions in winevulkan and 64-bit builds in
     // order to avoid potential driver or address space issues.
     // VK_KHR_buffer_device_address is expensive on some drivers.
-    bool enableCudaInterop = !env::is32BitHostPlatform() &&
+    bool enableCudaInterop = env::isWineVulkan() && !env::is32BitHostPlatform() &&
       m_deviceExtensions.supports(devExtensions.nvxBinaryImport.name()) &&
       m_deviceExtensions.supports(devExtensions.nvxImageViewHandle.name()) &&
       m_deviceFeatures.vk12.bufferDeviceAddress;
@@ -394,6 +398,10 @@ namespace dxvk {
     enabledFeatures.extExtendedDynamicState3.extendedDynamicState3LineRasterizationMode =
       m_deviceFeatures.extExtendedDynamicState3.extendedDynamicState3LineRasterizationMode;
 
+    // Used with VK_EXT_sample_locations
+    enabledFeatures.extExtendedDynamicState3.extendedDynamicState3SampleLocationsEnable =
+      m_deviceFeatures.extExtendedDynamicState3.extendedDynamicState3SampleLocationsEnable;
+
     // Used for both pNext shader module info, and fast-linking pipelines provided
     // that graphicsPipelineLibraryIndependentInterpolationDecoration is supported
     enabledFeatures.extGraphicsPipelineLibrary.graphicsPipelineLibrary =
@@ -433,10 +441,10 @@ namespace dxvk {
     enabledFeatures.extShaderModuleIdentifier.shaderModuleIdentifier =
       m_deviceFeatures.extShaderModuleIdentifier.shaderModuleIdentifier;
 
-    // Enable swap chain features that are transparent tot he device
-    enabledFeatures.extSwapchainMaintenance1.swapchainMaintenance1 =
-      m_deviceFeatures.extSwapchainMaintenance1.swapchainMaintenance1 &&
-      instance->extensions().extSurfaceMaintenance1;
+    // Enable KHR swap chain features that are transparent to the device
+    enabledFeatures.khrSwapchainMaintenance1.swapchainMaintenance1 =
+      m_deviceFeatures.khrSwapchainMaintenance1.swapchainMaintenance1 &&
+      instance->extensions().khrSurfaceMaintenance1;
 
     // Enable maintenance features if supported
     enabledFeatures.khrMaintenance5.maintenance5 =
@@ -450,6 +458,13 @@ namespace dxvk {
     enabledFeatures.khrPresentWait.presentWait =
       m_deviceFeatures.khrPresentId.presentId &&
       m_deviceFeatures.khrPresentWait.presentWait;
+
+    // Enable present id2 and present wait2 together, if possible
+    enabledFeatures.khrPresentId2.presentId2 =
+      m_deviceFeatures.khrPresentId2.presentId2;
+    enabledFeatures.khrPresentWait2.presentWait2 =
+      m_deviceFeatures.khrPresentId2.presentId2 &&
+      m_deviceFeatures.khrPresentWait2.presentWait2;
 
     // Unless we're on an Nvidia driver where these extensions are known to be broken
     if (matchesDriver(VK_DRIVER_ID_NVIDIA_PROPRIETARY, Version(), Version(535, 0, 0))) {
@@ -585,6 +600,14 @@ namespace dxvk {
           enabledFeatures.extAttachmentFeedbackLoopLayout = *reinterpret_cast<const VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT*>(f);
           break;
 
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT:
+          enabledFeatures.extDynamicRenderingUnusedAttachments = *reinterpret_cast<const VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT*>(f);
+          break;
+
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT:
+          enabledFeatures.extBorderColorSwizzle = *reinterpret_cast<const VkPhysicalDeviceBorderColorSwizzleFeaturesEXT*>(f);
+          break;
+
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUSTOM_BORDER_COLOR_FEATURES_EXT:
           enabledFeatures.extCustomBorderColor = *reinterpret_cast<const VkPhysicalDeviceCustomBorderColorFeaturesEXT*>(f);
           break;
@@ -637,8 +660,8 @@ namespace dxvk {
           enabledFeatures.extShaderModuleIdentifier = *reinterpret_cast<const VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT*>(f);
           break;
 
-        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT:
-          enabledFeatures.extSwapchainMaintenance1 = *reinterpret_cast<const VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT*>(f);
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR:
+          enabledFeatures.khrSwapchainMaintenance1 = *reinterpret_cast<const VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR*>(f);
           break;
 
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT:
@@ -663,6 +686,14 @@ namespace dxvk {
 
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR:
           enabledFeatures.khrPresentWait = *reinterpret_cast<const VkPhysicalDevicePresentWaitFeaturesKHR*>(f);
+          break;
+
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR:
+          enabledFeatures.khrPresentId2 = *reinterpret_cast<const VkPhysicalDevicePresentId2FeaturesKHR*>(f);
+          break;
+
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR:
+          enabledFeatures.khrPresentWait2 = *reinterpret_cast<const VkPhysicalDevicePresentWait2FeaturesKHR*>(f);
           break;
 
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_POOL_OVERALLOCATION_FEATURES_NV:
@@ -821,6 +852,11 @@ namespace dxvk {
       m_deviceInfo.extMultiDraw.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.extMultiDraw);
     }
 
+    if (m_deviceExtensions.supports(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME)) {
+      m_deviceInfo.extSampleLocations.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLE_LOCATIONS_PROPERTIES_EXT;
+      m_deviceInfo.extSampleLocations.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.extSampleLocations);
+    }
+
     if (m_deviceExtensions.supports(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
       m_deviceInfo.extRobustness2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_EXT;
       m_deviceInfo.extRobustness2.pNext = std::exchange(m_deviceInfo.core.pNext, &m_deviceInfo.extRobustness2);
@@ -875,6 +911,16 @@ namespace dxvk {
     if (m_deviceExtensions.supports(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME)) {
       m_deviceFeatures.extAttachmentFeedbackLoopLayout.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT;
       m_deviceFeatures.extAttachmentFeedbackLoopLayout.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extAttachmentFeedbackLoopLayout);
+    }
+
+    if (m_deviceExtensions.supports(VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME)) {
+      m_deviceFeatures.extDynamicRenderingUnusedAttachments.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT;
+      m_deviceFeatures.extDynamicRenderingUnusedAttachments.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extDynamicRenderingUnusedAttachments);
+    }
+
+    if (m_deviceExtensions.supports(VK_EXT_BORDER_COLOR_SWIZZLE_EXTENSION_NAME)) {
+      m_deviceFeatures.extBorderColorSwizzle.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT;
+      m_deviceFeatures.extBorderColorSwizzle.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extBorderColorSwizzle);
     }
 
     if (m_deviceExtensions.supports(VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME))
@@ -946,6 +992,9 @@ namespace dxvk {
       m_deviceFeatures.extRobustness2.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extRobustness2);
     }
 
+    if (m_deviceExtensions.supports(VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME))
+      m_deviceFeatures.extSampleLocations = VK_TRUE;
+
     if (m_deviceExtensions.supports(VK_EXT_SHADER_MODULE_IDENTIFIER_EXTENSION_NAME)) {
       m_deviceFeatures.extShaderModuleIdentifier.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT;
       m_deviceFeatures.extShaderModuleIdentifier.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extShaderModuleIdentifier);
@@ -957,9 +1006,9 @@ namespace dxvk {
     if (m_deviceExtensions.supports(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME))
       m_deviceFeatures.extSwapchainColorSpace = VK_TRUE;
 
-    if (m_deviceExtensions.supports(VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
-      m_deviceFeatures.extSwapchainMaintenance1.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT;
-      m_deviceFeatures.extSwapchainMaintenance1.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extSwapchainMaintenance1);
+    if (m_deviceExtensions.supports(VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME)) {
+      m_deviceFeatures.khrSwapchainMaintenance1.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR;
+      m_deviceFeatures.khrSwapchainMaintenance1.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrSwapchainMaintenance1);
     }
 
     if (m_deviceExtensions.supports(VK_EXT_HDR_METADATA_EXTENSION_NAME))
@@ -974,6 +1023,9 @@ namespace dxvk {
       m_deviceFeatures.extVertexAttributeDivisor.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT;
       m_deviceFeatures.extVertexAttributeDivisor.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.extVertexAttributeDivisor);
     }
+
+    if (m_deviceExtensions.supports(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME))
+      m_deviceFeatures.extCalibratedTimestamps = VK_TRUE;
 
     if (m_deviceExtensions.supports(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME))
       m_deviceFeatures.khrExternalMemoryWin32 = VK_TRUE;
@@ -1002,6 +1054,16 @@ namespace dxvk {
     if (m_deviceExtensions.supports(VK_KHR_PRESENT_WAIT_EXTENSION_NAME)) {
       m_deviceFeatures.khrPresentWait.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
       m_deviceFeatures.khrPresentWait.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrPresentWait);
+    }
+
+    if (m_deviceExtensions.supports(VK_KHR_PRESENT_ID_2_EXTENSION_NAME)) {
+      m_deviceFeatures.khrPresentId2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR;
+      m_deviceFeatures.khrPresentId2.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrPresentId2);
+    }
+
+    if (m_deviceExtensions.supports(VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME)) {
+      m_deviceFeatures.khrPresentWait2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR;
+      m_deviceFeatures.khrPresentWait2.pNext = std::exchange(m_deviceFeatures.core.pNext, &m_deviceFeatures.khrPresentWait2);
     }
 
     if (m_deviceExtensions.supports(VK_NV_DESCRIPTOR_POOL_OVERALLOCATION_EXTENSION_NAME)) {
@@ -1053,6 +1115,8 @@ namespace dxvk {
       &devExtensions.amdMemoryOverallocationBehaviour,
       &devExtensions.amdShaderFragmentMask,
       &devExtensions.extAttachmentFeedbackLoopLayout,
+      &devExtensions.extDynamicRenderingUnusedAttachments,
+      &devExtensions.extBorderColorSwizzle,
       &devExtensions.extConservativeRasterization,
       &devExtensions.extCustomBorderColor,
       &devExtensions.extDepthClipEnable,
@@ -1069,12 +1133,14 @@ namespace dxvk {
       &devExtensions.extNonSeamlessCubeMap,
       &devExtensions.extPageableDeviceLocalMemory,
       &devExtensions.extRobustness2,
+      &devExtensions.extSampleLocations,
       &devExtensions.extShaderModuleIdentifier,
       &devExtensions.extShaderStencilExport,
       &devExtensions.extSwapchainColorSpace,
-      &devExtensions.extSwapchainMaintenance1,
+      &devExtensions.khrSwapchainMaintenance1,
       &devExtensions.extTransformFeedback,
       &devExtensions.extVertexAttributeDivisor,
+      &devExtensions.extCalibratedTimestamps,
       &devExtensions.khrExternalMemoryWin32,
       &devExtensions.khrExternalSemaphoreWin32,
       &devExtensions.extLoadStoreOpNone,
@@ -1083,6 +1149,8 @@ namespace dxvk {
       &devExtensions.khrPipelineLibrary,
       &devExtensions.khrPresentId,
       &devExtensions.khrPresentWait,
+      &devExtensions.khrPresentId2,
+      &devExtensions.khrPresentWait2,
       &devExtensions.khrSwapchain,
       &devExtensions.khrSwapchainMutableFormat,
       &devExtensions.khrWin32KeyedMutex,
@@ -1117,6 +1185,16 @@ namespace dxvk {
     if (devExtensions.extAttachmentFeedbackLoopLayout) {
       enabledFeatures.extAttachmentFeedbackLoopLayout.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_FEATURES_EXT;
       enabledFeatures.extAttachmentFeedbackLoopLayout.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extAttachmentFeedbackLoopLayout);
+    }
+
+    if (devExtensions.extDynamicRenderingUnusedAttachments) {
+      enabledFeatures.extDynamicRenderingUnusedAttachments.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT;
+      enabledFeatures.extDynamicRenderingUnusedAttachments.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extDynamicRenderingUnusedAttachments);
+    }
+
+    if (devExtensions.extBorderColorSwizzle) {
+      enabledFeatures.extBorderColorSwizzle.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BORDER_COLOR_SWIZZLE_FEATURES_EXT;
+      enabledFeatures.extBorderColorSwizzle.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extBorderColorSwizzle);
     }
 
     if (devExtensions.extConservativeRasterization)
@@ -1188,6 +1266,9 @@ namespace dxvk {
       enabledFeatures.extRobustness2.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extRobustness2);
     }
 
+    if (devExtensions.extSampleLocations)
+      enabledFeatures.extSampleLocations = VK_TRUE;
+
     if (devExtensions.extShaderModuleIdentifier) {
       enabledFeatures.extShaderModuleIdentifier.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_MODULE_IDENTIFIER_FEATURES_EXT;
       enabledFeatures.extShaderModuleIdentifier.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extShaderModuleIdentifier);
@@ -1199,9 +1280,9 @@ namespace dxvk {
     if (devExtensions.extSwapchainColorSpace)
       enabledFeatures.extSwapchainColorSpace = VK_TRUE;
 
-    if (devExtensions.extSwapchainMaintenance1) {
-      enabledFeatures.extSwapchainMaintenance1.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT;
-      enabledFeatures.extSwapchainMaintenance1.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extSwapchainMaintenance1);
+    if (devExtensions.khrSwapchainMaintenance1) {
+      enabledFeatures.khrSwapchainMaintenance1.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR;
+      enabledFeatures.khrSwapchainMaintenance1.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrSwapchainMaintenance1);
     }
 
     if (devExtensions.extHdrMetadata)
@@ -1216,6 +1297,9 @@ namespace dxvk {
       enabledFeatures.extVertexAttributeDivisor.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT;
       enabledFeatures.extVertexAttributeDivisor.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.extVertexAttributeDivisor);
     }
+
+    if (devExtensions.extCalibratedTimestamps)
+      enabledFeatures.extCalibratedTimestamps = VK_TRUE;
 
     if (devExtensions.khrExternalMemoryWin32)
       enabledFeatures.khrExternalMemoryWin32 = VK_TRUE;
@@ -1244,6 +1328,16 @@ namespace dxvk {
     if (devExtensions.khrPresentWait) {
       enabledFeatures.khrPresentWait.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
       enabledFeatures.khrPresentWait.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrPresentWait);
+    }
+
+    if (devExtensions.khrPresentId2) {
+      enabledFeatures.khrPresentId2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR;
+      enabledFeatures.khrPresentId2.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrPresentId2);
+    }
+
+    if (devExtensions.khrPresentWait2) {
+      enabledFeatures.khrPresentWait2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_2_FEATURES_KHR;
+      enabledFeatures.khrPresentWait2.pNext = std::exchange(enabledFeatures.core.pNext, &enabledFeatures.khrPresentWait2);
     }
 
     if (devExtensions.khrSwapchainMutableFormat)
@@ -1345,6 +1439,11 @@ namespace dxvk {
       "\n  extension supported                    : " << (features.amdShaderFragmentMask ? "1" : "0") <<
       "\n" << VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME <<
       "\n  attachmentFeedbackLoopLayout           : " << (features.extAttachmentFeedbackLoopLayout.attachmentFeedbackLoopLayout ? "1" : "0") <<
+      "\n" << VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME <<
+      "\n  dynamicRenderingUnusedAttachments           : " << (features.extDynamicRenderingUnusedAttachments.dynamicRenderingUnusedAttachments ? "1" : "0") <<
+      "\n" << VK_EXT_BORDER_COLOR_SWIZZLE_EXTENSION_NAME <<
+      "\n  borderColorSwizzle                     : " << (features.extBorderColorSwizzle.borderColorSwizzle ? "1" : "0") <<
+      "\n  borderColorSwizzleFromImage            : " << (features.extBorderColorSwizzle.borderColorSwizzleFromImage ? "1" : "0") <<
       "\n" << VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME <<
       "\n  extension supported                    : " << (features.extConservativeRasterization ? "1" : "0") <<
       "\n" << VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME <<
@@ -1363,6 +1462,7 @@ namespace dxvk {
       "\n  extDynamicState3RasterizationSamples   : " << (features.extExtendedDynamicState3.extendedDynamicState3RasterizationSamples ? "1" : "0") <<
       "\n  extDynamicState3SampleMask             : " << (features.extExtendedDynamicState3.extendedDynamicState3SampleMask ? "1" : "0") <<
       "\n  extDynamicState3LineRasterizationMode  : " << (features.extExtendedDynamicState3.extendedDynamicState3LineRasterizationMode ? "1" : "0") <<
+      "\n  extDynamicState3SampleLocationsEnable  : " << (features.extExtendedDynamicState3.extendedDynamicState3SampleLocationsEnable ? "1" : "0") <<
       "\n" << VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME <<
       "\n  fragmentShaderSampleInterlock          : " << (features.extFragmentShaderInterlock.fragmentShaderSampleInterlock ? "1" : "0") <<
       "\n  fragmentShaderPixelInterlock           : " << (features.extFragmentShaderInterlock.fragmentShaderPixelInterlock ? "1" : "0") <<
@@ -1387,14 +1487,16 @@ namespace dxvk {
       "\n  robustBufferAccess2                    : " << (features.extRobustness2.robustBufferAccess2 ? "1" : "0") <<
       "\n  robustImageAccess2                     : " << (features.extRobustness2.robustImageAccess2 ? "1" : "0") <<
       "\n  nullDescriptor                         : " << (features.extRobustness2.nullDescriptor ? "1" : "0") <<
+      "\n" << VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME <<
+      "\n  extension supported                    : " << (features.extSampleLocations ? "1" : "0") <<
       "\n" << VK_EXT_SHADER_MODULE_IDENTIFIER_EXTENSION_NAME <<
       "\n  shaderModuleIdentifier                 : " << (features.extShaderModuleIdentifier.shaderModuleIdentifier ? "1" : "0") <<
       "\n" << VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME <<
       "\n  extension supported                    : " << (features.extShaderStencilExport ? "1" : "0") <<
       "\n" << VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME <<
       "\n  extension supported                    : " << (features.extSwapchainColorSpace ? "1" : "0") <<
-      "\n" << VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME <<
-      "\n  swapchainMaintenance1                  : " << (features.extSwapchainMaintenance1.swapchainMaintenance1 ? "1" : "0") <<
+      "\n" << VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME <<
+      "\n  swapchainMaintenance1                  : " << (features.khrSwapchainMaintenance1.swapchainMaintenance1 ? "1" : "0") <<
       "\n" << VK_EXT_HDR_METADATA_EXTENSION_NAME <<
       "\n  extension supported                    : " << (features.extHdrMetadata ? "1" : "0") <<
       "\n" << VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME <<
@@ -1403,6 +1505,8 @@ namespace dxvk {
       "\n" << VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME <<
       "\n  vertexAttributeInstanceRateDivisor     : " << (features.extVertexAttributeDivisor.vertexAttributeInstanceRateDivisor ? "1" : "0") <<
       "\n  vertexAttributeInstanceRateZeroDivisor : " << (features.extVertexAttributeDivisor.vertexAttributeInstanceRateZeroDivisor ? "1" : "0") <<
+      "\n" << VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME <<
+      "\n  extension supported                    : " << (features.extCalibratedTimestamps ? "1" : "0") <<
       "\n" << VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME <<
       "\n  extension supported                    : " << (features.khrExternalMemoryWin32 ? "1" : "0") <<
       "\n" << VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME <<
@@ -1417,6 +1521,10 @@ namespace dxvk {
       "\n  presentId                              : " << (features.khrPresentId.presentId ? "1" : "0") <<
       "\n" << VK_KHR_PRESENT_WAIT_EXTENSION_NAME <<
       "\n  presentWait                            : " << (features.khrPresentWait.presentWait ? "1" : "0") <<
+      "\n" << VK_KHR_PRESENT_ID_2_EXTENSION_NAME <<
+      "\n  presentId2                             : " << (features.khrPresentId2.presentId2 ? "1" : "0") <<
+      "\n" << VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME <<
+      "\n  presentWait2                           : " << (features.khrPresentWait2.presentWait2 ? "1" : "0") <<
       "\n" << VK_NV_DESCRIPTOR_POOL_OVERALLOCATION_EXTENSION_NAME <<
       "\n  descriptorPoolOverallocation           : " << (features.nvDescriptorPoolOverallocation.descriptorPoolOverallocation ? "1" : "0") <<
       "\n" << VK_NV_LOW_LATENCY_2_EXTENSION_NAME <<

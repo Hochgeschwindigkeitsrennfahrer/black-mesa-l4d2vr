@@ -10,22 +10,23 @@
 #include "../util/util_ratio.h"
 #include "../util/util_string.h"
 
-#include "../wsi/wsi_monitor.h"
-
 #include <cfloat>
 
 namespace dxvk {
 
   const char* GetDriverDLL(DxvkGpuVendor vendor) {
     switch (vendor) {
-      default:
       case DxvkGpuVendor::Nvidia: return "nvd3dum.dll";
 
 #if defined(__x86_64__) || defined(_M_X64)
+      default:
       case DxvkGpuVendor::Amd:    return "aticfx64.dll";
+
       case DxvkGpuVendor::Intel:  return "igdumd64.dll";
 #else
+      default:
       case DxvkGpuVendor::Amd:    return "aticfx32.dll";
+
       case DxvkGpuVendor::Intel:  return "igdumd32.dll";
 #endif
     }
@@ -34,6 +35,7 @@ namespace dxvk {
 
   D3D9Adapter::D3D9Adapter(
           D3D9InterfaceEx* pParent,
+    const D3D9ON12_ARGS*   p9On12Args,
           Rc<DxvkAdapter>  Adapter,
           UINT             Ordinal,
           UINT             DisplayIndex)
@@ -41,10 +43,17 @@ namespace dxvk {
     m_adapter         (Adapter),
     m_ordinal         (Ordinal),
     m_displayIndex    (DisplayIndex),
-    m_modeCacheFormat (D3D9Format::Unknown),
-    m_d3d9Formats     (Adapter, m_parent->GetOptions()) {
+    m_modeCacheFormat (D3D9Format::Unknown) {
     m_adapter->logAdapterInfo();
+    CacheIdentifierInfo();
+    // D3D9VkFormatTable needs to be constructed after we've cached the
+    // identifier info and determined the proper vendorID to be used.
+    m_d3d9Formats = std::make_unique<D3D9VkFormatTable>(this, Adapter, m_parent->GetOptions());
+
+    if (p9On12Args)
+      m_9On12Args = *p9On12Args;
   }
+
 
   template <size_t N>
   static void copyToStringArray(char (&dst)[N], const char* src) {
@@ -58,10 +67,6 @@ namespace dxvk {
     if (unlikely(pIdentifier == nullptr))
       return D3DERR_INVALIDCALL;
 
-    auto& options = m_parent->GetOptions();
-    
-    const auto& props = m_adapter->deviceProperties();
-
     WCHAR wideDisplayName[32] = { };
     if (!wsi::getDisplayName(wsi::getDefaultMonitor(), wideDisplayName)) {
       Logger::err("D3D9Adapter::GetAdapterIdentifier: Failed to query monitor info");
@@ -70,20 +75,13 @@ namespace dxvk {
 
     std::string displayName = str::fromws(wideDisplayName);
 
-    GUID guid          = bit::cast<GUID>(m_adapter->devicePropertiesExt().vk11.deviceUUID);
+    copyToStringArray(pIdentifier->Description, m_deviceDesc.c_str());
+    copyToStringArray(pIdentifier->DeviceName,  displayName.c_str());    // The GDI device name. Not the actual device name.
+    copyToStringArray(pIdentifier->Driver,      m_deviceDriver.c_str()); // This is the driver's dll.
 
-    uint32_t vendorId  = options.customVendorId == -1     ? props.vendorID   : uint32_t(options.customVendorId);
-    uint32_t deviceId  = options.customDeviceId == -1     ? props.deviceID   : uint32_t(options.customDeviceId);
-    const char*  desc  = options.customDeviceDesc.empty() ? props.deviceName : options.customDeviceDesc.c_str();
-    const char* driver = GetDriverDLL(DxvkGpuVendor(vendorId));
-
-    copyToStringArray(pIdentifier->Description, desc);
-    copyToStringArray(pIdentifier->DeviceName,  displayName.c_str()); // The GDI device name. Not the actual device name.
-    copyToStringArray(pIdentifier->Driver,      driver);            // This is the driver's dll.
-
-    pIdentifier->DeviceIdentifier       = guid;
-    pIdentifier->DeviceId               = deviceId;
-    pIdentifier->VendorId               = vendorId;
+    pIdentifier->DeviceIdentifier       = m_deviceGuid;
+    pIdentifier->DeviceId               = m_deviceId;
+    pIdentifier->VendorId               = m_vendorId;
     pIdentifier->Revision               = 0;
     pIdentifier->SubSysId               = 0;
     pIdentifier->WHQLLevel              = m_parent->IsExtended() ? 1 : 0; // This doesn't check with the driver on Direct3D9Ex and is always 1.
@@ -123,52 +121,110 @@ namespace dxvk {
     if (!IsSupportedAdapterFormat(AdapterFormat))
       return D3DERR_NOTAVAILABLE;
 
-    const bool dmap = Usage & D3DUSAGE_DMAP;
+    const bool isD3D8Compatible = m_parent->IsD3D8Compatible();
+    const bool isNvidia         = m_vendorId == uint32_t(DxvkGpuVendor::Nvidia);
+    const bool isAmd            = m_vendorId == uint32_t(DxvkGpuVendor::Amd);
+
     const bool rt   = Usage & D3DUSAGE_RENDERTARGET;
     const bool ds   = Usage & D3DUSAGE_DEPTHSTENCIL;
 
-    const bool surface = RType == D3DRTYPE_SURFACE;
-    const bool texture = RType == D3DRTYPE_TEXTURE;
+    const bool surface       = RType == D3DRTYPE_SURFACE;
+    const bool texture       = RType == D3DRTYPE_TEXTURE;
+    const bool volumeTexture = RType == D3DRTYPE_VOLUMETEXTURE;
 
     const bool twoDimensional = surface || texture;
 
-    const bool srgb = (Usage & (D3DUSAGE_QUERY_SRGBREAD | D3DUSAGE_QUERY_SRGBWRITE)) != 0;
+    const bool isDepthStencilFormat = IsDepthStencilFormat(CheckFormat);
+    const bool isLockableDepthStencilFormat = IsLockableDepthStencilFormat(CheckFormat);
 
-    if (CheckFormat == D3D9Format::INST)
-      return D3D_OK;
-
-    if (rt && CheckFormat == D3D9Format::A8 && m_parent->GetOptions().disableA8RT)
+    if (ds && !isDepthStencilFormat)
       return D3DERR_NOTAVAILABLE;
 
-    if (ds && !IsDepthStencilFormat(CheckFormat))
+    // Offscreen plain surfaces must only use lockable depth stencil formats
+    if (surface && !(rt || ds) && isDepthStencilFormat && !isLockableDepthStencilFormat)
       return D3DERR_NOTAVAILABLE;
 
-    if (rt && CheckFormat == D3D9Format::NULL_FORMAT && twoDimensional)
+    // Volume textures can not be used as render targets
+    if (rt && volumeTexture)
+      return D3DERR_NOTAVAILABLE;
+
+    auto& options = m_parent->GetOptions();
+
+    if (unlikely(rt && CheckFormat == D3D9Format::A8 && options.disableA8RT))
+      return D3DERR_NOTAVAILABLE;
+
+    // NULL RT format hack (supported across all
+    // vendors, and also advertised in D3D8)
+    if (unlikely(rt && CheckFormat == D3D9Format::NULL_FORMAT && twoDimensional))
       return D3D_OK;
 
-    if (rt && CheckFormat == D3D9Format::RESZ && surface)
-      return D3D_OK;
-
-    if (CheckFormat == D3D9Format::ATOC && surface)
-      return D3D_OK;
-
-    if (CheckFormat == D3D9Format::NVDB && surface)
-      return m_adapter->features().core.features.depthBounds
+    // AMD/Intel's driver hack for RESZ
+    // (also advertised in D3D8 by AMD drivers,
+    // not advertised at all by modern Intel drivers)
+    if (unlikely(rt && CheckFormat == D3D9Format::RESZ && surface))
+      return isAmd
         ? D3D_OK
         : D3DERR_NOTAVAILABLE;
 
-    // I really don't want to support this...
-    if (dmap)
+    // Nvidia/Intel's driver hack for ATOC
+    if (unlikely(CheckFormat == D3D9Format::ATOC && surface))
+      return (!isD3D8Compatible && !isAmd)
+        ? D3D_OK
+        : D3DERR_NOTAVAILABLE;
+
+    // Nvidia's driver hack for SSAA (supported on Nvidia
+    // drivers, ever since the GeForce 6 series)
+    if (unlikely(CheckFormat == D3D9Format::SSAA && surface)) {
+      if (!isD3D8Compatible && isNvidia)
+        Logger::warn("D3D9Adapter::CheckDeviceFormat: Transparency supersampling (SSAA) is unsupported");
+      return D3DERR_NOTAVAILABLE;
+    }
+
+    // Nvidia specific depth bounds test hack
+    // (supported ever since the GeForce 6 series)
+    if (unlikely(CheckFormat == D3D9Format::NVDB && surface))
+      return (!isD3D8Compatible &&
+              m_adapter->features().core.features.depthBounds && isNvidia)
+        ? D3D_OK
+        : D3DERR_NOTAVAILABLE;
+
+    // AMD specific render to vertex buffer hack
+    // (not supported on modern AMD drivers)
+    if (unlikely(CheckFormat == D3D9Format::R2VB && surface)) {
+      if (!isD3D8Compatible && isAmd)
+        Logger::info("D3D9Adapter::CheckDeviceFormat: Render to vertex buffer (R2VB) is unsupported");
+      return D3DERR_NOTAVAILABLE;
+    }
+
+    // AMD specific INST (geometry instancing)
+    // hack for SM2-only capable cards
+    if (unlikely(CheckFormat == D3D9Format::INST && surface))
+      return (!isD3D8Compatible && isAmd)
+        ? D3D_OK
+        : D3DERR_NOTAVAILABLE;
+
+    // AMD/Nvidia CENT(roid) hack (not advertised
+    // by either AMD or Nvidia drivers)
+    if (unlikely(CheckFormat == D3D9Format::CENT && surface))
       return D3DERR_NOTAVAILABLE;
 
-    auto mapping = m_d3d9Formats.GetFormatMapping(CheckFormat);
+    // I really don't want to support this...
+    if (unlikely(Usage & D3DUSAGE_DMAP)) {
+      Logger::warn("D3D9Adapter::CheckDeviceFormat: D3DUSAGE_DMAP is unsupported");
+      return D3DERR_NOTAVAILABLE;
+    }
+
+    auto mapping = GetFormatMapping(CheckFormat);
     if (mapping.FormatColor == VK_FORMAT_UNDEFINED)
       return D3DERR_NOTAVAILABLE;
+
+    const bool srgb = (Usage & (D3DUSAGE_QUERY_SRGBREAD | D3DUSAGE_QUERY_SRGBWRITE)) != 0;
 
     if (mapping.FormatSrgb  == VK_FORMAT_UNDEFINED && srgb)
       return D3DERR_NOTAVAILABLE;
 
-    if (RType == D3DRTYPE_CUBETEXTURE && mapping.Aspect != VK_IMAGE_ASPECT_COLOR_BIT)
+    if (RType == D3DRTYPE_CUBETEXTURE && mapping.Aspect != VK_IMAGE_ASPECT_COLOR_BIT
+     && !options.supportCubeDepthFormats)
       return D3DERR_NOTAVAILABLE;
 
     // Let's actually ask Vulkan now that we got some quirks out the way!
@@ -176,6 +232,7 @@ namespace dxvk {
     if (unlikely(mapping.ConversionFormatInfo.FormatColor != VK_FORMAT_UNDEFINED)) {
       format = mapping.ConversionFormatInfo.FormatColor;
     }
+
     return CheckDeviceVkFormat(format, Usage, RType);
   }
 
@@ -200,9 +257,9 @@ namespace dxvk {
       return D3DERR_NOTAVAILABLE;
 
     if (MultiSampleType != D3DMULTISAMPLE_NONE
-     && (SurfaceFormat == D3D9Format::D32_LOCKABLE
+     && (SurfaceFormat == D3D9Format::D16_LOCKABLE
       || SurfaceFormat == D3D9Format::D32F_LOCKABLE
-      || SurfaceFormat == D3D9Format::D16_LOCKABLE
+      || SurfaceFormat == D3D9Format::D32_LOCKABLE
       || SurfaceFormat == D3D9Format::INTZ
       || SurfaceFormat == D3D9Format::DXT1
       || SurfaceFormat == D3D9Format::DXT2
@@ -216,7 +273,7 @@ namespace dxvk {
     // Check if this is a power of two...
     if (sampleCount & (sampleCount - 1))
       return D3DERR_NOTAVAILABLE;
-    
+
     // Therefore...
     VkSampleCountFlags sampleFlags = VkSampleCountFlags(sampleCount);
 
@@ -339,7 +396,7 @@ namespace dxvk {
                                     | D3DPRESENT_INTERVAL_FOUR
                                     | D3DPRESENT_INTERVAL_IMMEDIATE;
     // Cursor
-    pCaps->CursorCaps               = D3DCURSORCAPS_COLOR; // I do not support Cursor yet, but I don't want to say I don't support it for compatibility reasons.
+    pCaps->CursorCaps               = D3DCURSORCAPS_COLOR;
     // Dev Caps
     pCaps->DevCaps                  = D3DDEVCAPS_EXECUTESYSTEMMEMORY
                                     | D3DDEVCAPS_EXECUTEVIDEOMEMORY
@@ -609,7 +666,7 @@ namespace dxvk {
     pCaps->MaxNpatchTessellationLevel = 0.0f;
     // Reserved for... something
     pCaps->Reserved5                  = 0;
-    // Master adapter for us is adapter 0, atm... 
+    // Master adapter for us is adapter 0, atm...
     pCaps->MasterAdapterOrdinal       = 0;
     // The group of adapters this one is in
     pCaps->AdapterOrdinalInGroup      = 0;
@@ -737,7 +794,10 @@ namespace dxvk {
   HRESULT D3D9Adapter::GetAdapterDisplayModeEx(
           D3DDISPLAYMODEEX*   pMode,
           D3DDISPLAYROTATION* pRotation) {
-    if (pMode == nullptr)
+    if (unlikely(pMode == nullptr))
+      return D3DERR_INVALIDCALL;
+
+    if (unlikely(pMode->Size != sizeof(D3DDISPLAYMODEEX)))
       return D3DERR_INVALIDCALL;
 
     if (pRotation != nullptr)
@@ -767,6 +827,16 @@ namespace dxvk {
       *pLUID = dxvk::GetAdapterLUID(m_ordinal);
 
     return D3D_OK;
+  }
+
+
+  bool D3D9Adapter::IsExtended() const {
+    return m_parent->IsExtended();
+  }
+
+
+  bool D3D9Adapter::IsD3D8Compatible() const {
+    return m_parent->IsD3D8Compatible();
   }
 
 
@@ -818,10 +888,64 @@ namespace dxvk {
     m_modeCacheFormat = Format;
 
     // Skip unsupported formats
-    if (!IsSupportedAdapterFormat(Format))
+    if (!IsSupportedModeFormat(Format))
       return;
 
     auto& options = m_parent->GetOptions();
+
+    // Filter the modes considering the config option filters.
+    FilterModesByFormat(Format, true);
+
+    // If no modes are returned based on the previous filtered
+    // search, then fall back to an unfiltered search.
+    if (unlikely((!options.forceAspectRatio.empty()
+                || options.forceRefreshRate
+                || options.modeCountCompatibility) && !m_modes.size())) {
+      Logger::warn("D3D9Adapter::CacheModes: No modes were found. Discarding filters.");
+      FilterModesByFormat(Format, false);
+    }
+
+    // Sort display modes by width, height and refresh rate (descending), in that order.
+    // Some games rely on correct ordering, e.g. Prince of Persia (2008) expects the highest
+    // refresh rate to be listed first for a particular resolution.
+    std::sort(m_modes.begin(), m_modes.end(),
+      [](const D3DDISPLAYMODEEX& a, const D3DDISPLAYMODEEX& b) {
+        if (a.Width < b.Width)   return true;
+        if (a.Width > b.Width)   return false;
+
+        if (a.Height < b.Height) return true;
+        if (a.Height > b.Height) return false;
+
+        return a.RefreshRate > b.RefreshRate;
+    });
+  }
+
+
+  void D3D9Adapter::FilterModesByFormat(
+       D3D9Format Format,
+       const bool ApplyOptionsFilters) {
+    auto& options = m_parent->GetOptions();
+
+    const auto forcedRatio = Ratio<DWORD>(options.forceAspectRatio);
+
+    wsi::WsiMode currentMode = { };
+    wsi::WsiMode currentCompatibleMode = { };
+
+    if (options.modeCountCompatibility) {
+      wsi::getDesktopDisplayMode(wsi::getDefaultMonitor(), &currentMode);
+
+      if (likely(currentMode.width)) {
+        // Skip checking the compabilitiy refresh rate (60 Hz),
+        // if that's equal to the current desktop refresh rate.
+        if (currentMode.refreshRate.numerator / currentMode.refreshRate.denominator != 60) {
+          currentCompatibleMode = currentMode;
+          currentCompatibleMode.refreshRate.numerator = 60;
+          currentCompatibleMode.refreshRate.denominator = 1;
+        }
+      } else {
+        Logger::err("D3D9Adapter::CacheModes: Failed to determine desktop display mode");
+      }
+    }
 
     // Walk over all modes that the display supports and
     // return those that match the requested format etc.
@@ -829,10 +953,8 @@ namespace dxvk {
 
     uint32_t modeIndex = 0;
 
-    const auto forcedRatio = Ratio<DWORD>(options.forceAspectRatio);
-
     while (wsi::getDisplayMode(wsi::getDefaultMonitor(), modeIndex++, &devMode)) {
-      // Skip interlaced modes altogether
+      // Skip inauto& options = m_parent->GetOptions();terlaced modes altogether
       if (devMode.interlaced)
         continue;
 
@@ -840,7 +962,21 @@ namespace dxvk {
       if (devMode.bitsPerPixel != GetMonitorFormatBpp(Format))
         continue;
 
-      if (!forcedRatio.undefined() && Ratio<DWORD>(devMode.width, devMode.height) != forcedRatio)
+      if (!forcedRatio.undefined() &&
+          ApplyOptionsFilters &&
+          Ratio<DWORD>(devMode.width, devMode.height) != forcedRatio)
+        continue;
+
+      if (options.forceRefreshRate &&
+          ApplyOptionsFilters &&
+          devMode.refreshRate.numerator / devMode.refreshRate.denominator != options.forceRefreshRate)
+        continue;
+
+      if (options.modeCountCompatibility &&
+          ApplyOptionsFilters &&
+          !IsEquivalentMode(devMode, currentMode) &&
+          (!currentCompatibleMode.width || !IsEquivalentMode(devMode, currentCompatibleMode)) &&
+          !IsCountCompatibleMode(devMode))
         continue;
 
       D3DDISPLAYMODEEX mode = ConvertDisplayMode(devMode);
@@ -851,19 +987,79 @@ namespace dxvk {
         m_modes.push_back(mode);
     }
 
-    // Sort display modes by width, height and refresh rate (descending), in that order.
-    // Some games rely on correct ordering, e.g. Prince of Persia (2008) expects the highest
-    // refresh rate to be listed first for a particular resolution.
-    std::sort(m_modes.begin(), m_modes.end(),
-      [](const D3DDISPLAYMODEEX& a, const D3DDISPLAYMODEEX& b) {
-        if (a.Width < b.Width)   return true;
-        if (a.Width > b.Width)   return false;
-        
-        if (a.Height < b.Height) return true;
-        if (a.Height > b.Height) return false;
-        
-        return b.RefreshRate < a.RefreshRate;
-    });
+  }
+
+
+  void D3D9Adapter::CacheIdentifierInfo() {
+    auto& options = m_parent->GetOptions();
+
+    const auto& props = m_adapter->deviceProperties();
+
+    m_deviceGuid   = bit::cast<GUID>(m_adapter->devicePropertiesExt().vk11.deviceUUID);
+    m_vendorId     = props.vendorID;
+    m_deviceId     = props.deviceID;
+    m_deviceDesc   = props.deviceName;
+
+    // Custom Vendor ID / Device ID / Device Description
+    if (options.customVendorId >= 0)
+      m_vendorId = uint32_t(options.customVendorId);
+
+    if (options.customDeviceId >= 0)
+      m_deviceId = uint32_t(options.customDeviceId);
+
+    if (!options.customDeviceDesc.empty())
+      m_deviceDesc = options.customDeviceDesc;
+
+    if (options.customVendorId < 0) {
+      bool isNonclassicalVendorId = m_vendorId != uint32_t(DxvkGpuVendor::Nvidia) &&
+                                    m_vendorId != uint32_t(DxvkGpuVendor::Amd) &&
+                                    m_vendorId != uint32_t(DxvkGpuVendor::Intel);
+
+      if (isNonclassicalVendorId)
+        Logger::info(str::format("D3D9: Detected nonclassical vendor ID: 0x", std::hex, m_vendorId));
+
+      uint32_t     fallbackVendor = 0xdead;
+      uint32_t     fallbackDevice = 0xbeef;
+      const char*  fallbackDesc   = "Generic Graphics Card";
+
+      if (!options.hideAmdGpu) {
+        // AMD RX 6700 XT
+        fallbackVendor = uint32_t(DxvkGpuVendor::Amd);
+        fallbackDevice = 0x73df;
+        fallbackDesc   = "AMD Radeon RX 6700 XT";
+      } else if (!options.hideNvidiaGpu) {
+        // Nvidia RTX 3060
+        fallbackVendor = uint32_t(DxvkGpuVendor::Nvidia);
+        fallbackDevice = 0x2487;
+        fallbackDesc   = "NVIDIA GeForce RTX 3060";
+      }
+
+      bool hideNvidiaGpu = m_adapter->devicePropertiesExt().vk12.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY
+        ? options.hideNvidiaGpu : options.hideNvkGpu;
+
+      bool hideGpu = (m_vendorId == uint32_t(DxvkGpuVendor::Nvidia) && hideNvidiaGpu)
+                  || (m_vendorId == uint32_t(DxvkGpuVendor::Amd) && options.hideAmdGpu)
+                  || (m_vendorId == uint32_t(DxvkGpuVendor::Intel) && options.hideIntelGpu)
+                  // Hide the GPU by default for other vendors (default to reporting AMD)
+                  || isNonclassicalVendorId;
+
+      if (hideGpu) {
+        m_vendorId = fallbackVendor;
+
+        if (options.customDeviceId < 0)
+          m_deviceId = fallbackDevice;
+
+        if (options.customDeviceDesc.empty())
+          m_deviceDesc = fallbackDesc;
+
+        Logger::info(str::format("D3D9: Hiding actual GPU, reporting:\n",
+                                 "  vendor ID: 0x", std::hex, m_vendorId, "\n",
+                                 "  device ID: 0x", std::hex, m_deviceId, "\n",
+                                 "  device description: ", m_deviceDesc, "\n"));
+      }
+    }
+
+    m_deviceDriver = GetDriverDLL(DxvkGpuVendor(m_vendorId));
   }
 
 }

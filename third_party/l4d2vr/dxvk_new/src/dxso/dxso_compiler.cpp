@@ -229,7 +229,6 @@ namespace dxvk {
     info.bindings = m_bindings.data();
     info.inputMask = m_inputMask;
     info.outputMask = m_outputMask;
-    info.pushConstStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     info.pushConstSize = sizeof(D3D9RenderStateInfo);
 
     if (m_programInfo.type() == DxsoProgramTypes::PixelShader)
@@ -306,12 +305,13 @@ namespace dxvk {
     m_module.decorateDescriptorSet(m_cBuffer, 0);
     m_module.decorateBinding(m_cBuffer, bindingId);
 
-    DxvkBindingInfo binding = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    binding.resourceBinding = bindingId;
-    binding.viewType        = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    auto& binding = m_bindings.emplace_back();
+    binding.set             = 0u;
+    binding.binding         = bindingId;
+    binding.resourceIndex   = bindingId;
+    binding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     binding.access          = VK_ACCESS_UNIFORM_READ_BIT;
-    binding.uboSet          = VK_TRUE;
-    m_bindings.push_back(binding);
+    binding.flags.set(DxvkDescriptorFlag::UniformBuffer);
   }
 
   template<DxsoConstantBufferType ConstantBufferType>
@@ -393,17 +393,17 @@ namespace dxvk {
     if (asSsbo)
       m_module.decorate(constantBufferId, spv::DecorationNonWritable);
 
-    DxvkBindingInfo binding = { };
+    auto& binding = m_bindings.emplace_back();
+    binding.set             = 0u;
+    binding.binding         = bindingId;
+    binding.resourceIndex   = bindingId;
     binding.descriptorType  = asSsbo
       ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
       : VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    binding.resourceBinding = bindingId;
-    binding.viewType        = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
     binding.access          = asSsbo
       ? VK_ACCESS_SHADER_READ_BIT
       : VK_ACCESS_UNIFORM_READ_BIT;
-    binding.uboSet          = VK_TRUE;
-    m_bindings.push_back(binding);
+    binding.flags.set(DxvkDescriptorFlag::UniformBuffer);
 
     return constantBufferId;
   }
@@ -484,12 +484,13 @@ namespace dxvk {
     m_module.decorateDescriptorSet(m_ps.sharedState, 0);
     m_module.decorateBinding(m_ps.sharedState, bindingId);
 
-    DxvkBindingInfo binding = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    binding.resourceBinding = bindingId;
-    binding.viewType        = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    auto& binding = m_bindings.emplace_back();
+    binding.set             = 0u;
+    binding.binding         = bindingId;
+    binding.resourceIndex   = bindingId;
+    binding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     binding.access          = VK_ACCESS_UNIFORM_READ_BIT;
-    binding.uboSet          = VK_TRUE;
-    m_bindings.push_back(binding);
+    binding.flags.set(DxvkDescriptorFlag::UniformBuffer);
   }
 
 
@@ -784,11 +785,13 @@ namespace dxvk {
     m_samplers[idx].type = type;
 
     // Store descriptor info for the shader interface
-    DxvkBindingInfo bindingInfo = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER };
-    bindingInfo.resourceBinding = binding;
+    auto& bindingInfo = m_bindings.emplace_back();
+    bindingInfo.set             = 0u;
+    bindingInfo.binding         = binding;
+    bindingInfo.resourceIndex   = binding;
+    bindingInfo.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     bindingInfo.viewType        = implicit ? VK_IMAGE_VIEW_TYPE_MAX_ENUM : viewType;
     bindingInfo.access          = VK_ACCESS_SHADER_READ_BIT;
-    m_bindings.push_back(bindingInfo);
   }
 
 
@@ -1795,7 +1798,7 @@ namespace dxvk {
     for (uint32_t i = 0; i < 4; i++)
       constant.float32[i] = data[i];
     m_constants.push_back(constant);
-    m_maxDefinedConstant = std::max(constant.uboIdx, m_maxDefinedConstant);
+    m_maxDefinedFloatConstant = std::max(static_cast<int32_t>(constant.uboIdx), m_maxDefinedFloatConstant);
   }
 
   void DxsoCompiler::emitDefI(const DxsoInstructionContext& ctx) {
@@ -1806,6 +1809,8 @@ namespace dxvk {
 
     std::string name = str::format("cI", ctx.dst.id.num, "_def");
     m_module.setDebugName(constId, name.c_str());
+
+    m_maxDefinedIntConstant = std::max(static_cast<int32_t>(ctx.dst.id.num), m_maxDefinedIntConstant);
   }
 
   void DxsoCompiler::emitDefB(const DxsoInstructionContext& ctx) {
@@ -1816,6 +1821,8 @@ namespace dxvk {
 
     std::string name = str::format("cB", ctx.dst.id.num, "_def");
     m_module.setDebugName(constId, name.c_str());
+
+    m_maxDefinedBoolConstant = std::max(static_cast<int32_t>(ctx.dst.id.num), m_maxDefinedBoolConstant);
   }
 
 
@@ -2114,11 +2121,17 @@ namespace dxvk {
         std::array<uint32_t, 4> sincosVectorIndices = { 0, 0, 0, 0 };
 
         uint32_t index = 0;
+        uint32_t type = m_module.defFloatType(32);
+        uint32_t sincos = m_module.opSinCos(src0, !m_moduleInfo.options.sincosEmulation);
+
+        uint32_t sinIndex = 0u;
+        uint32_t cosIndex = 1u;
+
         if (mask[0])
-          sincosVectorIndices[index++] = m_module.opCos(scalarTypeId, src0);
+          sincosVectorIndices[index++] = m_module.opCompositeExtract(type, sincos, 1u, &cosIndex);
 
         if (mask[1])
-          sincosVectorIndices[index++] = m_module.opSin(scalarTypeId, src0);
+          sincosVectorIndices[index++] = m_module.opCompositeExtract(type, sincos, 1u, &sinIndex);
 
         for (; index < result.type.ccount; index++) {
           if (sincosVectorIndices[index] == 0)
@@ -2718,7 +2731,7 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       uint32_t projResult = m_module.opVectorTimesScalar(texcoord_t, coord.id, projScalar);
 
       if (switchProjRes) {
-        uint32_t shouldProj = m_spec.get(m_module, m_specUbo, SpecProjectionType, samplerIdx, 1);
+        uint32_t shouldProj = m_spec.get(m_module, m_specUbo, SpecSamplerProjected, samplerIdx, 1);
         shouldProj = m_module.opINotEqual(bool_t, shouldProj, m_module.constu32(0));
 
         uint32_t bvec4_t = m_module.defVectorType(bool_t, 4);
@@ -2898,19 +2911,26 @@ void DxsoCompiler::emitControlFlowGenericLoop(
 
       uint32_t reference = 0;
       if (depth) {
+        uint32_t uiType = m_module.defIntType(32, false);
         uint32_t fType = m_module.defFloatType(32);
         uint32_t component = sampler.dimensions;
         reference = m_module.opCompositeExtract(
           fType, texcoordVar.id, 1, &component);
 
         // [D3D8] Scale Dref from [0..(2^N - 1)] for D24S8 and D16 if Dref scaling is enabled
-        if (m_moduleInfo.options.drefScaling) {
-          uint32_t drefScale       = m_module.constf32(GetDrefScaleFactor(m_moduleInfo.options.drefScaling));
-          reference                = m_module.opFMul(fType, reference, drefScale);
-        }
+        uint32_t drefScaleShift = m_spec.get(m_module, m_specUbo, SpecDrefScaling);
+        uint32_t drefScale      = m_module.opShiftLeftLogical(uiType, m_module.constu32(1), drefScaleShift);
+        drefScale               = m_module.opConvertUtoF(fType, drefScale);
+        drefScale               = m_module.opFSub(fType, drefScale, m_module.constf32(1.0f));
+        drefScale               = m_module.opFDiv(fType, m_module.constf32(1.0f), drefScale);
+        reference               = m_module.opSelect(fType,
+          m_module.opINotEqual(bool_t, drefScaleShift, m_module.constu32(0)),
+          m_module.opFMul(fType, reference, drefScale),
+          reference
+        );
 
         // Clamp Dref to [0..1] for D32F emulating UNORM textures 
-        uint32_t clampDref = m_spec.get(m_module, m_specUbo, SpecDrefClamp, samplerIdx, 1);
+        uint32_t clampDref = m_spec.get(m_module, m_specUbo, SpecSamplerDrefClamp, samplerIdx, 1);
         clampDref = m_module.opINotEqual(bool_t, clampDref, m_module.constu32(0));
         uint32_t clampedDref = m_module.opFClamp(fType, reference, m_module.constf32(0.0f), m_module.constf32(1.0f));
         reference = m_module.opSelect(fType, clampDref, clampedDref, reference);
@@ -2918,7 +2938,7 @@ void DxsoCompiler::emitControlFlowGenericLoop(
 
       uint32_t fetch4 = 0;
       if (m_programInfo.type() == DxsoProgramType::PixelShader && samplerType != SamplerTypeTexture3D) {
-        fetch4 = m_spec.get(m_module, m_specUbo, SpecFetch4, samplerIdx, 1);
+        fetch4 = m_spec.get(m_module, m_specUbo, SpecSamplerFetch4, samplerIdx, 1);
 
         fetch4 = m_module.opINotEqual(bool_t, fetch4, m_module.constu32(0));
 
@@ -3282,11 +3302,9 @@ void DxsoCompiler::emitControlFlowGenericLoop(
         mask = DxsoRegMask(true, true, true, true);
 
       std::array<uint32_t, 4> indices = { 0, 1, 2, 3 };
-      uint32_t count = 0;
       for (uint32_t i = 0; i < 4; i++) {
         if (mask[i]) {
           indices[i] = i + 4;
-          count++;
         }
       }
 
@@ -3309,18 +3327,32 @@ void DxsoCompiler::emitControlFlowGenericLoop(
 
 
   void DxsoCompiler::emitLinkerOutputSetup() {
-    bool outputtedColor0 = false;
-    bool outputtedColor1 = false;
+    std::array<bool, 2> outputtedColor = {};
+    std::array<bool, 8> outputtedTexcoords = {};
+    bool outputtedNormals = false;
 
     for (uint32_t i = 0; i < m_osgn.elemCount; i++) {
       const auto& elem = m_osgn.elems[i];
       const uint32_t slot = elem.slot;
 
-      if (elem.semantic.usage == DxsoUsage::Color) {
-        if (elem.semantic.usageIndex == 0)
-          outputtedColor0 = true;
-        else
-          outputtedColor1 = true;
+      switch (elem.semantic.usage) {
+        case DxsoUsage::Color:
+          if (elem.semantic.usageIndex < outputtedColor.size()) {
+            outputtedColor[elem.semantic.usageIndex] = true;
+          }
+          break;
+
+        case DxsoUsage::Normal:
+          outputtedNormals = true;
+          break;
+
+
+        case DxsoUsage::Texcoord:
+          if (elem.semantic.usageIndex < outputtedTexcoords.size()) {
+            outputtedTexcoords[elem.semantic.usageIndex] = true;
+          }
+          break;
+        default: break; // Silence GCC warnings
       }
       
       DxsoRegisterInfo info;
@@ -3432,16 +3464,21 @@ void DxsoCompiler::emitControlFlowGenericLoop(
     auto OutputDefault = [&](DxsoSemantic semantic) {
       DxsoRegisterInfo info;
       info.type.ctype   = DxsoScalarType::Float32;
-      info.type.ccount  = 4;
+      info.type.ccount  = semantic.usage != DxsoUsage::Fog ? 4 : 1;
       info.type.alength = 1;
       info.sclass       = spv::StorageClassOutput;
 
       uint32_t slot = RegisterLinkerSlot(semantic);
 
-      uint32_t value = semantic == DxsoSemantic{ DxsoUsage::Color, 0 }
-        ? m_module.constvec4f32(1.0f, 1.0f, 1.0f, 1.0f)
-        : m_module.constvec4f32(0.0f, 0.0f, 0.0f, 0.0f);
+      uint32_t value;
 
+      if (semantic == DxsoSemantic{ DxsoUsage::Color, 0 }) {
+        value = m_module.constvec4f32(1.0f, 1.0f, 1.0f, 1.0f);
+      } else if (semantic == DxsoSemantic{ DxsoUsage::Fog, 0}) {
+        value = m_module.constf32(0.0);
+      } else {
+        value = m_module.constvec4f32(0.0f, 0.0f, 0.0f, 0.0f);
+      }
 
       uint32_t outputPtr = emitNewVariableDefault(info, value);
 
@@ -3455,11 +3492,30 @@ void DxsoCompiler::emitControlFlowGenericLoop(
       m_outputMask |= 1u << slot;
     };
 
-    if (!outputtedColor0)
-      OutputDefault(DxsoSemantic{ DxsoUsage::Color, 0 });
-
-    if (!outputtedColor1)
-      OutputDefault(DxsoSemantic{ DxsoUsage::Color, 1 });
+    if (m_programInfo.majorVersion() == 3) {
+      // Assume that shader model 3 vertex shaders hardly ever get mixed with fixed function pixel processing
+      // If they do, the backend handles it. Color 0 is the exception because that needs a different value.
+      if (!outputtedColor[0]) {
+        OutputDefault(DxsoSemantic{ DxsoUsage::Color, 0 });
+      }
+    } else {
+      // Emit the outputs that fixed function expects but the shader didn't emit itself.
+      // This avoids SPIR-V patching in the backend which would disable fast linked pipelines.
+      for (uint32_t i = 0; i < outputtedColor.size(); i++) {
+        if (outputtedColor[i]) continue;
+        OutputDefault(DxsoSemantic{ DxsoUsage::Color, i });
+      }
+      for (uint32_t i = 0; i < outputtedTexcoords.size(); i++) {
+        if (outputtedTexcoords[i]) continue;
+        OutputDefault(DxsoSemantic{ DxsoUsage::Texcoord, i });
+      }
+      if (!outputtedNormals) {
+        OutputDefault(DxsoSemantic{ DxsoUsage::Normal, 0 });
+      }
+      if (m_fog.id == 0) {
+        OutputDefault(DxsoSemantic{ DxsoUsage::Fog, 0 });
+      }
+    }
 
     auto pointInfo = GetPointSizeInfoVS(m_spec, m_module, m_vs.oPos.id, 0, 0, m_rsBlock, m_specUbo, false);
 
@@ -3508,13 +3564,14 @@ void DxsoCompiler::emitControlFlowGenericLoop(
     m_module.setDebugName         (clipPlaneBlock, "clip_info");
     m_module.decorateDescriptorSet(clipPlaneBlock, 0);
     m_module.decorateBinding      (clipPlaneBlock, bindingId);
-    
-    DxvkBindingInfo binding = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    binding.resourceBinding = bindingId;
-    binding.viewType        = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+
+    auto& binding = m_bindings.emplace_back();
+    binding.set             = 0u;
+    binding.binding         = bindingId;
+    binding.resourceIndex   = bindingId;
+    binding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     binding.access          = VK_ACCESS_UNIFORM_READ_BIT;
-    binding.uboSet          = VK_TRUE;
-    m_bindings.push_back(binding);
+    binding.flags.set(DxvkDescriptorFlag::UniformBuffer);
 
     // Declare output array for clip distances
     uint32_t clipDistArray = m_module.newVar(

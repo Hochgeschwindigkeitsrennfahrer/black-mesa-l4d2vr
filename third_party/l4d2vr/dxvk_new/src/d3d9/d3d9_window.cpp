@@ -66,10 +66,6 @@ namespace dxvk
       D3DDEVICE_CREATION_PARAMETERS create_parms;
       device->GetCreationParameters(&create_parms);
 
-      // Stock DXVK exclusive-fullscreen helper: minimize on alt-tab, then
-      // SetWindowPos to the desktop on restore. With SteamVR + forced windowed
-      // BM that cycle left WaitGetPoses running at ~15 Hz and crashed after
-      // repeated tab-outs (bmvr_log 2026-08-16, still eL=0, no device Reset).
       if (!vrSession && !(create_parms.BehaviorFlags & D3DCREATE_NOWINDOWCHANGES)) {
         D3D9WindowMessageFilter filter(window);
         if (wparam && !windowData.activateProcessed) {
@@ -82,14 +78,16 @@ namespace dxvk
           SetWindowPos(window, nullptr, rect.left, rect.top, params.BackBufferWidth, params.BackBufferHeight,
                        SWP_NOACTIVATE | SWP_NOZORDER);
         }
-        else if (!wparam && IsWindowVisible(window)) {
-          ShowWindow(window, SW_MINIMIZE);
+        else if (!wparam) {
+          if (IsWindowVisible(window))
+            ShowWindow(window, SW_MINIMIZE);
         }
       }
 
       if ((wparam && !windowData.activateProcessed)
-       || (!wparam && !windowData.deactivateProcessed))
+        || (!wparam && !windowData.deactivateProcessed)) {
         device->NotifyWindowActivated(window, wparam);
+      }
 
       SetActivateProcessed(window, !!wparam);
     }
@@ -156,6 +154,10 @@ namespace dxvk
         it->second.deactivateProcessed = !processed;
       }
   }
+
+  void ActivateFocusWindow(HWND window) {
+      SetWindowPos(window, nullptr, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE);
+  }
 #else
   D3D9WindowMessageFilter::D3D9WindowMessageFilter(HWND window, bool filter) {
 
@@ -175,6 +177,10 @@ namespace dxvk
 
   void SetActivateProcessed(HWND window, bool processed) {
   }
+
+  void ActivateFocusWindow(HWND window) {
+  }
+
 #endif
 
 }

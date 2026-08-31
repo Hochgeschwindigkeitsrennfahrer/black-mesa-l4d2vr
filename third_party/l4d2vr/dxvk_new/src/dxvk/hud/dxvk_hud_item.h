@@ -132,12 +132,13 @@ namespace dxvk::hud {
     }
 
     template<typename T>
-    int32_t getItemPos() {
+    Rc<T> getItem() {
       for (int i=0; i<(int)m_items.size(); ++i) {
-        if (dynamic_cast<T*>(m_items[i].ptr()))
-          return i;
+        T* item = dynamic_cast<T*>(m_items[i].ptr());
+        if (item)
+          return Rc<T> (item);
       }
-      return -1;
+      return Rc<T> (nullptr);
     }
 
   private:
@@ -216,7 +217,7 @@ namespace dxvk::hud {
   private:
 
     std::string m_deviceName;
-    std::string m_driverName;
+    std::string m_vulkanVer;
     std::string m_driverVer;
 
   };
@@ -290,6 +291,88 @@ namespace dxvk::hud {
 
 
   /**
+   * \brief HUD item to display jitter
+   */
+  class HudJitterItem : public HudItem {
+    constexpr static int64_t UpdateInterval = 500'000;
+  public:
+
+    HudJitterItem();
+
+    ~HudJitterItem();
+
+    void updateLatencyTracker( const Rc<DxvkLatencyTracker>& tracker ) {
+      m_tracker = tracker;
+    }
+
+    void update(dxvk::high_resolution_clock::time_point time);
+
+    HudPos render(
+      const DxvkContextObjects& ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
+
+  private:
+
+    Rc<DxvkLatencyTracker> m_tracker;
+
+    dxvk::high_resolution_clock::time_point m_lastUpdate
+      = dxvk::high_resolution_clock::now();
+
+    std::string m_frametime;
+    std::string m_latency;
+    std::string m_appThread;
+
+  };
+
+
+  /**
+   * \brief HUD item to display latency details, buffers, etc.
+   */
+  class HudLatencyDetailsItem : public HudItem {
+    constexpr static int64_t UpdateInterval = 500'000;
+  public:
+
+    HudLatencyDetailsItem();
+
+    ~HudLatencyDetailsItem();
+
+    void updateLatencyTracker( const Rc<DxvkLatencyTracker>& tracker ) {
+      m_tracker = tracker;
+    }
+
+    void update(dxvk::high_resolution_clock::time_point time);
+
+    HudPos render(
+      const DxvkContextObjects& ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
+
+  private:
+
+    Rc<DxvkLatencyTracker> m_tracker;
+
+    dxvk::high_resolution_clock::time_point m_lastUpdate
+      = dxvk::high_resolution_clock::now();
+
+    std::string m_gpuP50;
+    std::string m_gpuP75;
+    std::string m_gpuP95;
+    std::string m_gpuP99;
+
+    std::string m_presentP50;
+    std::string m_presentP75;
+    std::string m_presentP95;
+    std::string m_presentP99;
+
+  };
+
+
+  /**
    * \brief HUD item to display the frame rate
    */
   class HudFrameTimeItem : public HudItem {
@@ -346,15 +429,10 @@ namespace dxvk::hud {
     Rc<DxvkBufferView>        m_textView;
     Rc<DxvkGpuQuery>          m_query;
 
-    VkDescriptorSetLayout     m_computeSetLayout = VK_NULL_HANDLE;
-    VkPipelineLayout          m_computePipelineLayout = VK_NULL_HANDLE;
+    const DxvkPipelineLayout* m_computePipelineLayout = nullptr;
+    const DxvkPipelineLayout* m_gfxPipelineLayout     = nullptr;
+
     VkPipeline                m_computePipeline = VK_NULL_HANDLE;
-
-    HudShaderModule           m_vs;
-    HudShaderModule           m_fs;
-
-    VkDescriptorSetLayout     m_gfxSetLayout = VK_NULL_HANDLE;
-    VkPipelineLayout          m_gfxPipelineLayout = VK_NULL_HANDLE;
 
     std::unordered_map<HudPipelineKey,
       VkPipeline, DxvkHash, DxvkEq> m_gfxPipelines;
@@ -383,9 +461,7 @@ namespace dxvk::hud {
     void createComputePipeline(
           HudRenderer&          renderer);
 
-    VkDescriptorSetLayout createDescriptorSetLayout();
-
-    VkPipelineLayout createPipelineLayout();
+    const DxvkPipelineLayout* createPipelineLayout();
 
     VkPipeline getPipeline(
             HudRenderer&        renderer,
@@ -619,14 +695,7 @@ namespace dxvk::hud {
     Rc<DxvkBuffer>            m_dataBuffer;
     std::vector<DrawInfo>     m_drawInfos;
 
-    HudShaderModule           m_vsBackground;
-    HudShaderModule           m_fsBackground;
-
-    HudShaderModule           m_vsVisualize;
-    HudShaderModule           m_fsVisualize;
-
-    VkDescriptorSetLayout     m_setLayout = VK_NULL_HANDLE;
-    VkPipelineLayout          m_pipelineLayout = VK_NULL_HANDLE;
+    const DxvkPipelineLayout* m_pipelineLayout = nullptr;
 
     std::unordered_map<HudPipelineKey,
       PipelinePair, DxvkHash, DxvkEq> m_pipelines;
@@ -648,9 +717,7 @@ namespace dxvk::hud {
             VkDescriptorBufferInfo& drawDescriptor,
             VkDescriptorBufferInfo& dataDescriptor);
 
-    VkDescriptorSetLayout createSetLayout();
-
-    VkPipelineLayout createPipelineLayout();
+    const DxvkPipelineLayout* createPipelineLayout();
 
     PipelinePair createPipeline(
             HudRenderer&        renderer,

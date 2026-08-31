@@ -493,6 +493,17 @@ bool L4D2VR_OpenXrHelperHasSubmittedFrame()
         state->status == static_cast<uint32_t>(L4D2VROpenXrBridgeStatus::SubmittedFrame);
 }
 
+bool L4D2VR_ReadOpenXrHelperSubmittedFrames(uint32_t& submittedFrames)
+{
+    std::lock_guard<std::mutex> lock(g_OpenXrBridgeStateMutex);
+    const L4D2VROpenXrBridgeState* state = g_OpenXrBridgeState;
+    if (!state)
+        return false;
+
+    submittedFrames = state->submittedFrames;
+    return true;
+}
+
 bool L4D2VR_ReadOpenXrHmdPose(L4D2VROpenXrPoseDesc& pose, uint32_t* generation)
 {
     std::lock_guard<std::mutex> lock(g_OpenXrBridgeStateMutex);
@@ -617,6 +628,34 @@ void L4D2VR_PublishOpenXrHapticRequest(uint32_t handIndex, float durationSeconds
     request.frequency = frequency;
     request.amplitude = amplitude;
     request.sequence = seq + 2u;
+    state->heartbeatTickMs = GetTickCount64();
+}
+
+// Both eyes must land in the helper as one pair. They are published per frame
+// now that the game rotates publish textures, and the helper reads them from
+// shared memory without a lock, so two separate stores let it pick up left from
+// one slot and right from another - each eye a different game frame, which is a
+// double image as soon as the head moves. Seqlock the pair like the pose.
+void L4D2VR_PublishOpenXrSharedTexturePair(
+    const L4D2VROpenXrSharedTextureDesc& left,
+    const L4D2VROpenXrSharedTextureDesc& right)
+{
+    if (!left.valid || !right.valid)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_OpenXrBridgeStateMutex);
+    L4D2VROpenXrBridgeState* state = g_OpenXrBridgeState;
+    if (!state)
+        return;
+
+    ++state->sharedTextureGeneration;
+    std::atomic_thread_fence(std::memory_order_release);
+    state->eyeTextures[L4D2VR_OPENXR_EYE_LEFT] = left;
+    state->eyeTextures[L4D2VR_OPENXR_EYE_RIGHT] = right;
+    state->sharedTexturesReadyMask |=
+        (1u << L4D2VR_OPENXR_EYE_LEFT) | (1u << L4D2VR_OPENXR_EYE_RIGHT);
+    std::atomic_thread_fence(std::memory_order_release);
+    ++state->sharedTextureGeneration;
     state->heartbeatTickMs = GetTickCount64();
 }
 

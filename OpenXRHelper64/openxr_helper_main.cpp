@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdarg>
 #include <cstdint>
 #include <cmath>
@@ -455,6 +456,70 @@ namespace
             fov.angleDown < -0.001f;
     }
 
+    struct ContainBlitRect
+    {
+        int32_t x = 0;
+        int32_t y = 0;
+        int32_t w = 0;
+        int32_t h = 0;
+    };
+
+    // Copy the game eye into the swapchain without stretching a short image
+    // into a taller HMD buffer (that repeated the last scanline and froze the
+    // picture). Scale is at most 1.0; leftover dest pixels stay black.
+    ContainBlitRect ComputeContainBlitRect(uint32_t srcW, uint32_t srcH, uint32_t dstW, uint32_t dstH)
+    {
+        ContainBlitRect rect{ 0, 0, static_cast<int32_t>(dstW), static_cast<int32_t>(dstH) };
+        if (srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0)
+            return rect;
+        const double scale = std::min(1.0,
+            std::min(static_cast<double>(dstW) / static_cast<double>(srcW),
+                     static_cast<double>(dstH) / static_cast<double>(srcH)));
+        rect.w = std::max(1, static_cast<int32_t>(static_cast<double>(srcW) * scale + 0.5));
+        rect.h = std::max(1, static_cast<int32_t>(static_cast<double>(srcH) * scale + 0.5));
+        if (rect.w > static_cast<int32_t>(dstW))
+            rect.w = static_cast<int32_t>(dstW);
+        if (rect.h > static_cast<int32_t>(dstH))
+            rect.h = static_cast<int32_t>(dstH);
+        rect.x = (static_cast<int32_t>(dstW) - rect.w) / 2;
+        rect.y = (static_cast<int32_t>(dstH) - rect.h) / 2;
+        if (rect.x < 0)
+            rect.x = 0;
+        if (rect.y < 0)
+            rect.y = 0;
+        return rect;
+    }
+
+    void BoundedSourcePixels(uint32_t texW, uint32_t texH, float uMin, float vMin, float uMax, float vMax,
+        uint32_t& outW, uint32_t& outH)
+    {
+        const float du = std::fabs(uMax - uMin);
+        const float dv = std::fabs(vMax - vMin);
+        outW = static_cast<uint32_t>(static_cast<float>(texW) * std::clamp(du, 0.0f, 1.0f) + 0.5f);
+        outH = static_cast<uint32_t>(static_cast<float>(texH) * std::clamp(dv, 0.0f, 1.0f) + 0.5f);
+        if (outW < 1)
+            outW = texW;
+        if (outH < 1)
+            outH = texH;
+    }
+
+    void ChooseOpenXrSwapchainExtent(const XrViewConfigurationView& view, uint32_t& width, uint32_t& height)
+    {
+        // Use the runtime recommended size (SteamVR SS slider). Scaling to
+        // maxImageRect (often 4096x4096) made a 2560x1440 game image stretch
+        // into a huge square swapchain and ATW ghosted on head motion.
+        width = view.recommendedImageRectWidth;
+        height = view.recommendedImageRectHeight;
+        if (width > 4096)
+            width = 4096;
+        if (height > 4096)
+            height = 4096;
+        if (width < 640)
+            width = view.recommendedImageRectWidth;
+        if (height < 360)
+            height = view.recommendedImageRectHeight;
+    }
+
     L4D2VROpenXrRuntimeViewConfigDesc BuildRuntimeViewConfig(
         const std::vector<XrViewConfigurationView>& viewConfigs,
         const std::vector<XrView>& locatedViews,
@@ -474,8 +539,7 @@ namespace
             const XrViewConfigurationView& viewConfig = viewConfigs[eye];
             const XrView& locatedView = locatedViews[eye];
             L4D2VROpenXrRuntimeViewDesc& out = config.views[eye];
-            out.width = viewConfig.recommendedImageRectWidth;
-            out.height = viewConfig.recommendedImageRectHeight;
+            ChooseOpenXrSwapchainExtent(viewConfig, out.width, out.height);
             out.recommendedSampleCount = viewConfig.recommendedSwapchainSampleCount;
             out.angleLeft = locatedView.fov.angleLeft;
             out.angleRight = locatedView.fov.angleRight;
@@ -514,8 +578,7 @@ namespace
         {
             const XrViewConfigurationView& viewConfig = viewConfigs[eye];
             L4D2VROpenXrRuntimeViewDesc& out = config.views[eye];
-            out.width = viewConfig.recommendedImageRectWidth;
-            out.height = viewConfig.recommendedImageRectHeight;
+            ChooseOpenXrSwapchainExtent(viewConfig, out.width, out.height);
             out.recommendedSampleCount = viewConfig.recommendedSwapchainSampleCount;
             out.valid = (out.width > 0 && out.height > 0) ? 1u : 0u;
         }
@@ -950,6 +1013,34 @@ namespace
             return m_State->eyeTextures[eyeIndex];
         }
 
+        // Seqlock read of both eyes. The game rotates publish textures now, so a
+        // torn read puts each eye on a different game frame.
+        bool ReadSharedTexturePair(
+            L4D2VROpenXrSharedTextureDesc& left,
+            L4D2VROpenXrSharedTextureDesc& right,
+            uint32_t& generation) const
+        {
+            if (!m_State)
+                return false;
+
+            for (int attempt = 0; attempt < 8; ++attempt)
+            {
+                const uint32_t before = m_State->sharedTextureGeneration;
+                if (before == 0 || (before & 1u) != 0)
+                    continue;
+                std::atomic_thread_fence(std::memory_order_acquire);
+                left = m_State->eyeTextures[L4D2VR_OPENXR_EYE_LEFT];
+                right = m_State->eyeTextures[L4D2VR_OPENXR_EYE_RIGHT];
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if (m_State->sharedTextureGeneration == before)
+                {
+                    generation = before;
+                    return true;
+                }
+            }
+            return false;
+        }
+
         uint32_t OverlayGeneration() const
         {
             return m_State ? m_State->overlayGeneration : 0;
@@ -1136,6 +1227,20 @@ namespace
             pose.position[1] *= invCount;
             pose.position[2] *= invCount;
         }
+        if (count >= 2)
+        {
+            const XrVector3f& left = views[0].pose.position;
+            const XrVector3f& right = views[1].pose.position;
+            const float dx = right.x - left.x;
+            const float dy = right.y - left.y;
+            const float dz = right.z - left.z;
+            float ipd = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (!(std::isfinite(ipd) && ipd > 0.01f && ipd < 0.20f))
+                ipd = 0.063f;
+            uint32_t ipdBits = 0;
+            std::memcpy(&ipdBits, &ipd, sizeof(ipdBits));
+            pose.reserved0 = ipdBits;
+        }
         return pose;
     }
 
@@ -1260,7 +1365,14 @@ namespace
             renderPose.position[2]
         };
 
-        const float ipd = GetLocatedViewIpd(locatedViews, locatedCount);
+        float ipd = GetLocatedViewIpd(locatedViews, locatedCount);
+        if (renderPose.reserved0 != 0)
+        {
+            float renderIpd = 0.f;
+            std::memcpy(&renderIpd, &renderPose.reserved0, sizeof(renderIpd));
+            if (std::isfinite(renderIpd) && renderIpd >= 0.04f && renderIpd <= 0.10f)
+                ipd = renderIpd;
+        }
         XrVector3f right = RotateOpenXrVector(pose.orientation, XrVector3f{ 1.0f, 0.0f, 0.0f });
         const float rightLen = std::sqrt(right.x * right.x + right.y * right.y + right.z * right.z);
         if (rightLen > 0.0001f)
@@ -1921,8 +2033,7 @@ namespace
             {
                 EyeSwapchain& swapchain = m_Eyes[eye];
                 const XrViewConfigurationView& view = m_ViewConfigs[eye];
-                swapchain.width = view.recommendedImageRectWidth;
-                swapchain.height = view.recommendedImageRectHeight;
+                ChooseOpenXrSwapchainExtent(view, swapchain.width, swapchain.height);
                 swapchain.format = selectedFormat;
 
                 XrSwapchainCreateInfo createInfo{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
@@ -5618,7 +5729,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             VkAttachmentDescription colorAttachment{};
             colorAttachment.format = colorFormat;
             colorAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
-            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            colorAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             colorAttachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             colorAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
             colorAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
@@ -5829,11 +5940,15 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             }
             m_Log.Print("Runtime swapchain VkFormats=%s", formatList.str().c_str());
 
+            // Game eye textures are UNORM but hold sRGB-encoded D3D9 color. Blit
+            // through the shader (srgbToLinear sample -> sRGB attachment) so the
+            // compositor matches desktop gamma. UNORM swapchain + transfer blit
+            // looked too bright on WMR OpenXR.
             const std::array<VkFormat, 4> preferredFormats = {
-                VK_FORMAT_B8G8R8A8_UNORM,
-                VK_FORMAT_R8G8B8A8_UNORM,
                 VK_FORMAT_B8G8R8A8_SRGB,
-                VK_FORMAT_R8G8B8A8_SRGB
+                VK_FORMAT_R8G8B8A8_SRGB,
+                VK_FORMAT_B8G8R8A8_UNORM,
+                VK_FORMAT_R8G8B8A8_UNORM
             };
 
             VkFormat selectedFormat = static_cast<VkFormat>(formats[0]);
@@ -5857,8 +5972,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             {
                 VulkanEyeSwapchain& swapchain = m_Eyes[eye];
                 const XrViewConfigurationView& view = m_ViewConfigs[eye];
-                swapchain.width = view.recommendedImageRectWidth;
-                swapchain.height = view.recommendedImageRectHeight;
+                ChooseOpenXrSwapchainExtent(view, swapchain.width, swapchain.height);
                 swapchain.format = selectedFormat;
 
                 XrSwapchainCreateInfo createInfo{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
@@ -6443,18 +6557,96 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             }
         }
 
-        bool ImportGameEyeTexture(uint32_t eyeIndex, const L4D2VROpenXrSharedTextureDesc& desc, uint32_t generation)
+        void ApplyGameEyeSourceBounds(VulkanGameEyeTexture& eye, const L4D2VROpenXrSharedTextureDesc& desc, uint32_t generation)
+        {
+            eye.generation = generation;
+            eye.uMin = std::clamp(desc.uMin, 0.0f, 1.0f);
+            eye.vMin = std::clamp(desc.vMin, 0.0f, 1.0f);
+            eye.uMax = std::clamp(desc.uMax, 0.0f, 1.0f);
+            eye.vMax = std::clamp(desc.vMax, 0.0f, 1.0f);
+            eye.renderFovXDeg = (std::isfinite(desc.renderFovXDeg) && desc.renderFovXDeg > 1.0f && desc.renderFovXDeg < 179.0f)
+                ? desc.renderFovXDeg
+                : 90.0f;
+            eye.renderAspect = (std::isfinite(desc.renderAspect) && desc.renderAspect > 0.1f && desc.renderAspect < 10.0f)
+                ? desc.renderAspect
+                : ((desc.height > 0) ? (static_cast<float>(desc.width) / static_cast<float>(desc.height)) : 1.0f);
+            if (eye.uMax <= eye.uMin)
+            {
+                eye.uMin = 0.0f;
+                eye.uMax = 1.0f;
+            }
+            if (eye.vMax <= eye.vMin)
+            {
+                eye.vMin = 0.0f;
+                eye.vMax = 1.0f;
+            }
+        }
+
+        bool GameEyeMatchesDesc(const VulkanGameEyeTexture& eye, const L4D2VROpenXrSharedTextureDesc& desc) const
+        {
+            return eye.image != VK_NULL_HANDLE &&
+                eye.kmtHandle == desc.kmtHandle &&
+                eye.width == desc.width &&
+                eye.height == desc.height &&
+                eye.format == static_cast<VkFormat>(desc.format);
+        }
+
+        // The game rotates through several publish textures so it can keep
+        // rendering while we still read the previous image. Park imports we are
+        // not using instead of destroying them: re-importing external memory
+        // every frame stalls the driver.
+        bool SwapInCachedGameEye(uint32_t eyeIndex, const L4D2VROpenXrSharedTextureDesc& desc, uint32_t generation)
+        {
+            for (VulkanGameEyeTexture& cached : m_GameEyeCache[eyeIndex])
+            {
+                if (!GameEyeMatchesDesc(cached, desc))
+                    continue;
+                std::swap(m_GameEyes[eyeIndex], cached);
+                ApplyGameEyeSourceBounds(m_GameEyes[eyeIndex], desc, generation);
+                return UpdateBlitDescriptorSet(eyeIndex);
+            }
+            return false;
+        }
+
+        void ParkCurrentGameEye(uint32_t eyeIndex)
         {
             VulkanGameEyeTexture& eye = m_GameEyes[eyeIndex];
-            if (eye.generation == generation && eye.kmtHandle == desc.kmtHandle && eye.image != VK_NULL_HANDLE)
-                return true;
+            if (eye.image == VK_NULL_HANDLE)
+                return;
+            for (VulkanGameEyeTexture& cached : m_GameEyeCache[eyeIndex])
+            {
+                if (cached.image == VK_NULL_HANDLE)
+                {
+                    std::swap(eye, cached);
+                    return;
+                }
+            }
+            DestroyImportedGameEye(m_GameEyeCache[eyeIndex][0]);
+            std::swap(eye, m_GameEyeCache[eyeIndex][0]);
+        }
 
-            DestroyImportedGameEye(eye);
+        bool ImportGameEyeTexture(uint32_t eyeIndex, const L4D2VROpenXrSharedTextureDesc& desc, uint32_t generation)
+        {
+            if (eyeIndex >= L4D2VR_OPENXR_EYE_COUNT)
+                return false;
+            VulkanGameEyeTexture& eye = m_GameEyes[eyeIndex];
+            if (GameEyeMatchesDesc(eye, desc))
+            {
+                ApplyGameEyeSourceBounds(eye, desc, generation);
+                return true;
+            }
+
             if (!desc.valid || desc.kmtHandle == 0 || desc.width == 0 || desc.height == 0)
             {
                 m_Log.Print("Shared texture eye=%u is invalid for Vulkan import", eyeIndex);
                 return false;
             }
+
+            if (SwapInCachedGameEye(eyeIndex, desc, generation))
+                return true;
+
+            ParkCurrentGameEye(eyeIndex);
+            DestroyImportedGameEye(eye);
 
             const VkExternalMemoryHandleTypeFlagBits handleType = desc.handleType != 0
                 ? static_cast<VkExternalMemoryHandleTypeFlagBits>(desc.handleType)
@@ -6678,12 +6870,14 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
         bool ImportSharedGameTexturesIfNeeded()
         {
-            const uint32_t generation = m_Bridge.SharedTextureGeneration();
-            if (generation == 0)
+            L4D2VROpenXrSharedTextureDesc eyes[L4D2VR_OPENXR_EYE_COUNT]{};
+            uint32_t generation = 0;
+            if (!m_Bridge.ReadSharedTexturePair(
+                    eyes[L4D2VR_OPENXR_EYE_LEFT], eyes[L4D2VR_OPENXR_EYE_RIGHT], generation))
                 return false;
             for (uint32_t eyeIndex = 0; eyeIndex < L4D2VR_OPENXR_EYE_COUNT; ++eyeIndex)
             {
-                if (!ImportGameEyeTexture(eyeIndex, m_Bridge.SharedTexture(eyeIndex), generation))
+                if (!ImportGameEyeTexture(eyeIndex, eyes[eyeIndex], generation))
                     return false;
             }
             return true;
@@ -7208,7 +7402,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             m_Vk.vkCmdPipelineBarrier(m_CommandBuffer, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
         }
 
-        bool CmdRenderShaderBlitWithDescriptor(VulkanEyeSwapchain& target, uint32_t imageIndex, const VulkanGameEyeTexture& source, VkDescriptorSet descriptorSet)
+        bool CmdRenderShaderBlitWithDescriptor(VulkanEyeSwapchain& target, uint32_t imageIndex, const VulkanGameEyeTexture& source, VkDescriptorSet descriptorSet, bool containFit)
         {
             if (!m_UseShaderBlit ||
                 imageIndex >= target.framebuffers.size() ||
@@ -7220,22 +7414,37 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 return false;
             }
 
+            ContainBlitRect dest{ 0, 0, static_cast<int32_t>(target.width), static_cast<int32_t>(target.height) };
+            if (containFit)
+            {
+                uint32_t srcW = 0;
+                uint32_t srcH = 0;
+                BoundedSourcePixels(source.width, source.height, source.uMin, source.vMin, source.uMax, source.vMax, srcW, srcH);
+                dest = ComputeContainBlitRect(srcW, srcH, target.width, target.height);
+            }
+
+            VkClearValue clear{};
             VkRenderPassBeginInfo beginInfo{ VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO };
             beginInfo.renderPass = m_BlitRenderPass;
             beginInfo.framebuffer = target.framebuffers[imageIndex];
             beginInfo.renderArea.extent = { target.width, target.height };
+            beginInfo.clearValueCount = 1;
+            beginInfo.pClearValues = &clear;
 
             m_Vk.vkCmdBeginRenderPass(m_CommandBuffer, &beginInfo, VK_SUBPASS_CONTENTS_INLINE);
 
             VkViewport viewport{};
-            viewport.width = static_cast<float>(target.width);
-            viewport.height = static_cast<float>(target.height);
+            viewport.x = static_cast<float>(dest.x);
+            viewport.y = static_cast<float>(dest.y);
+            viewport.width = static_cast<float>(dest.w);
+            viewport.height = static_cast<float>(dest.h);
             viewport.minDepth = 0.0f;
             viewport.maxDepth = 1.0f;
             m_Vk.vkCmdSetViewport(m_CommandBuffer, 0, 1, &viewport);
 
             VkRect2D scissor{};
-            scissor.extent = { target.width, target.height };
+            scissor.offset = { dest.x, dest.y };
+            scissor.extent = { static_cast<uint32_t>(dest.w), static_cast<uint32_t>(dest.h) };
             m_Vk.vkCmdSetScissor(m_CommandBuffer, 0, 1, &scissor);
 
             m_Vk.vkCmdBindPipeline(m_CommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_BlitPipeline);
@@ -7249,8 +7458,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 0,
                 nullptr);
 
-            // Match bounded eye-submit semantics: sample the bounded source region
-            // and stretch it into the full OpenXR swapchain image.
+            // Sample the bounded source. Eye submits contain-fit (no upscale);
+            // overlays still fill the swapchain.
             const float bounds[4] = { source.uMin, source.vMin, source.uMax, source.vMax };
             m_Vk.vkCmdPushConstants(
                 m_CommandBuffer,
@@ -7269,7 +7478,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         {
             if (eyeIndex >= L4D2VR_OPENXR_EYE_COUNT)
                 return false;
-            return CmdRenderShaderBlitWithDescriptor(eye, imageIndex, source, m_BlitDescriptorSets[eyeIndex]);
+            return CmdRenderShaderBlitWithDescriptor(eye, imageIndex, source, m_BlitDescriptorSets[eyeIndex], true);
         }
 
         bool CmdRenderOverlayShaderBlit(uint32_t overlayIndex, VulkanEyeSwapchain& swapchain, uint32_t imageIndex, const VulkanGameEyeTexture& source)
@@ -7277,7 +7486,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             const uint32_t descriptorIndex = OverlayBlitDescriptorIndex(overlayIndex);
             if (overlayIndex >= L4D2VR_OPENXR_OVERLAY_COUNT || descriptorIndex >= m_BlitDescriptorSets.size())
                 return false;
-            return CmdRenderShaderBlitWithDescriptor(swapchain, imageIndex, source, m_BlitDescriptorSets[descriptorIndex]);
+            return CmdRenderShaderBlitWithDescriptor(swapchain, imageIndex, source, m_BlitDescriptorSets[descriptorIndex], false);
         }
 
         bool RenderEye(uint32_t eyeIndex, uint32_t frameIndex, uint32_t sharedFrameId, bool waitForQueueIdle = true)
@@ -7325,8 +7534,12 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     if (s_eyeBlitLogBudget > 0)
                     {
                         --s_eyeBlitLogBudget;
+                        uint32_t srcW = 0;
+                        uint32_t srcH = 0;
+                        BoundedSourcePixels(source.width, source.height, source.uMin, source.vMin, source.uMax, source.vMax, srcW, srcH);
+                        const ContainBlitRect dest = ComputeContainBlitRect(srcW, srcH, eye.width, eye.height);
                         m_Log.Print(
-                            "[OpenXR][EyeBlit] eye=%s(%u) frame=%u sourceGen=%u sourceHandle=0x%llX sourceImage=0x%llX sourceSize=%ux%u sourceFormat=%u sourceBounds=(%.4f %.4f %.4f %.4f) dstSwapchain=0x%llX dstImage=0x%llX dstImageIndex=%u dstSize=%ux%u path=%s",
+                            "[OpenXR][EyeBlit] eye=%s(%u) frame=%u sourceGen=%u sourceHandle=0x%llX sourceImage=0x%llX sourceSize=%ux%u sourceFormat=%u sourceBounds=(%.4f %.4f %.4f %.4f) dstSwapchain=0x%llX dstImage=0x%llX dstImageIndex=%u dstSize=%ux%u containBlit=(%d,%d %dx%d) path=%s",
                             EyeName(eyeIndex),
                             eyeIndex,
                             frameIndex,
@@ -7345,6 +7558,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                             imageIndex,
                             eye.width,
                             eye.height,
+                            dest.x,
+                            dest.y,
+                            dest.w,
+                            dest.h,
                             useShaderBlit ? "shader" : "transfer");
                     }
                 }
@@ -7363,6 +7580,13 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                         0, VK_ACCESS_TRANSFER_WRITE_BIT,
                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
 
+                    const VkClearColorValue black{ { 0.0f, 0.0f, 0.0f, 1.0f } };
+                    VkImageSubresourceRange clearRange{};
+                    clearRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    clearRange.levelCount = 1;
+                    clearRange.layerCount = 1;
+                    m_Vk.vkCmdClearColorImage(m_CommandBuffer, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &clearRange);
+
                     const int32_t srcX0 = static_cast<int32_t>(std::floor(source.uMin * static_cast<float>(source.width)));
                     const int32_t srcY0 = static_cast<int32_t>(std::floor(source.vMin * static_cast<float>(source.height)));
                     const int32_t srcX1 = static_cast<int32_t>(std::ceil(source.uMax * static_cast<float>(source.width)));
@@ -7371,6 +7595,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     const int32_t srcMinY = std::clamp(srcY0, 0, static_cast<int32_t>(source.height) - 1);
                     const int32_t srcMaxX = std::clamp(srcX1, srcMinX + 1, static_cast<int32_t>(source.width));
                     const int32_t srcMaxY = std::clamp(srcY1, srcMinY + 1, static_cast<int32_t>(source.height));
+                    uint32_t srcW = 0;
+                    uint32_t srcH = 0;
+                    BoundedSourcePixels(source.width, source.height, source.uMin, source.vMin, source.uMax, source.vMax, srcW, srcH);
+                    const ContainBlitRect dest = ComputeContainBlitRect(srcW, srcH, eye.width, eye.height);
                     VkImageBlit blit{};
                     blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                     blit.srcSubresource.layerCount = 1;
@@ -7378,7 +7606,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     blit.srcOffsets[1] = { srcMaxX, srcMaxY, 1 };
                     blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                     blit.dstSubresource.layerCount = 1;
-                    blit.dstOffsets[1] = { static_cast<int32_t>(eye.width), static_cast<int32_t>(eye.height), 1 };
+                    blit.dstOffsets[0] = { dest.x, dest.y, 0 };
+                    blit.dstOffsets[1] = { dest.x + dest.w, dest.y + dest.h, 1 };
                     m_Vk.vkCmdBlitImage(m_CommandBuffer, source.image, source.layout,
                         dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
 
@@ -7627,16 +7856,23 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 if (sharedTexturesReady)
                 {
                     const uint32_t generation = m_Bridge.SharedTextureGeneration();
-                    if (requireSharedTextures && generation != lastLoggedSharedTextureGeneration)
+                    // Gate on the eye layout, not the generation. The game rotates
+                    // publish textures every frame, so a generation gate logs to
+                    // disk inside the frame loop at the publish rate.
+                    const auto logLeft = m_Bridge.SharedTexture(L4D2VR_OPENXR_EYE_LEFT);
+                    const auto logRight = m_Bridge.SharedTexture(L4D2VR_OPENXR_EYE_RIGHT);
+                    const uint32_t sharedTextureLayout =
+                        (logLeft.width * 31u + logLeft.height) * 31u + logLeft.format;
+                    if (requireSharedTextures && sharedTextureLayout != lastLoggedSharedTextureGeneration)
                     {
-                        const auto left = m_Bridge.SharedTexture(L4D2VR_OPENXR_EYE_LEFT);
-                        const auto right = m_Bridge.SharedTexture(L4D2VR_OPENXR_EYE_RIGHT);
+                        const auto& left = logLeft;
+                        const auto& right = logRight;
                         m_Log.Print("Shared game eye textures ready gen=%u L(handle=0x%llX image=0x%llX %ux%u fmt=%u type=0x%X q=%u) R(handle=0x%llX image=0x%llX %ux%u fmt=%u type=0x%X q=%u)",
                             generation, static_cast<unsigned long long>(left.kmtHandle), static_cast<unsigned long long>(left.image),
                             left.width, left.height, left.format, left.handleType, left.queueFamilyIndex,
                             static_cast<unsigned long long>(right.kmtHandle), static_cast<unsigned long long>(right.image),
                             right.width, right.height, right.format, right.handleType, right.queueFamilyIndex);
-                        lastLoggedSharedTextureGeneration = generation;
+                        lastLoggedSharedTextureGeneration = sharedTextureLayout;
                     }
                     if (requireSharedTextures && !ImportSharedGameTexturesIfNeeded())
                         return 28;
@@ -7644,7 +7880,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
                 uint32_t sharedTextureFrameId = 0;
                 uint32_t sharedTextureFrameGeneration = 0;
-                const bool sharedTextureFrameReady =
+                bool sharedTextureFrameReady =
                     !requireSharedTextures ||
                     m_Bridge.ReadSharedTextureFrame(sharedTextureFrameId, &sharedTextureFrameGeneration);
                 uint32_t overlayFrameId = 0;
@@ -7697,6 +7933,15 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                         locatedCount,
                         viewState.viewStateFlags,
                         frameState.predictedDisplayTime));
+                    // Do not Sleep for a game frame here. Waiting ~8ms past
+                    // xrWaitFrame made xrEndFrame late, and displayTime matching
+                    // then flipped submit poses between game-render and located
+                    // views (headset twitch while the head was still, 2026-08-30).
+                    if (requireSharedTextures)
+                    {
+                        sharedTextureFrameReady = m_Bridge.ReadSharedTextureFrame(
+                            sharedTextureFrameId, &sharedTextureFrameGeneration);
+                    }
                     static bool s_loggedRuntimeViewConfig = false;
                     if (locatedCount >= 2 && RuntimeViewConfigIsReady(m_SessionState))
                     {
@@ -7713,21 +7958,6 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     uint32_t gameRenderPoseGeneration = 0;
                     const bool readGameRenderPose =
                         m_Bridge.ReadGameRenderPose(gameRenderPose, &gameRenderPoseGeneration);
-                    if (readGameRenderPose)
-                    {
-                        lastGameRenderPose = gameRenderPose;
-                        lastGameRenderPoseGeneration = gameRenderPoseGeneration;
-                    }
-                    const bool haveGameRenderPose = lastGameRenderPose.valid != 0;
-                    const L4D2VROpenXrPoseDesc& projectionRenderPose =
-                        haveGameRenderPose ? lastGameRenderPose : gameRenderPose;
-                    const uint32_t projectionRenderPoseGeneration =
-                        haveGameRenderPose ? lastGameRenderPoseGeneration : 0;
-                    const bool useGameRenderPoseForProjection =
-                        options.useGameRenderPoseForProjection && haveGameRenderPose;
-                    const char* projectionPoseSource = useGameRenderPoseForProjection
-                        ? (readGameRenderPose ? "game render" : "cached game render")
-                        : "runtime located";
                     if ((viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0 && locatedCount >= 2)
                     {
                         const bool haveNewResolvedSharedFrame =
@@ -7737,6 +7967,15 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
                         if (sharedTexturesReady && haveNewResolvedSharedFrame)
                         {
+                            // Re-read the eye descriptors here, not only before
+                            // xrWaitFrame. That earlier snapshot is up to a whole
+                            // display frame old, and the game now rotates publish
+                            // textures, so a stale descriptor pins both blits to an
+                            // already-superseded slot and the image drags behind the
+                            // head (2026-08-31). Both eyes still resolve to the same
+                            // published slot, so they stay the same game frame.
+                            if (requireSharedTextures && !ImportSharedGameTexturesIfNeeded())
+                                return 28;
                             for (uint32_t eye = 0; eye < 2; ++eye)
                             {
                                 if (!RenderEye(eye, submittedFrames, sharedTextureFrameId))
@@ -7746,7 +7985,31 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                             eyeSwapchainsHaveContent = true;
                             if (requireSharedTextures)
                                 lastSubmittedSharedTextureFrameGeneration = sharedTextureFrameGeneration;
+                            // Latch pose with the image we just copied. Do not
+                            // pick up a newer game pose on compositor re-submits.
+                            if (readGameRenderPose && gameRenderPose.valid)
+                            {
+                                lastGameRenderPose = gameRenderPose;
+                                lastGameRenderPoseGeneration = gameRenderPoseGeneration;
+                            }
                         }
+
+                        const bool haveGameRenderPose = lastGameRenderPose.valid != 0;
+                        const L4D2VROpenXrPoseDesc& projectionRenderPose =
+                            haveGameRenderPose ? lastGameRenderPose : gameRenderPose;
+                        const uint32_t projectionRenderPoseGeneration =
+                            haveGameRenderPose ? lastGameRenderPoseGeneration : 0;
+                        // Always pair the submitted layer with the pose the game
+                        // drew. Switching to xrLocateViews when displayTime was
+                        // "close enough" used per-eye IMU poses on a same-orientation
+                        // stereo image and twitched even with a still head.
+                        const bool useGameRenderPoseForProjection =
+                            options.useGameRenderPoseForProjection && haveGameRenderPose;
+                        const char* projectionPoseSource = useGameRenderPoseForProjection
+                            ? ((readGameRenderPose && haveNewResolvedSharedFrame)
+                                ? "game render"
+                                : "cached game render")
+                            : "runtime located";
 
                         if (sharedTexturesReady && eyeSwapchainsHaveContent)
                         {
@@ -8376,6 +8639,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         std::vector<XrViewConfigurationView> m_ViewConfigs;
         std::vector<VulkanEyeSwapchain> m_Eyes;
         std::array<VulkanGameEyeTexture, L4D2VR_OPENXR_EYE_COUNT> m_GameEyes;
+        static constexpr uint32_t kGameEyeCacheSlots = 4;
+        std::array<std::array<VulkanGameEyeTexture, kGameEyeCacheSlots>, L4D2VR_OPENXR_EYE_COUNT> m_GameEyeCache{};
         std::array<VulkanGameEyeTexture, L4D2VR_OPENXR_OVERLAY_COUNT> m_OverlayTextures;
         std::array<VulkanEyeSwapchain, L4D2VR_OPENXR_OVERLAY_COUNT> m_OverlaySwapchains;
         std::array<OverlaySpatialLock, L4D2VR_OPENXR_OVERLAY_COUNT> m_OverlaySpatialLocks;

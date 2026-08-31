@@ -63,6 +63,7 @@ namespace dxvk {
         return D3DERR_INVALIDCALL;
 
       *ppDevice = ref(GetDevice());
+
       return D3D_OK;
     }
 
@@ -76,7 +77,7 @@ namespace dxvk {
 
   protected:
 
-    D3D8Device* m_parent;
+    D3D8Device* m_parent = nullptr;
 
   };
 

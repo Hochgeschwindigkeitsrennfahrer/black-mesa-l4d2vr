@@ -297,6 +297,8 @@ namespace dxvk {
     DxvkExt amdMemoryOverallocationBehaviour  = { VK_AMD_MEMORY_OVERALLOCATION_BEHAVIOR_EXTENSION_NAME,     DxvkExtMode::Disabled };
     DxvkExt amdShaderFragmentMask             = { VK_AMD_SHADER_FRAGMENT_MASK_EXTENSION_NAME,               DxvkExtMode::Optional };
     DxvkExt extAttachmentFeedbackLoopLayout   = { VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME,    DxvkExtMode::Optional };
+    DxvkExt extDynamicRenderingUnusedAttachments   = { VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME,    DxvkExtMode::Optional };
+    DxvkExt extBorderColorSwizzle             = { VK_EXT_BORDER_COLOR_SWIZZLE_EXTENSION_NAME,               DxvkExtMode::Optional };
     DxvkExt extConservativeRasterization      = { VK_EXT_CONSERVATIVE_RASTERIZATION_EXTENSION_NAME,         DxvkExtMode::Optional };
     DxvkExt extCustomBorderColor              = { VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME,                DxvkExtMode::Optional };
     DxvkExt extDepthClipEnable                = { VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME,                  DxvkExtMode::Optional };
@@ -312,13 +314,15 @@ namespace dxvk {
     DxvkExt extNonSeamlessCubeMap             = { VK_EXT_NON_SEAMLESS_CUBE_MAP_EXTENSION_NAME,              DxvkExtMode::Optional };
     DxvkExt extPageableDeviceLocalMemory      = { VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME,       DxvkExtMode::Optional };
     DxvkExt extRobustness2                    = { VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,                       DxvkExtMode::Required };
+    DxvkExt extSampleLocations                = { VK_EXT_SAMPLE_LOCATIONS_EXTENSION_NAME,                   DxvkExtMode::Optional };
     DxvkExt extShaderModuleIdentifier         = { VK_EXT_SHADER_MODULE_IDENTIFIER_EXTENSION_NAME,           DxvkExtMode::Optional };
     DxvkExt extShaderStencilExport            = { VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME,              DxvkExtMode::Optional };
     DxvkExt extSwapchainColorSpace            = { VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME,              DxvkExtMode::Optional };
-    DxvkExt extSwapchainMaintenance1          = { VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,            DxvkExtMode::Optional };
+    DxvkExt khrSwapchainMaintenance1          = { VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,            DxvkExtMode::Optional };
     DxvkExt extHdrMetadata                    = { VK_EXT_HDR_METADATA_EXTENSION_NAME,                       DxvkExtMode::Optional };
     DxvkExt extTransformFeedback              = { VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME,                 DxvkExtMode::Optional };
     DxvkExt extVertexAttributeDivisor         = { VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME,           DxvkExtMode::Optional };
+    DxvkExt extCalibratedTimestamps           = { VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,              DxvkExtMode::Optional };
     DxvkExt khrExternalMemoryWin32            = { VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,              DxvkExtMode::Optional };
     DxvkExt khrExternalSemaphoreWin32         = { VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,           DxvkExtMode::Optional };
     DxvkExt extLoadStoreOpNone                = { VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME,                 DxvkExtMode::Optional };
@@ -327,6 +331,8 @@ namespace dxvk {
     DxvkExt khrPipelineLibrary                = { VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME,                   DxvkExtMode::Optional };
     DxvkExt khrPresentId                      = { VK_KHR_PRESENT_ID_EXTENSION_NAME,                         DxvkExtMode::Optional };
     DxvkExt khrPresentWait                    = { VK_KHR_PRESENT_WAIT_EXTENSION_NAME,                       DxvkExtMode::Optional };
+    DxvkExt khrPresentId2                     = { VK_KHR_PRESENT_ID_2_EXTENSION_NAME,                       DxvkExtMode::Optional };
+    DxvkExt khrPresentWait2                   = { VK_KHR_PRESENT_WAIT_2_EXTENSION_NAME,                     DxvkExtMode::Optional };
     DxvkExt khrSwapchain                      = { VK_KHR_SWAPCHAIN_EXTENSION_NAME,                          DxvkExtMode::Required };
     DxvkExt khrSwapchainMutableFormat         = { VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME,           DxvkExtMode::Optional };
     DxvkExt khrWin32KeyedMutex                = { VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME,                  DxvkExtMode::Optional };
@@ -345,9 +351,9 @@ namespace dxvk {
    */
   struct DxvkInstanceExtensions {
     DxvkExt extDebugUtils                   = { VK_EXT_DEBUG_UTILS_EXTENSION_NAME,                      DxvkExtMode::Optional };
-    DxvkExt extSurfaceMaintenance1          = { VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME,            DxvkExtMode::Optional };
     DxvkExt khrGetSurfaceCapabilities2      = { VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME,       DxvkExtMode::Optional };
     DxvkExt khrSurface                      = { VK_KHR_SURFACE_EXTENSION_NAME,                          DxvkExtMode::Required };
+    DxvkExt khrSurfaceMaintenance1          = { VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME,            DxvkExtMode::Optional };
   };
   
 }

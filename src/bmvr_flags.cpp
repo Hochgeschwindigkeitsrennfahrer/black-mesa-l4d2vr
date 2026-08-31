@@ -1149,11 +1149,20 @@ namespace bmvr
             && SizesNear(g_GbActualWidth, eyeW) && SizesNear(g_GbActualHeight, eyeH);
     }
 
+    void SetOpenXrHelperSession(bool active)
+    {
+        (void)active;
+        // Session flag used to bypass gbmatch; that froze 2480-tall views
+        // into a 1440 G-buffer (2026-08-30). Keep the hook for logs.
+    }
+
     bool UseGbMatchViewLock()
     {
         // When FullFrame+G-buffer+eyes match, stereo views must be that size
         // so flashlight apply hits the deferred buffers. Mismatch (GB 3728 /
         // view 2560) was the 2026-08-26 flashlight/ghost failure.
+        // Do not bypass this on OpenXR: CViewSetup height 2480 into a 1440
+        // G-buffer froze the frame with last-scanline smear (2026-08-30).
         return g_TryFlashlightGbMatch && !OffscreenWorldMatchesEyes();
     }
 

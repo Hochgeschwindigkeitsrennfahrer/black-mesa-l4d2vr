@@ -10,14 +10,6 @@
 namespace dxvk::vk {
 
   static std::pair<HMODULE, PFN_vkGetInstanceProcAddr> loadVulkanLibrary() {
-#ifdef _WIN32
-    // Bandicam installs VK_LAYER_bandicam_helper as a global Vulkan layer.
-    // Disable it before loading the Vulkan loader so bdcamvk32.dll never
-    // enters this process's Vulkan instance and device dispatch chains.
-    ::SetEnvironmentVariableW(L"DISABLE_VK_LAYER_bandicam_helper_1", L"1");
-    Logger::info("Vulkan: Disabled Bandicam Vulkan capture layer.");
-#endif
-
     static const std::array<const char*, 2> dllNames = {{
 #ifdef _WIN32
       "winevulkan.dll",
@@ -112,8 +104,6 @@ namespace dxvk::vk {
   
   DeviceFn::DeviceFn(const Rc<InstanceLoader>& library, bool owned, VkDevice device)
   : DeviceLoader(library, owned, device) { }
-  
-  
   DeviceFn::~DeviceFn() {
     if (m_owned)
       this->vkDestroyDevice(m_device, nullptr);

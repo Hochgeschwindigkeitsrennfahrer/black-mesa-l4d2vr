@@ -170,7 +170,7 @@ namespace dxvk {
     
     // Determine map mode based on our findings
     VkMemoryPropertyFlags memoryProperties = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-    std::tie(m_mapMode, memoryProperties) = DetermineMapMode(&imageInfo);
+    std::tie(m_mapMode, memoryProperties) = DetermineMapMode(pDevice, &imageInfo);
     
     // If the image is mapped directly to host memory, we need
     // to enable linear tiling, and DXVK needs to be aware that
@@ -546,6 +546,7 @@ namespace dxvk {
 
   
   std::pair<D3D11_COMMON_TEXTURE_MAP_MODE, VkMemoryPropertyFlags> D3D11CommonTexture::DetermineMapMode(
+    const D3D11Device*          device,
     const DxvkImageCreateInfo*  pImageInfo) const {
     // Don't map an image unless the application requests it
     if (!m_desc.CPUAccessFlags)
@@ -563,8 +564,9 @@ namespace dxvk {
       return { D3D11_COMMON_TEXTURE_MAP_MODE_STAGING, 0u };
 
     // If the packed format and image format don't match, we need to use
-    // a staging buffer and perform format conversion when mapping.
-    if (m_packedFormat != pImageInfo->format)
+    // a staging buffer and perform format conversion when mapping. The
+    // same is true if the game is broken and requires tight packing.
+    if (m_packedFormat != pImageInfo->format || device->GetOptions()->disableDirectImageMapping)
       return { D3D11_COMMON_TEXTURE_MAP_MODE_DYNAMIC, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT };
 
     // Multi-plane and depth-stencil images have a special memory layout
@@ -700,10 +702,11 @@ namespace dxvk {
 
         auto blockCount = util::computeBlockCount(extent, formatInfo->blockSize);
 
-        if (!result.RowPitch) {
-          result.RowPitch   = elementSize * blockCount.width;
-          result.DepthPitch = elementSize * blockCount.width * blockCount.height;
-        }
+        if (!result.RowPitch)
+          result.RowPitch = elementSize * blockCount.width;
+
+        if (!result.DepthPitch || formatInfo->flags.test(DxvkFormatFlag::MultiPlane))
+          result.DepthPitch += elementSize * blockCount.width * blockCount.height;
 
         VkDeviceSize size = elementSize * blockCount.width * blockCount.height * blockCount.depth;
 
@@ -859,16 +862,26 @@ namespace dxvk {
 
 
   D3D11DXGISurface::D3D11DXGISurface(
-          ID3D11Resource*     pResource,
-          D3D11CommonTexture* pTexture)
+          ID3D11Resource*     pResource)
   : m_resource  (pResource),
-    m_texture   (pTexture),
     m_gdiSurface(nullptr) {
-    if (pTexture->Desc()->MiscFlags & D3D11_RESOURCE_MISC_GDI_COMPATIBLE)
+    auto texture = GetCommonTexture(pResource);
+    if (texture && texture->Desc()->MiscFlags & D3D11_RESOURCE_MISC_GDI_COMPATIBLE)
       m_gdiSurface = new D3D11GDISurface(m_resource, 0);
   }
 
-  
+  D3D11DXGISurface::D3D11DXGISurface(
+          ID3D11Resource*     pParentResource,
+          UINT                Subresource)
+  : m_isSubresourceSurface(true),
+    m_subresource         (Subresource),
+    m_resource            (pParentResource),
+    m_gdiSurface(nullptr) {
+    auto texture = GetCommonTexture(pParentResource);
+    if (texture && texture->Desc()->MiscFlags & D3D11_RESOURCE_MISC_GDI_COMPATIBLE)
+      m_gdiSurface = new D3D11GDISurface(m_resource, m_subresource);
+  }
+
   D3D11DXGISurface::~D3D11DXGISurface() {
     if (m_gdiSurface)
       delete m_gdiSurface;
@@ -888,6 +901,24 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11DXGISurface::QueryInterface(
           REFIID                  riid,
           void**                  ppvObject) {
+
+    InitReturnPtr(ppvObject);
+
+    // Only a subset of interfaces are available for subresource surfaces
+    if (m_isSubresourceSurface) {
+      if (riid == __uuidof(IUnknown)
+       || riid == __uuidof(IDXGIObject)
+       || riid == __uuidof(IDXGIDeviceSubObject)
+       || riid == __uuidof(IDXGISurface)
+       || riid == __uuidof(IDXGISurface1)
+       || riid == __uuidof(IDXGISurface2)) {
+        *ppvObject = ref(this);
+        return S_OK;
+      }
+
+      return E_NOINTERFACE;
+    }
+
     return m_resource->QueryInterface(riid, ppvObject);
   }
 
@@ -933,15 +964,42 @@ namespace dxvk {
   
   HRESULT STDMETHODCALLTYPE D3D11DXGISurface::GetDesc(
           DXGI_SURFACE_DESC*      pDesc) {
+    auto buffer  = GetCommonBuffer (m_resource);
+    auto texture = GetCommonTexture(m_resource);
+
     if (!pDesc)
       return DXGI_ERROR_INVALID_CALL;
 
-    auto desc = m_texture->Desc();
-    pDesc->Width      = desc->Width;
-    pDesc->Height     = desc->Height;
-    pDesc->Format     = desc->Format;
-    pDesc->SampleDesc = desc->SampleDesc;
-    return S_OK;
+    if (m_isSubresourceSurface) {
+      if (texture) {
+        auto desc = texture->Desc();
+
+        pDesc->Width      = std::max(1u, desc->Width >> (m_subresource % desc->MipLevels));
+        pDesc->Height     = std::max(1u, desc->Height >> (m_subresource % desc->MipLevels));
+        pDesc->Format     = desc->Format;
+        pDesc->SampleDesc = desc->SampleDesc;
+        return S_OK;
+      } else if (buffer) {
+        auto desc = buffer->Desc();
+        pDesc->Width              = desc->ByteWidth;
+        pDesc->Height             = 1;
+        pDesc->Format             = DXGI_FORMAT_UNKNOWN;
+        pDesc->SampleDesc.Count   = 1;
+        pDesc->SampleDesc.Quality = 0;
+        return S_OK;
+      } else {
+        return DXGI_ERROR_INVALID_CALL;
+      }
+    } else if (texture) {
+      auto desc = texture->Desc();
+      pDesc->Width      = desc->Width;
+      pDesc->Height     = desc->Height;
+      pDesc->Format     = desc->Format;
+      pDesc->SampleDesc = desc->SampleDesc;
+      return S_OK;
+    } else {
+      return DXGI_ERROR_INVALID_CALL;
+    }
   }
 
   
@@ -961,11 +1019,11 @@ namespace dxvk {
 
     D3D11_MAP mapType;
 
-    if (MapFlags & (DXGI_MAP_READ | DXGI_MAP_WRITE))
+    if (MapFlags & DXGI_MAP_READ && MapFlags & DXGI_MAP_WRITE)
       mapType = D3D11_MAP_READ_WRITE;
     else if (MapFlags & DXGI_MAP_READ)
       mapType = D3D11_MAP_READ;
-    else if (MapFlags & (DXGI_MAP_WRITE | DXGI_MAP_DISCARD))
+    else if (MapFlags & DXGI_MAP_WRITE && MapFlags & DXGI_MAP_DISCARD)
       mapType = D3D11_MAP_WRITE_DISCARD;
     else if (MapFlags & DXGI_MAP_WRITE)
       mapType = D3D11_MAP_WRITE;
@@ -973,7 +1031,7 @@ namespace dxvk {
       return DXGI_ERROR_INVALID_CALL;
     
     D3D11_MAPPED_SUBRESOURCE sr;
-    HRESULT hr = context->Map(m_resource, 0,
+    HRESULT hr = context->Map(m_resource, m_subresource,
       mapType, 0, pLockedRect ? &sr : nullptr);
 
     if (hr != S_OK)
@@ -992,7 +1050,7 @@ namespace dxvk {
     m_resource->GetDevice(&device);
     device->GetImmediateContext(&context);
     
-    context->Unmap(m_resource, 0);
+    context->Unmap(m_resource, m_subresource);
     return S_OK;
   }
 
@@ -1020,15 +1078,27 @@ namespace dxvk {
           REFIID                  riid,
           void**                  ppParentResource,
           UINT*                   pSubresourceIndex) {
-    HRESULT hr = m_resource->QueryInterface(riid, ppParentResource);
-    if (pSubresourceIndex)
-      *pSubresourceIndex = 0;
+    HRESULT hr;
+
+    if (!ppParentResource)
+      return E_POINTER;
+
+    InitReturnPtr(ppParentResource);
+    hr = m_resource->QueryInterface(riid, ppParentResource);
+    if (SUCCEEDED(hr))
+      *pSubresourceIndex = m_subresource;
+
     return hr;
   }
   
   
   bool D3D11DXGISurface::isSurfaceCompatible() const {
-    auto desc = m_texture->Desc();
+    auto texture = GetCommonTexture(m_resource);
+
+    if (!texture)
+      return false;
+
+    auto desc = texture->Desc();
 
     return desc->ArraySize == 1
         && desc->MipLevels == 1;
@@ -1084,20 +1154,34 @@ namespace dxvk {
           VkImageLayout*        pLayout,
           VkImageCreateInfo*    pInfo) {
     const Rc<DxvkImage> image = m_texture->GetImage();
+
+    if (!m_locked.load(std::memory_order_acquire)) {
+      // Need to make sure that the image cannot be relocated. This may
+      // be entered by multiple threads, which is fine since the actual
+      // work is serialized into the CS thread and only the first call
+      // will actually modify any image state.
+      Com<ID3D11Device> device;
+      m_resource->GetDevice(&device);
+
+      static_cast<D3D11Device*>(device.ptr())->LockImage(image, 0u);
+
+      m_locked.store(true, std::memory_order_release);
+    }
+
     const DxvkImageCreateInfo& info = image->info();
-    
+
     if (pHandle != nullptr)
       *pHandle = image->handle();
-    
+
     if (pLayout != nullptr)
       *pLayout = info.layout;
-    
+
     if (pInfo != nullptr) {
       // We currently don't support any extended structures
       if (pInfo->sType != VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO
        || pInfo->pNext != nullptr)
         return E_INVALIDARG;
-      
+
       pInfo->flags          = 0;
       pInfo->imageType      = info.type;
       pInfo->format         = info.format;
@@ -1125,10 +1209,11 @@ namespace dxvk {
   : D3D11DeviceChild<ID3D11Texture1D>(pDevice),
     m_texture (this, pDevice, pDesc, p11on12Info, D3D11_RESOURCE_DIMENSION_TEXTURE1D, 0, VK_NULL_HANDLE, nullptr),
     m_interop (this, &m_texture),
-    m_surface (this, &m_texture),
+    m_surface (this),
     m_resource(this, pDevice),
-    m_d3d10   (this) {
-    
+    m_d3d10   (this),
+    m_destructionNotifier(this) {
+
   }
   
   
@@ -1181,7 +1266,12 @@ namespace dxvk {
       *ppvObject = ref(&m_interop);
       return S_OK;
     }
-    
+
+    if (riid == __uuidof(ID3DDestructionNotifier)) {
+      *ppvObject = ref(&m_destructionNotifier);
+      return S_OK;
+    }
+
     if (logQueryInterfaceError(__uuidof(ID3D10Texture1D), riid)) {
       Logger::warn("D3D11Texture1D::QueryInterface: Unknown interface query");
       Logger::warn(str::format(riid));
@@ -1236,10 +1326,11 @@ namespace dxvk {
   : D3D11DeviceChild<ID3D11Texture2D1>(pDevice),
     m_texture   (this, pDevice, pDesc, p11on12Info, D3D11_RESOURCE_DIMENSION_TEXTURE2D, 0, VK_NULL_HANDLE, hSharedHandle),
     m_interop   (this, &m_texture),
-    m_surface   (this, &m_texture),
+    m_surface   (this),
     m_resource  (this, pDevice),
     m_d3d10     (this),
-    m_swapChain (nullptr) {
+    m_swapChain (nullptr),
+    m_destructionNotifier(this) {
   }
 
 
@@ -1251,11 +1342,12 @@ namespace dxvk {
   : D3D11DeviceChild<ID3D11Texture2D1>(pDevice),
     m_texture   (this, pDevice, pDesc, nullptr, D3D11_RESOURCE_DIMENSION_TEXTURE2D, DxgiUsage, vkImage, nullptr),
     m_interop   (this, &m_texture),
-    m_surface   (this, &m_texture),
+    m_surface   (this),
     m_resource  (this, pDevice),
     m_d3d10     (this),
-    m_swapChain (nullptr) {
-    
+    m_swapChain (nullptr),
+    m_destructionNotifier(this) {
+
   }
 
 
@@ -1267,11 +1359,12 @@ namespace dxvk {
   : D3D11DeviceChild<ID3D11Texture2D1>(pDevice),
     m_texture   (this, pDevice, pDesc, nullptr, D3D11_RESOURCE_DIMENSION_TEXTURE2D, DxgiUsage, VK_NULL_HANDLE, nullptr),
     m_interop   (this, &m_texture),
-    m_surface   (this, &m_texture),
+    m_surface   (this),
     m_resource  (this, pDevice),
     m_d3d10     (this),
-    m_swapChain (pSwapChain) {
-    
+    m_swapChain (pSwapChain),
+    m_destructionNotifier(this) {
+
   }
   
   
@@ -1350,7 +1443,12 @@ namespace dxvk {
       *ppvObject = ref(&m_interop);
       return S_OK;
     }
-    
+
+    if (riid == __uuidof(ID3DDestructionNotifier)) {
+      *ppvObject = ref(&m_destructionNotifier);
+      return S_OK;
+    }
+
     if (logQueryInterfaceError(__uuidof(ID3D10Texture2D), riid)) {
       Logger::warn("D3D11Texture2D::QueryInterface: Unknown interface query");
       Logger::warn(str::format(riid));
@@ -1422,8 +1520,9 @@ namespace dxvk {
     m_texture (this, pDevice, pDesc, p11on12Info, D3D11_RESOURCE_DIMENSION_TEXTURE3D, 0, VK_NULL_HANDLE, nullptr),
     m_interop (this, &m_texture),
     m_resource(this, pDevice),
-    m_d3d10   (this) {
-    
+    m_d3d10   (this),
+    m_destructionNotifier(this) {
+
   }
   
   
@@ -1469,7 +1568,12 @@ namespace dxvk {
       *ppvObject = ref(&m_interop);
       return S_OK;
     }
-    
+
+    if (riid == __uuidof(ID3DDestructionNotifier)) {
+      *ppvObject = ref(&m_destructionNotifier);
+      return S_OK;
+    }
+
     if (logQueryInterfaceError(__uuidof(ID3D10Texture3D), riid)) {
       Logger::warn("D3D11Texture3D::QueryInterface: Unknown interface query");
       Logger::warn(str::format(riid));

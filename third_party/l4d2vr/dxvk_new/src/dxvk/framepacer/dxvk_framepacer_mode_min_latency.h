@@ -16,17 +16,16 @@ namespace dxvk {
 
   public:
 
-    MinLatencyMode(Mode mode, LatencyMarkersStorage* storage)
-    : FramePacerMode(mode, storage, 0) {}
+    MinLatencyMode(Mode mode, LatencyMarkersStorage* storage, FrameSync* frameSync, uint64_t firstFrameId)
+    : FramePacerMode(mode, "min-latency", storage, frameSync, firstFrameId) {}
 
     ~MinLatencyMode() {}
 
     void startFrame( uint64_t frameId ) override {
 
       Sleep::TimePoint now = high_resolution_clock::now();
-      int32_t frametime = static_cast<int32_t>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-          now - m_lastStart).count());
+      int32_t frametime = std::chrono::duration_cast<std::chrono::microseconds>(
+        now - m_lastStart ).count();
       int32_t frametimeDiff = std::max( 0, m_fpsLimitFrametime.load() - frametime );
       int32_t delay = std::max( 0, frametimeDiff );
       int32_t maxDelay = std::max( m_fpsLimitFrametime.load(), 20000 );

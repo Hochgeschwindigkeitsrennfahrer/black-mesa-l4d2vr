@@ -19,7 +19,10 @@ namespace dxvk {
 
   public:
 
-    D3D9InterfaceEx(bool bExtended);
+    D3D9InterfaceEx(
+              bool           bExtended,
+        const D3D9ON12_ARGS* pOverrideList,
+              uint32_t       OverrideCount);
 
     ~D3D9InterfaceEx();
 
@@ -121,7 +124,12 @@ namespace dxvk {
 
     HRESULT STDMETHODCALLTYPE GetAdapterLUID(UINT Adapter, LUID* pLUID);
 
-    HRESULT ValidatePresentationParameters(D3DPRESENT_PARAMETERS* pPresentationParameters);
+    HRESULT ValidatePresentationParametersEx(
+        const D3DPRESENT_PARAMETERS* pPresentationParameters,
+        const D3DDISPLAYMODEEX*      pFullscreenDisplayMode);
+
+    HRESULT ValidatePresentationParameters(
+        const D3DPRESENT_PARAMETERS* pPresentationParameters);
 
     const D3D9Options& GetOptions() { return m_d3d9Options; }
 
@@ -144,6 +152,12 @@ namespace dxvk {
 
     Rc<DxvkInstance> GetInstance() { return m_instance; }
 
+    bool HasFormatsUnlocked() const { return m_unlockAdditionalFormats; }
+
+    void EnableAdditionalFormats() {
+            m_unlockAdditionalFormats = true;
+    }
+
   private:
 
     Rc<DxvkInstance>              m_instance;
@@ -159,6 +173,15 @@ namespace dxvk {
     std::vector<D3D9Adapter>      m_adapters;
 
     D3D9VkInteropInterface        m_d3d9Interop;
+
+    static const D3D9ON12_ARGS* Find9On12Args(
+      const Rc<DxvkAdapter>& Adapter,
+      const D3D9ON12_ARGS*   pOverrides,
+            uint32_t         OverrideCount);
+
+    bool m_unlockAdditionalFormats = false;
+
+    D3D9VkExtInterface            m_d3d9ExtInterface;
 
   };
 

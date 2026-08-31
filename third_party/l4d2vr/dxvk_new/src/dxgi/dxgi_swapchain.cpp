@@ -22,7 +22,8 @@ namespace dxvk {
     m_presentId (0u),
     m_presenter (pPresenter),
     m_monitor   (wsi::getWindowMonitor(m_window)),
-    m_is_d3d12(SUCCEEDED(pDevice->QueryInterface(__uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&Com<ID3D12CommandQueue>())))) {
+    m_is_d3d12(SUCCEEDED(pDevice->QueryInterface(__uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&Com<ID3D12CommandQueue>())))),
+    m_destructionNotifier(this) {
 
     if (FAILED(m_presenter->GetAdapter(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&m_adapter))))
       throw DxvkError("DXGI: Failed to get adapter for present device");
@@ -39,7 +40,10 @@ namespace dxvk {
     
     // Apply initial window mode and fullscreen state
     if (!m_descFs.Windowed && FAILED(EnterFullscreenMode(nullptr)))
-      throw DxvkError("DXGI: Failed to set initial fullscreen state");
+    {
+      Logger::warn("DXGI: EnterFullscreenMode failed. Creating a windowed swapchain instead.");
+      m_descFs.Windowed = TRUE;
+    }
 
     // Ensure that RGBA16 swap chains are scRGB if supported
     UpdateColorSpace(m_desc.Format, m_colorSpace);
@@ -87,7 +91,12 @@ namespace dxvk {
       *ppvObject = ref(this);
       return S_OK;
     }
-    
+
+    if (riid == __uuidof(ID3DDestructionNotifier)) {
+      *ppvObject = ref(&m_destructionNotifier);
+      return S_OK;
+    }
+
     if (logQueryInterfaceError(__uuidof(IDXGISwapChain), riid)) {
       Logger::warn("DxgiSwapChain::QueryInterface: Unknown interface query");
       Logger::warn(str::format(riid));
@@ -350,12 +359,14 @@ namespace dxvk {
       SyncInterval = options->syncInterval;
 
     UpdateGlobalHDRState();
-    UpdateTargetFrameRate(SyncInterval);
+
+    if (!(PresentFlags & DXGI_PRESENT_TEST))
+      UpdateTargetFrameRate(SyncInterval);
 
     std::lock_guard<dxvk::recursive_mutex> lockWin(m_lockWindow);
     HRESULT hr = S_OK;
 
-    if (wsi::isWindow(m_window)) {
+    if (wsi::isWindow(m_window) || !m_window) {
       std::lock_guard<dxvk::mutex> lockBuf(m_lockBuffer);
       hr = m_presenter->Present(SyncInterval, PresentFlags, nullptr);
     }
@@ -414,7 +425,7 @@ namespace dxvk {
           UINT                      SwapChainFlags,
     const UINT*                     pCreationNodeMask,
           IUnknown* const*          ppPresentQueue) {
-    if (!wsi::isWindow(m_window))
+    if (m_window && !wsi::isWindow(m_window))
       return DXGI_ERROR_INVALID_CALL;
 
     constexpr UINT PreserveFlags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
@@ -425,10 +436,13 @@ namespace dxvk {
     std::lock_guard<dxvk::mutex> lock(m_lockBuffer);
     m_desc.Width  = Width;
     m_desc.Height = Height;
-    
-    wsi::getWindowSize(m_window,
-      m_desc.Width  ? nullptr : &m_desc.Width,
-      m_desc.Height ? nullptr : &m_desc.Height);
+    m_desc.Flags  = SwapChainFlags;
+
+    if (m_window) {
+      wsi::getWindowSize(m_window,
+        m_desc.Width  ? nullptr : &m_desc.Width,
+        m_desc.Height ? nullptr : &m_desc.Height);
+    }
     
     if (BufferCount != 0)
       m_desc.BufferCount = BufferCount;
@@ -483,12 +497,23 @@ namespace dxvk {
         Logger::err("DXGI: ResizeTarget: Failed to query containing output");
         return E_FAIL;
       }
-      
-      ChangeDisplayMode(output.ptr(), &newDisplayMode);
 
+      RECT bounds = { };
+      wsi::getDesktopCoordinates(m_monitor, &bounds);
+
+      uint32_t width = 0u;
+      uint32_t height = 0u;
+
+      wsi::getWindowSize(m_window, &width, &height);
+
+      // Window bounds were changed behind our back, update saved state
+      if (uint32_t(bounds.right - bounds.left) != width || uint32_t(bounds.bottom - bounds.top) != height)
+        wsi::saveWindowState(m_window, &m_windowState, false);
+
+      ChangeDisplayMode(output.ptr(), &newDisplayMode);
       wsi::updateFullscreenWindow(m_monitor, m_window, false);
     }
-    
+
     return S_OK;
   }
   
@@ -534,7 +559,11 @@ namespace dxvk {
   
   HRESULT STDMETHODCALLTYPE DxgiSwapChain::SetRotation(
           DXGI_MODE_ROTATION        Rotation) {
-    Logger::err("DxgiSwapChain::SetRotation: Not implemented");
+
+    if (Rotation == DXGI_MODE_ROTATION_IDENTITY)
+      return S_OK;
+
+    Logger::err(str::format("DxgiSwapChain::SetRotation(", Rotation,"): Not implemented"));
     return E_NOTIMPL;
   }
   
@@ -692,7 +721,21 @@ namespace dxvk {
 
     if (!wsi::isWindow(m_window))
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
-    
+
+    if (!(m_descFs.ScanlineOrdering >= DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED
+     && m_descFs.ScanlineOrdering <= DXGI_MODE_SCANLINE_ORDER_LOWER_FIELD_FIRST))
+    {
+      Logger::err(str::format("DXGI: EnterFullscreenMode: Invalid scanline order ", m_descFs.ScanlineOrdering));
+      return DXGI_ERROR_INVALID_CALL;
+    }
+
+    if (!(m_descFs.Scaling >= DXGI_MODE_SCALING_UNSPECIFIED
+     && m_descFs.Scaling <= DXGI_MODE_SCALING_STRETCHED))
+    {
+      Logger::err(str::format("DXGI: EnterFullscreenMode: Invalid scaling ", m_descFs.Scaling));
+      return DXGI_ERROR_INVALID_CALL;
+    }
+
     if (output == nullptr) {
       if (FAILED(GetOutputFromMonitor(wsi::getWindowMonitor(m_window), &output))) {
         Logger::err("DXGI: EnterFullscreenMode: Cannot query containing output");
@@ -723,6 +766,8 @@ namespace dxvk {
 
     DXGI_OUTPUT_DESC desc;
     output->GetDesc(&desc);
+
+    wsi::saveWindowState(m_window, &m_windowState, true);
 
     if (!wsi::enterFullscreenMode(desc.Monitor, m_window, &m_windowState, modeSwitch)) {
       Logger::err("DXGI: EnterFullscreenMode: Failed to enter fullscreen mode");
@@ -776,11 +821,12 @@ namespace dxvk {
     if (!wsi::isWindow(m_window))
       return S_OK;
     
-    if (!wsi::leaveFullscreenMode(m_window, &m_windowState, true)) {
+    if (!wsi::leaveFullscreenMode(m_window, &m_windowState)) {
       Logger::err("DXGI: LeaveFullscreenMode: Failed to exit fullscreen mode");
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
     }
-    
+    wsi::restoreWindowState(m_window, &m_windowState, true);
+
     return S_OK;
   }
   

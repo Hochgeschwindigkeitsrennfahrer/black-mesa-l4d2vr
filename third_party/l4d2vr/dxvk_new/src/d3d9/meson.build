@@ -13,8 +13,6 @@ d3d9_shaders = files([
 d3d9_src = [
   'd3d9_main.cpp',
   'd3d9_interface.cpp',
-  'd3d9_vr.cpp',
-  'd3d9_reshade_vr.cpp',
   'd3d9_adapter.cpp',
   'd3d9_monitor.cpp',
   'd3d9_device.cpp',
@@ -44,7 +42,6 @@ d3d9_src = [
   'd3d9_format_helpers.cpp',
   'd3d9_hud.cpp',
   'd3d9_annotation.cpp',
-  'd3d9_mem.cpp',
   'd3d9_window.cpp',
   'd3d9_interop.cpp',
   'd3d9_on_12.cpp',
@@ -53,35 +50,6 @@ d3d9_src = [
 
 d3d9_ld_args      = []
 d3d9_link_depends = []
-d3d9_inc_dirs = [ dxvk_include_path ]
-d3d9_extra_deps = []
-
-if fs.is_dir('../../../L4D2VR')
-  d3d9_inc_dirs += [ include_directories('../../../') ]
-endif
-if fs.is_dir('../../../L4D2VR/sdk')
-  d3d9_inc_dirs += [ include_directories('../../../L4D2VR/sdk') ]
-endif
-
-if platform == 'windows'
-  if fs.is_dir('../../../thirdparty/openvr/include')
-    d3d9_inc_dirs += [ include_directories('../../../thirdparty/openvr/include') ]
-  endif
-
-  openvr_lib_dir = ''
-  if cpu_family == 'x86' and fs.is_dir('../../../thirdparty/openvr/lib/win32')
-    openvr_lib_dir = '../../../thirdparty/openvr/lib/win32'
-  elif cpu_family == 'x86_64' and fs.is_dir('../../../thirdparty/openvr/lib/win64')
-    openvr_lib_dir = '../../../thirdparty/openvr/lib/win64'
-  endif
-
-  if openvr_lib_dir != ''
-    openvr_lib = cpp.find_library('openvr_api', dirs: [ openvr_lib_dir ], required: false)
-    if openvr_lib.found()
-      d3d9_extra_deps += [ openvr_lib ]
-    endif
-  endif
-endif
 
 if platform != 'windows'
   d3d9_ld_args      += [ '-Wl,--version-script', join_paths(meson.current_source_dir(), 'd3d9.sym') ]
@@ -89,8 +57,8 @@ if platform != 'windows'
 endif
 
 d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src, glsl_generator.process(d3d9_shaders), d3d9_res,
-  dependencies        : [ dxso_dep, dxvk_dep ] + d3d9_extra_deps,
-  include_directories : d3d9_inc_dirs,
+  dependencies        : [ dxso_dep, dxvk_dep ],
+  include_directories : dxvk_include_path,
   install             : true,
   vs_module_defs      : 'd3d9'+def_spec_ext,
   link_args           : d3d9_ld_args,
@@ -100,7 +68,7 @@ d3d9_dll = shared_library(dxvk_name_prefix+'d3d9', d3d9_src, glsl_generator.proc
 
 d3d9_dep = declare_dependency(
   link_with           : [ d3d9_dll ],
-  include_directories : d3d9_inc_dirs,
+  include_directories : [ dxvk_include_path ],
 )
 
 if platform != 'windows'

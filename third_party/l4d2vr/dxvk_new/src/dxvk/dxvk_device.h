@@ -40,6 +40,7 @@ namespace dxvk {
     VkBool32 renderPassResolveFormatBug : 1;
     VkBool32 preferRenderPassOps        : 1;
     VkBool32 preferPrimaryCmdBufs       : 1;
+    VkBool32 preferCachedMemory         : 1;
   };
   
   /**
@@ -388,6 +389,41 @@ namespace dxvk {
     Rc<DxvkSparsePageAllocator> createSparsePageAllocator();
 
     /**
+     * \brief Creates built-in pipeline layout
+     *
+     * \param [in] pushConstantStages Push constant stage mask
+     * \param [in] pushConstantSize Push constant size
+     * \param [in] bindingCount Number of resource bindings
+     * \param [in] bindings Resource bindings
+     * \returns Unique pipeline layout
+     */
+    const DxvkPipelineLayout* createBuiltInPipelineLayout(
+            VkShaderStageFlags              pushConstantStages,
+            VkDeviceSize                    pushConstantSize,
+            uint32_t                        bindingCount,
+      const DxvkDescriptorSetLayoutBinding* bindings);
+
+    /**
+     * \brief Creates built-in compute pipeline
+     *
+     * \param [in] layout Pipeline layout
+     * \param [in] stage Shader stage info
+     */
+    VkPipeline createBuiltInComputePipeline(
+      const DxvkPipelineLayout*             layout,
+      const util::DxvkBuiltInShaderStage&   stage);
+
+    /**
+     * \brief Creates built-in graphics pipeline
+     *
+     * \param [in] layout Pipeline layout
+     * \param [in] state Pipeline state
+     */
+    VkPipeline createBuiltInGraphicsPipeline(
+      const DxvkPipelineLayout*             layout,
+      const util::DxvkBuiltInGraphicsState& state);
+
+    /**
      * \brief Imports a buffer
      *
      * \param [in] createInfo Buffer create info
@@ -517,12 +553,14 @@ namespace dxvk {
      * \param [in] commandList The command list to submit
      * \param [in] tracker Latency tracker
      * \param [in] frameId Frame ID
+     * \param [in] queryPool Query pool to read device timestamp
      * \param [out] status Submission feedback
      */
     void submitCommandList(
       const Rc<DxvkCommandList>&      commandList,
       const Rc<DxvkLatencyTracker>&   tracker,
             uint64_t                  frameId,
+            VkQueryPool*              queryPool,
             DxvkSubmitStatus*         status);
 
     /**

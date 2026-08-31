@@ -471,6 +471,10 @@ namespace dxvk {
 
     bool Is11on12Device() const;
 
+    bool LockImage(
+      const Rc<DxvkImage>&            Image,
+            VkImageUsageFlags         Usage);
+
     static D3D_FEATURE_LEVEL GetMaxFeatureLevel(
       const Rc<DxvkInstance>& Instance,
       const Rc<DxvkAdapter>&  Adapter);
@@ -508,7 +512,6 @@ namespace dxvk {
     
     D3D11Initializer*               m_initializer = nullptr;
     D3D10Device*                    m_d3d10Device = nullptr;
-    Com<D3D11ImmediateContext, false> m_context;
 
     D3D11StateObjectSet<D3D11BlendState>        m_bsStateObjects;
     D3D11StateObjectSet<D3D11DepthStencilState> m_dsStateObjects;
@@ -519,9 +522,17 @@ namespace dxvk {
     D3D_FEATURE_LEVEL               m_maxFeatureLevel;
     D3D11DeviceFeatures             m_deviceFeatures;
 
+    Com<D3D11ImmediateContext, false> m_context;
+
+    DxvkShaderKey ComputeShaderKey(
+            VkShaderStageFlagBits   ShaderStage,
+      const void*                   pShaderBytecode,
+            size_t                  BytecodeLength,
+      const DxbcModuleInfo*         pModuleInfo);
+
     HRESULT CreateShaderModule(
             D3D11CommonShader*      pShaderModule,
-            DxvkShaderKey           ShaderKey,
+            VkShaderStageFlagBits   ShaderStage,
       const void*                   pShaderBytecode,
             size_t                  BytecodeLength,
             ID3D11ClassLinkage*     pClassLinkage,
@@ -985,9 +996,11 @@ namespace dxvk {
     D3D11ReflexDevice   m_d3d11Reflex;
     D3D11on12Device     m_d3d11on12;
     DXGIDXVKDevice      m_metaDevice;
-    
+
     DXGIVkSwapChainFactory   m_dxvkFactory;
-    
+
+    D3DDestructionNotifier   m_destructionNotifier;
+
     uint32_t m_frameLatency = DefaultFrameLatency;
 
   };

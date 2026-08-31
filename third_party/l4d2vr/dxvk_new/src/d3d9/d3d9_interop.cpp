@@ -111,6 +111,17 @@ namespace dxvk {
           VkImageLayout*        pLayout,
           VkImageCreateInfo*    pInfo) {
     const Rc<DxvkImage> image = m_texture->GetImage();
+
+    if (unlikely(!image)) {
+      if (pHandle != nullptr)
+        *pHandle = VK_NULL_HANDLE;
+
+      if (pLayout != nullptr)
+        *pLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+      return D3DERR_NOTFOUND;
+    }
+
     const DxvkImageCreateInfo& info = image->info();
     
     if (pHandle != nullptr)
@@ -238,7 +249,7 @@ namespace dxvk {
   }
 
   void STDMETHODCALLTYPE D3D9VkInteropDevice::LockDevice() {
-    m_lock = m_device->LockDeviceExclusive();
+    m_lock = m_device->LockDevice();
   }
   
   void STDMETHODCALLTYPE D3D9VkInteropDevice::UnlockDevice() {
@@ -362,6 +373,29 @@ namespace dxvk {
       Logger::err(e.message());
       return D3DERR_OUTOFVIDEOMEMORY;
     }
+  }
+
+D3D9VkExtInterface::D3D9VkExtInterface(D3D9InterfaceEx *pInterface)
+    : m_interface(pInterface) {
+
+  }
+  
+  ULONG STDMETHODCALLTYPE D3D9VkExtInterface::AddRef() {
+    return m_interface->AddRef();
+  }
+  
+  ULONG STDMETHODCALLTYPE D3D9VkExtInterface::Release() {
+    return m_interface->Release();
+  }
+  
+  HRESULT STDMETHODCALLTYPE D3D9VkExtInterface::QueryInterface(
+          REFIID                  riid,
+          void**                  ppvObject) {
+    return m_interface->QueryInterface(riid, ppvObject);
+  }
+
+  void STDMETHODCALLTYPE D3D9VkExtInterface::UnlockAdditionalFormats() {
+    m_interface->EnableAdditionalFormats();
   }
 
 }

@@ -39,6 +39,9 @@ namespace bmvr
     // G-buffers actually allocated at offscreen eye size (native HMD pixels).
     bool UseGbMatchViewLock();
     bool OffscreenWorldMatchesEyes();
+    // OpenXR helper session: stereo views must use HMD-aspect pixels so ATW
+    // does not warp a 16:9 framebuffer. Disables the flashlight gbmatch lock.
+    void SetOpenXrHelperSession(bool active);
 
     void DisableNamedRenderTargets(const char* reason);
     void DisableStereoRenderView(const char* reason);

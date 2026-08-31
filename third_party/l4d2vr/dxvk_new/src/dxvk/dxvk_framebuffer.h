@@ -24,12 +24,12 @@ namespace dxvk {
   /**
    * \brief Framebuffer attachment
    * 
-   * Stores an attachment, as well as the image layout
-   * that will be used for rendering to the attachment.
    */
   struct DxvkAttachment {
-    Rc<DxvkImageView> view    = nullptr;
-    VkImageLayout     layout  = VK_IMAGE_LAYOUT_UNDEFINED;
+    Rc<DxvkImageView> view = nullptr;
+
+    bool operator == (const DxvkAttachment& other) const { return view == other.view; }
+    bool operator != (const DxvkAttachment& other) const { return view != other.view; }
   };
   
   
@@ -42,6 +42,19 @@ namespace dxvk {
   struct DxvkRenderTargets {
     DxvkAttachment depth;
     DxvkAttachment color[MaxNumRenderTargets];
+
+    bool operator == (const DxvkRenderTargets& other) const {
+      bool eq = depth == other.depth;
+
+      for (uint32_t i = 0; i < MaxNumRenderTargets && eq; i++)
+        eq = color[i] == other.color[i];
+
+      return eq;
+    }
+
+    bool operator != (const DxvkRenderTargets& other) const {
+      return !(this->operator == (other));
+    }
   };
 
 
@@ -62,33 +75,6 @@ namespace dxvk {
     VkRenderingAttachmentInfo depth = { };
     VkRenderingAttachmentInfo stencil = { };
     VkRenderingInfo rendering = { };
-  };
-
-
-  /**
-   * \brief Framebuffer key
-   */
-  struct DxvkFramebufferKey {
-    uint64_t            colorViews[MaxNumRenderTargets];
-    uint64_t            depthView;
-    VkRenderPass        renderPass;
-
-    size_t hash() const {
-      DxvkHashState state;
-      state.add(depthView);
-      for (uint32_t i = 0; i < MaxNumRenderTargets; i++)
-        state.add(colorViews[i]);
-      state.add(uint64_t(renderPass));
-      return state;
-    }
-
-    bool eq(const DxvkFramebufferKey& other) const {
-      bool eq = depthView   == other.depthView
-             && renderPass  == other.renderPass;
-      for (uint32_t i = 0; i < MaxNumRenderTargets; i++)
-        eq &= colorViews[i] == other.colorViews[i];
-      return eq;
-    }
   };
 
 
@@ -191,15 +177,6 @@ namespace dxvk {
      * \returns Attachment index
      */
     int32_t findAttachment(const Rc<DxvkImageView>& view) const;
-
-    /**
-     * \brief Checks whether the framebuffer's targets match
-     *
-     * \param [in] renderTargets Render targets to check
-     * \returns \c true if the render targets are the same
-     *          as the ones used for this framebuffer object.
-     */
-    bool hasTargets(const DxvkRenderTargets& renderTargets);
 
     /**
      * \brief Checks whether view and framebuffer sizes match

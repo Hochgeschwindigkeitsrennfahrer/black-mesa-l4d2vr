@@ -4,15 +4,19 @@
 #include "d3d9_caps.h"
 #include "d3d9_device.h"
 #include "d3d9_bridge.h"
+#include "d3d9_window.h"
 #include "d3d9_vr.h"
 
 #include <openvr.h>
 #include "bmvr_flags.h"
+#include "openxr_helper_bridge.h"
+#include "vr_runtime_backend.h"
 
 #include "../util/util_singleton.h"
+#include <shellapi.h>
+#include <Windows.h>
 
 #include <algorithm>
-#include <cstdio>
 
 namespace dxvk {
 
@@ -36,6 +40,54 @@ namespace dxvk {
 #else
     return false;
 #endif
+  }
+
+  // L4D2VR openxr branch starts the x64 helper here so recommended eye size is
+  // known before the swapchain exists. BM does not rewrite the backbuffer to
+  // that size (verified: HMD-sized swapchain blacked the desktop).
+  static bool BootstrapOpenXrRecommendedSize(const OpenXrHelperLaunchConfig& helperConfig)
+  {
+    if (!helperConfig.enabled)
+      return false;
+
+    if (!L4D2VR_StartOpenXrHelper(helperConfig)) {
+      Logger::warn("BMVR CreateDevice: OpenXR helper did not start");
+      return false;
+    }
+
+    L4D2VROpenXrRuntimeViewConfigDesc runtimeViewConfig = { };
+    uint32_t runtimeViewConfigGeneration = 0;
+    const ULONGLONG startMs = GetTickCount64();
+    const ULONGLONG timeoutMs = (std::max)(1000u, helperConfig.waitReadySeconds * 1000u);
+    while (!L4D2VR_ReadOpenXrRuntimeViewConfig(runtimeViewConfig, &runtimeViewConfigGeneration)) {
+      if (!L4D2VR_OpenXrHelperBridgeIsStarted()) {
+        Logger::warn("BMVR CreateDevice: OpenXR helper exited before runtime views");
+        return false;
+      }
+      if (GetTickCount64() - startMs > timeoutMs) {
+        Logger::warn("BMVR CreateDevice: OpenXR runtime view projection was not published in time");
+        return false;
+      }
+      Sleep(10);
+    }
+
+    const uint32_t width = (std::max)(
+      runtimeViewConfig.views[L4D2VR_OPENXR_EYE_LEFT].width,
+      runtimeViewConfig.views[L4D2VR_OPENXR_EYE_RIGHT].width);
+    const uint32_t height = (std::max)(
+      runtimeViewConfig.views[L4D2VR_OPENXR_EYE_LEFT].height,
+      runtimeViewConfig.views[L4D2VR_OPENXR_EYE_RIGHT].height);
+    if (width < 640 || height < 360)
+      return false;
+
+    bmvr::g_RecommendedEyeWidth = width;
+    bmvr::g_RecommendedEyeHeight = height;
+    Logger::info(str::format(
+      "BMVR CreateDevice: OpenXR helper ready recommended ",
+      width, "x", height,
+      " runtimeViewGen=", runtimeViewConfigGeneration,
+      " (swapchain size unchanged)"));
+    return true;
   }
 
   static bool IsL4NNekoEnginePostLaunchArgPresent() {
@@ -62,12 +114,13 @@ namespace dxvk {
 
   Singleton<DxvkInstance> g_dxvkInstance;
 
-  D3D9InterfaceEx::D3D9InterfaceEx(bool bExtended)
+  D3D9InterfaceEx::D3D9InterfaceEx(bool bExtended, const D3D9ON12_ARGS* pOverrideList, uint32_t OverrideCount)
     : m_instance    ( g_dxvkInstance.acquire(DxvkInstanceFlag::ClientApiIsD3D9) )
     , m_d3d8Bridge  ( this )
     , m_extended    ( bExtended ) 
     , m_d3d9Options ( nullptr, m_instance->config() )
-    , m_d3d9Interop ( this ) {
+    , m_d3d9Interop ( this )
+    , m_d3d9ExtInterface( this ) {
     // D3D9 doesn't enumerate adapters like physical adapters...
     // only as connected displays.
 
@@ -96,8 +149,10 @@ namespace dxvk {
           ? m_instance->enumAdapters(0)
           : m_instance->enumAdapters(adapterOrdinal);
 
-        if (adapter != nullptr)
-          m_adapters.emplace_back(this, adapter, adapterOrdinal++, i - 1);
+        if (adapter != nullptr) {
+          const auto* d3d9On12Args = Find9On12Args(adapter, pOverrideList, OverrideCount);
+          m_adapters.emplace_back(this, d3d9On12Args, adapter, adapterOrdinal++, i - 1);
+        }
       }
     }
     else
@@ -106,8 +161,10 @@ namespace dxvk {
       const uint32_t adapterCount = m_instance->adapterCount();
       m_adapters.reserve(adapterCount);
 
-      for (uint32_t i = 0; i < adapterCount; i++)
-        m_adapters.emplace_back(this, m_instance->enumAdapters(i), i, 0);
+      for (uint32_t i = 0; i < adapterCount; i++) {
+        const auto* d3d9On12Args = Find9On12Args(m_instance->enumAdapters(i), pOverrideList, OverrideCount);
+        m_adapters.emplace_back(this, d3d9On12Args, m_instance->enumAdapters(i), i, 0);
+      }
     }
 
 #ifdef _WIN32
@@ -148,6 +205,11 @@ namespace dxvk {
     if (riid == __uuidof(ID3D9VkInteropInterface)
      || riid == __uuidof(ID3D9VkInteropInterface1)) {
       *ppvObject = ref(&m_d3d9Interop);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(ID3D9VkExtInterface)) {
+      *ppvObject = ref(&m_d3d9ExtInterface);
       return S_OK;
     }
 
@@ -336,6 +398,25 @@ namespace dxvk {
     }
     if (!noHmd)
     {
+      bool skipOpenVrInit = false;
+      const VrRuntimeBackendConfig runtimeConfig = L4D2VR_ReadRuntimeBackendConfig();
+      const VrRuntimeBackendSelection runtimeSelection =
+        L4D2VR_SelectRuntimeBackend(runtimeConfig.requestedBackend, true);
+      if (runtimeSelection.active == VrRuntimeBackend::OpenXR)
+      {
+        const OpenXrHelperLaunchConfig helperConfig = L4D2VR_ReadOpenXrHelperLaunchConfig();
+        if (helperConfig.enabled)
+        {
+          BootstrapOpenXrRecommendedSize(helperConfig);
+          // OpenXR owns the SteamVR/OpenXR scene app. VR_Init(Scene) here after
+          // a helper timeout started a second scene app, delayed load ~45s, and
+          // the game closed at the main menu.
+          skipOpenVrInit = true;
+        }
+      }
+
+      if (!skipOpenVrInit)
+      {
       vr::EVRInitError vrErr = vr::VRInitError_None;
       vr::IVRSystem* vrSys = vr::VR_Init(&vrErr, vr::VRApplication_Scene);
       if (vrErr == vr::VRInitError_None && vrSys)
@@ -395,6 +476,7 @@ namespace dxvk {
         Logger::warn(str::format(
           "BMVR CreateDevice: VR_Init failed (",
           static_cast<int>(vrErr), ") — keeping desktop swapchain size"));
+      }
       }
     }
     (void)noHmd;
@@ -500,17 +582,20 @@ namespace dxvk {
     if (unlikely(DeviceType == D3DDEVTYPE_SW))
       return D3DERR_INVALIDCALL;
 
-    // D3DDEVTYPE_REF devices can be created with D3D8, but not
-    // with D3D9, unless the Windows SDK 8.0 or later is installed.
-    // Report it unavailable, as it would be on most end-user systems.
-    if (unlikely(DeviceType == D3DDEVTYPE_REF && !m_isD3D8Compatible))
-      return D3DERR_NOTAVAILABLE;
-
     // Creating a device with D3DCREATE_PUREDEVICE only works in conjunction
     // with D3DCREATE_HARDWARE_VERTEXPROCESSING on native drivers.
     if (unlikely(BehaviorFlags & D3DCREATE_PUREDEVICE &&
                !(BehaviorFlags & D3DCREATE_HARDWARE_VERTEXPROCESSING)))
       return D3DERR_INVALIDCALL;
+
+    // Neither D3DDEVTYPE_REF nor D3DDEVTYPE_NULLREF support HWVP, although they
+    // will accept these flags as any regular D3DDEVTYPE_HAL device would.
+    if (unlikely(DeviceType == D3DDEVTYPE_REF || DeviceType == D3DDEVTYPE_NULLREF)) {
+      BehaviorFlags &= ~D3DCREATE_MIXED_VERTEXPROCESSING
+                     & ~D3DCREATE_PUREDEVICE
+                     & ~D3DCREATE_HARDWARE_VERTEXPROCESSING;
+      BehaviorFlags |= D3DCREATE_SOFTWARE_VERTEXPROCESSING;
+    }
 
     HRESULT hr;
     // Black Desert creates a D3DDEVTYPE_NULLREF device and
@@ -540,6 +625,9 @@ namespace dxvk {
         BehaviorFlags,
         dxvkDevice);
 
+      if (!pPresentationParameters->Windowed)
+        ActivateFocusWindow(hFocusWindow ? hFocusWindow : pPresentationParameters->hDeviceWindow);
+
       hr = device->InitialReset(pPresentationParameters, pFullscreenDisplayMode);
 
       if (unlikely(FAILED(hr)))
@@ -564,7 +652,36 @@ namespace dxvk {
   }
 
 
-  HRESULT D3D9InterfaceEx::ValidatePresentationParameters(D3DPRESENT_PARAMETERS* pPresentationParameters) {
+  HRESULT D3D9InterfaceEx::ValidatePresentationParametersEx(
+    const D3DPRESENT_PARAMETERS* pPresentationParameters,
+    const D3DDISPLAYMODEEX*      pFullscreenDisplayMode) {
+    if (unlikely(pPresentationParameters == nullptr))
+      return D3DERR_INVALIDCALL;
+
+    // pFullscreenDisplayMode must not be NULL in full screen mode.
+    if (unlikely(!pPresentationParameters->Windowed && pFullscreenDisplayMode == nullptr))
+      return D3DERR_INVALIDCALL;
+
+    // pFullscreenDisplayMode must be NULL in windowed mode.
+    if (unlikely(pPresentationParameters->Windowed && pFullscreenDisplayMode != nullptr))
+      return D3DERR_INVALIDCALL;
+
+    // On extended devices, the backbuffer dimensions
+    // must match the display mode when in full screen mode.
+    if (unlikely(!pPresentationParameters->Windowed &&
+                  (pPresentationParameters->BackBufferWidth  != pFullscreenDisplayMode->Width
+                || pPresentationParameters->BackBufferHeight != pFullscreenDisplayMode->Height)))
+      return D3DERR_INVALIDCALL;
+
+    return ValidatePresentationParameters(pPresentationParameters);
+  }
+
+
+  HRESULT D3D9InterfaceEx::ValidatePresentationParameters(
+    const D3DPRESENT_PARAMETERS* pPresentationParameters) {
+    if (unlikely(pPresentationParameters == nullptr))
+      return D3DERR_INVALIDCALL;
+
     if (m_extended) {
       // The swap effect value on a D3D9Ex device
       // can not be higher than D3DSWAPEFFECT_FLIPEX.
@@ -616,6 +733,37 @@ namespace dxvk {
       return D3DERR_INVALIDCALL;
 
     return D3D_OK;
+  }
+
+
+  const D3D9ON12_ARGS* D3D9InterfaceEx::Find9On12Args(
+    const Rc<DxvkAdapter>& Adapter,
+    const D3D9ON12_ARGS*   pOverrides,
+          uint32_t         OverrideCount) {
+    const D3D9ON12_ARGS* arg = nullptr;
+
+#ifdef _WIN32
+    for (uint32_t i = 0u; i < OverrideCount; i++) {
+      if (pOverrides[i].pD3D12Device) {
+        const auto& vk11 = Adapter->devicePropertiesExt().vk11;
+
+        if (vk11.deviceLUIDValid) {
+          Com<ID3D12Device> device = nullptr;
+
+          if (SUCCEEDED(pOverrides[i].pD3D12Device->QueryInterface(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device)))) {
+            LUID luid = device->GetAdapterLuid();
+
+            if (!std::memcmp(&luid, vk11.deviceLUID, sizeof(vk11.deviceLUID)))
+              arg = &pOverrides[i];
+          }
+        }
+      } else if (!arg) {
+        arg = &pOverrides[i];
+      }
+    }
+#endif
+
+    return arg;
   }
 
 }

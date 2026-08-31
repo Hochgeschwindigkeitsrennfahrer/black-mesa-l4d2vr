@@ -3,7 +3,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "dxvk_descriptor.h"
+#include "dxvk_descriptor_pool.h"
 #include "dxvk_format.h"
 #include "dxvk_hash.h"
 #include "dxvk_memory.h"
@@ -98,6 +98,15 @@ namespace dxvk {
      * \returns Buffer slice handle
      */
     DxvkBufferSliceHandle getSliceHandle() const;
+
+    /**
+     * \brief Retrieves raw buffer descriptor info
+     *
+     * Useful when accessing a buffer view as an
+     * unformatted storage or uniform buffer.
+     * \returns Raw buffer descriptor info
+     */
+    VkDescriptorBufferInfo getRawDescriptorInfo() const;
 
     /**
      * \brief Element count
@@ -268,8 +277,8 @@ namespace dxvk {
      * \param [in] length Buffer slice length
      * \returns Buffer slice descriptor
      */
-    DxvkDescriptorInfo getDescriptor(VkDeviceSize offset, VkDeviceSize length) const {
-      DxvkDescriptorInfo result = { };
+    DxvkLegacyDescriptor getDescriptor(VkDeviceSize offset, VkDeviceSize length) const {
+      DxvkLegacyDescriptor result = { };
       result.buffer.buffer = m_bufferInfo.buffer;
       result.buffer.offset = m_bufferInfo.offset + offset;
       result.buffer.range = length;
@@ -346,6 +355,15 @@ namespace dxvk {
 
       if (unlikely(m_info.debugName))
         updateDebugName();
+
+      // If this is a device-local buffer, update residency
+      if (!(m_properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) {
+        auto common = m_properties & m_storage->getMemoryProperties();
+
+        updateResidencyStatus((common & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+          ? DxvkResourceResidency::Resident
+          : DxvkResourceResidency::Evicted);
+      }
 
       // Implicitly invalidate views
       m_version += 1u;
@@ -429,7 +447,6 @@ namespace dxvk {
   private:
 
     Rc<vk::DeviceFn>            m_vkd;
-    DxvkMemoryAllocator*        m_allocator     = nullptr;
     VkMemoryPropertyFlags       m_properties    = 0u;
     VkShaderStageFlags          m_shaderStages  = 0u;
     DxvkSharingModeInfo         m_sharingMode   = { };
@@ -591,7 +608,7 @@ namespace dxvk {
      * \brief Retrieves descriptor info
      * \returns Buffer slice descriptor
      */
-    DxvkDescriptorInfo getDescriptor() const {
+    DxvkLegacyDescriptor getDescriptor() const {
       return m_buffer->getDescriptor(m_offset, m_length);
     }
     
@@ -683,12 +700,17 @@ namespace dxvk {
   }
 
 
-  inline void DxvkBufferView::incRef() {
+  inline VkDescriptorBufferInfo DxvkBufferView::getRawDescriptorInfo() const {
+    return m_buffer->getDescriptor(m_key.offset, m_key.size).buffer;
+  }
+
+
+  force_inline void DxvkBufferView::incRef() {
     m_buffer->incRef();
   }
 
 
-  inline void DxvkBufferView::decRef() {
+  force_inline void DxvkBufferView::decRef() {
     m_buffer->decRef();
   }
 

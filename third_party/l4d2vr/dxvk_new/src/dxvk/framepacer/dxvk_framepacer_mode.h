@@ -1,10 +1,10 @@
 #pragma once
 
 #include "dxvk_latency_markers.h"
+#include "dxvk_frame_sync.h"
 #include "../../util/sync/sync_signal.h"
 #include "../../util/util_env.h"
-#include <dxgi.h>
-#include <exception>
+#include "../../util/util_time.h"
 
 namespace dxvk {
 
@@ -14,18 +14,23 @@ namespace dxvk {
 
   class FramePacerMode {
 
+    using time_point = high_resolution_clock::time_point;
+
   public:
 
     enum Mode {
       MAX_FRAME_LATENCY = 0,
       LOW_LATENCY,
+      LOW_LATENCY_VRR,
       MIN_LATENCY
     };
 
-    FramePacerMode( Mode mode, LatencyMarkersStorage* markerStorage, uint32_t maxFrameLatency=1 )
+    FramePacerMode( Mode mode, const char* name, LatencyMarkersStorage* markerStorage, FrameSync* frameSync, uint64_t firstFrameId )
     : m_mode( mode ),
-      m_waitLatency( maxFrameLatency+1 ),
-      m_latencyMarkersStorage( markerStorage ) {
+      m_name( name ),
+      m_firstFrameId( firstFrameId ),
+      m_latencyMarkersStorage( markerStorage ),
+      m_frameSync( frameSync ) {
       setFpsLimitFrametimeFromEnv();
     }
 
@@ -36,25 +41,27 @@ namespace dxvk {
 
     virtual void finishRender( uint64_t frameId ) { }
 
-    void waitRenderFinished( uint64_t frameId ) {
-      if (m_mode) m_fenceGpuFinished.wait(frameId-m_waitLatency); }
+    virtual void notifyQueueSubmit( uint64_t frameId, time_point t ) { }
+    virtual void notifyGpuReady( uint64_t frameId, time_point t ) { }
 
-    void signalRenderFinished( uint64_t frameId ) {
-      if (m_mode) m_fenceGpuFinished.signal(frameId); }
+    void setPresentMode( uint32_t presentMode )
+      { m_presentMode = presentMode; }
 
-    void signalGpuStart( uint64_t frameId ) {
-      if (m_mode) m_fenceGpuStart.signal(frameId); }
+    uint32_t getPresentMode()
+      { return m_presentMode; }
 
-    void signalCsFinished( uint64_t frameId ) {
-      if (m_mode) m_fenceCsFinished.signal(frameId); }
-
-    void setTargetFrameRate( double frameRate ) {
+    virtual void setTargetFrameRate( double frameRate ) {
       if (!m_fpsLimitEnvOverride && frameRate > 1.0)
-        m_fpsLimitFrametime.store(
-          static_cast<int32_t>(1'000'000.0 / frameRate));
+        m_fpsLimitFrametime.store( 1'000'000/frameRate );
     }
 
     const Mode m_mode;
+
+    const char* getName() const
+      { return m_name; }
+
+    uint64_t getFirstFrameId() const
+      { return m_firstFrameId; }
 
     static bool getDoubleFromEnv( const char* name, double* result );
     static bool getIntFromEnv( const char* name, int* result );
@@ -63,14 +70,13 @@ namespace dxvk {
 
     void setFpsLimitFrametimeFromEnv();
 
-    const uint32_t m_waitLatency;
-    LatencyMarkersStorage* m_latencyMarkersStorage;
-    std::atomic<int32_t> m_fpsLimitFrametime = { 0 };
-    bool m_fpsLimitEnvOverride = { false };
-
-    sync::Fence m_fenceGpuStart    = { sync::Fence(DXGI_MAX_SWAP_CHAIN_BUFFERS) };
-    sync::Fence m_fenceGpuFinished = { sync::Fence(DXGI_MAX_SWAP_CHAIN_BUFFERS) };
-    sync::Fence m_fenceCsFinished  = { sync::Fence(DXGI_MAX_SWAP_CHAIN_BUFFERS) };
+    const char*             m_name;
+    const uint64_t          m_firstFrameId;
+    LatencyMarkersStorage*  m_latencyMarkersStorage;
+    FrameSync*              m_frameSync;
+    std::atomic<uint32_t>   m_presentMode;
+    std::atomic<int32_t>    m_fpsLimitFrametime = { 0 };
+    bool                    m_fpsLimitEnvOverride = { false };
 
   };
 
@@ -84,7 +90,7 @@ namespace dxvk {
     try {
       *result = std::stod(env);
       return true;
-    } catch (const std::exception&) {
+    } catch (const std::invalid_argument&) {
       return false;
     }
   }
@@ -98,7 +104,7 @@ namespace dxvk {
     try {
       *result = std::stoi(env);
       return true;
-    } catch (const std::exception&) {
+    } catch (const std::invalid_argument&) {
       return false;
     }
   }
@@ -113,7 +119,7 @@ namespace dxvk {
     if (fpsLimit < 1.0)
       return;
 
-    m_fpsLimitFrametime = static_cast<int32_t>(1'000'000.0 / fpsLimit);
+    m_fpsLimitFrametime = 1'000'000/fpsLimit;
   }
 
 }

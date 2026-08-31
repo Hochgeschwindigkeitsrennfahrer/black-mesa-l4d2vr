@@ -298,6 +298,12 @@ namespace dxvk {
     if (m_renderLatencyHud)
       m_renderLatencyHud->updateLatencyTracker(m_latency);
 
+    if (m_jitterHud)
+      m_jitterHud->updateLatencyTracker(m_latency);
+
+    if (m_latencyDetailsHud)
+      m_latencyDetailsHud->updateLatencyTracker(m_latency);
+
     return hr;
   }
 
@@ -525,6 +531,7 @@ namespace dxvk {
     m_presenter->setFrameRateLimit(m_targetFrameRate, GetActualFrameLatency());
 
     m_latency = m_device->createLatencyTracker(m_presenter);
+    m_presenter->registerLatencyTracker(m_latency);
 
     Com<D3D11ReflexDevice> reflex = GetReflexDevice();
     reflex->RegisterLatencyTracker(m_latency);
@@ -608,8 +615,12 @@ namespace dxvk {
         m_latencyHud = hud->addItem<hud::HudLatencyItem>("latency", 4);
         FramePacer* framePacer = dynamic_cast<FramePacer*>(m_latency.ptr());
         if (framePacer) {
-          int32_t fpsItemPos = hud->getItemPos<hud::HudFpsItem>();
-          m_renderLatencyHud = hud->addItem<hud::HudRenderLatencyItem>("renderlatency", fpsItemPos+1);
+          m_renderLatencyHud = reinterpret_cast<hud::HudRenderLatencyItem*>(
+            hud->getItem<hud::HudRenderLatencyItem>().ptr() );
+          m_jitterHud = reinterpret_cast<hud::HudJitterItem*>(
+            hud->getItem<hud::HudJitterItem>().ptr() );
+          m_latencyDetailsHud = reinterpret_cast<hud::HudLatencyDetailsItem*>(
+            hud->getItem<hud::HudLatencyDetailsItem>().ptr() );
         }
       }
     }
@@ -713,7 +724,9 @@ namespace dxvk {
     uint32_t flHi = (featureLevel >> 12);
     uint32_t flLo = (featureLevel >> 8) & 0x7;
 
-    return str::format("D3D", apiVersion, " FL", flHi, "_", flLo);
+    bool is11On12 = m_parent->Is11on12Device();
+
+    return str::format("D3D", apiVersion, (is11On12 ? "On12" : ""), " FL", flHi, "_", flLo);
   }
 
 }

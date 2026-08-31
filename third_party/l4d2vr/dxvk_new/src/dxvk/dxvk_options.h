@@ -1,7 +1,10 @@
 #pragma once
 
 #include "../util/config/config.h"
+#include "../util/util_env.h"
 #include "dxvk_include.h"
+
+#include "../vulkan/vulkan_loader.h"
 
 namespace dxvk {
 
@@ -28,8 +31,8 @@ namespace dxvk {
     /// Enables pipeline lifetime tracking
     Tristate trackPipelineLifetime = Tristate::Auto;
 
-    // Enable async pipelines
-    bool enableAsync;
+    /// Enable async pipelines
+    bool enableAsync = true;
     // Enable state cache with gpl and fixes for async
     bool gplAsyncCache;
 
@@ -69,8 +72,11 @@ namespace dxvk {
     /// Whether to enable tiler optimizations
     Tristate tilerMode = Tristate::Auto;
 
+    /// Overrides memory budget for DXVK
+    VkDeviceSize maxMemoryBudget = 0u;
+
     /// Frame pacing
-    std::string framePace;
+    std::string framePace = "max-frame-latency";
 
     /// A value in microseconds to fine-tune the low-latency frame pacing.
     /// Positive values make a frame begin later which might improve responsiveness.
@@ -80,6 +86,9 @@ namespace dxvk {
     /// Determines whether a frame is allowed to begin before finishing processing
     /// the cpu-part of the previous one, when low-latency frame pacing is used.
     bool lowLatencyAllowCpuFramesOverlap;
+
+    /// Enable descriptor update templates
+    bool enableDescriptorUpdateTemplates = true;
 
     // Device name
     std::string deviceFilter;

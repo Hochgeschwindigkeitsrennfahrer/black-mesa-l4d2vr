@@ -26,6 +26,7 @@ namespace dxvk {
     VkPhysicalDeviceGraphicsPipelineLibraryPropertiesEXT      extGraphicsPipelineLibrary;
     VkPhysicalDeviceLineRasterizationPropertiesEXT            extLineRasterization;
     VkPhysicalDeviceMultiDrawPropertiesEXT                    extMultiDraw;
+    VkPhysicalDeviceSampleLocationsPropertiesEXT              extSampleLocations;
     VkPhysicalDeviceRobustness2PropertiesEXT                  extRobustness2;
     VkPhysicalDeviceTransformFeedbackPropertiesEXT            extTransformFeedback;
     VkPhysicalDeviceVertexAttributeDivisorPropertiesEXT       extVertexAttributeDivisor;
@@ -48,6 +49,8 @@ namespace dxvk {
     VkPhysicalDeviceVulkan13Features                          vk13;
     VkBool32                                                  amdShaderFragmentMask;
     VkPhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT   extAttachmentFeedbackLoopLayout;
+    VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT   extDynamicRenderingUnusedAttachments;
+    VkPhysicalDeviceBorderColorSwizzleFeaturesEXT             extBorderColorSwizzle;
     VkBool32                                                  extConservativeRasterization;
     VkPhysicalDeviceCustomBorderColorFeaturesEXT              extCustomBorderColor;
     VkPhysicalDeviceDepthClipEnableFeaturesEXT                extDepthClipEnable;
@@ -64,12 +67,14 @@ namespace dxvk {
     VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT             extNonSeamlessCubeMap;
     VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT      extPageableDeviceLocalMemory;
     VkPhysicalDeviceRobustness2FeaturesEXT                    extRobustness2;
+    VkBool32                                                  extSampleLocations;
     VkPhysicalDeviceShaderModuleIdentifierFeaturesEXT         extShaderModuleIdentifier;
     VkBool32                                                  extShaderStencilExport;
     VkBool32                                                  extSwapchainColorSpace;
-    VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT          extSwapchainMaintenance1;
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR          khrSwapchainMaintenance1;
     VkPhysicalDeviceTransformFeedbackFeaturesEXT              extTransformFeedback;
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT         extVertexAttributeDivisor;
+    VkBool32                                                  extCalibratedTimestamps;
     VkBool32                                                  khrExternalMemoryWin32;
     VkBool32                                                  khrExternalSemaphoreWin32;
     VkBool32                                                  extLoadStoreOpNone;
@@ -77,6 +82,8 @@ namespace dxvk {
     VkPhysicalDeviceMaintenance7FeaturesKHR                   khrMaintenance7;
     VkPhysicalDevicePresentIdFeaturesKHR                      khrPresentId;
     VkPhysicalDevicePresentWaitFeaturesKHR                    khrPresentWait;
+    VkPhysicalDevicePresentId2FeaturesKHR                     khrPresentId2;
+    VkPhysicalDevicePresentWait2FeaturesKHR                   khrPresentWait2;
     VkBool32                                                  khrSwapchainMutableFormat;
     VkPhysicalDeviceDescriptorPoolOverallocationFeaturesNV    nvDescriptorPoolOverallocation;
     VkBool32                                                  nvLowLatency2;

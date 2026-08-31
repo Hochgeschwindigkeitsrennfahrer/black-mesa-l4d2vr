@@ -68,6 +68,7 @@ public:
     void* GetInterface(const char* dllname, const char* interfacename);
     C_BaseEntity* GetClientEntity(int entityIndex);
     C_BaseEntity* GetLocalPlayerEntity();
+    C_BaseEntity* ResolveEntityFromHandle(uint32_t handle);
     C_BaseEntity* GetActiveWeaponEntity();
     C_BaseEntity* GetViewModelEntity();
     bool GetEntityAttachment(C_BaseEntity* entity, const char* name, Vector& origin, QAngle& angles);
@@ -77,6 +78,7 @@ public:
     void ScanWristHudNetVars();
     bool ReadWristHudValues(int& health, int& armor, int& clip, int& reserve, int& secondary);
     int ReadWeaponClip(C_BaseEntity* weapon);
+    bool WeaponHasNoAmmo(C_BaseEntity* weapon);
     const char* GetActiveWeaponModelName();
     const char* GetEntityModelName(C_BaseEntity* entity);
     const char* GetEntityNetworkName(int entityIndex);

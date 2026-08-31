@@ -34,15 +34,14 @@ namespace dxvk {
   void DxvkPipelineWorkers::compileGraphicsPipeline(
           DxvkGraphicsPipeline*           pipeline,
     const DxvkGraphicsPipelineStateInfo&  state,
-          DxvkPipelinePriority            priority,
-          bool                            async) {
+          DxvkPipelinePriority            priority) {
     std::unique_lock lock(m_lock);
     this->startWorkers();
 
     pipeline->acquirePipeline();
     m_tasksTotal += 1;
 
-    m_buckets[uint32_t(priority)].queue.emplace(pipeline, state, async);
+    m_buckets[uint32_t(priority)].queue.emplace(pipeline, state);
     notifyWorkers(priority);
   }
 
@@ -83,30 +82,34 @@ namespace dxvk {
 
   void DxvkPipelineWorkers::startWorkers() {
     if (!std::exchange(m_workersRunning, true)) {
-      // Get number of CPU logical threads
-      uint32_t workerCount = dxvk::thread::hardware_concurrency();
+      // Determine number of available CPU logical threads, and clamp to a useful
+      // range. DXVK is not tested on extremely high core counts, and
+      // parallelism may be limited past a certain point.
+      uint32_t coreCount = dxvk::thread::hardware_concurrency();
 
-      // Use (number of CPU logical threads - 2) pipeline workers.
+      // Use (number of CPU logical threads - 2) CPU logical threads.
       // Less stuttering when compiling shaders while playing,
       // in comparison to using all CPU logical threads.
-      workerCount = workerCount > 2 ? workerCount - 2 : 1;
+      coreCount = coreCount - 2;
 
-      // Catch systems with fewer than four reported logical threads.
-      if (workerCount <  1) workerCount =  1;
-      // Catching systems with more than 64 threads
-      if (workerCount > 64) workerCount = 64;
-
-      // Reduce worker count on 32-bit to save adderss space
-      if (env::is32BitHostPlatform())
-        workerCount = std::min(workerCount, 16u);
+      coreCount = std::clamp(coreCount, 1u, 64u);
 
       if (m_device->config().numCompilerThreads > 0)
-        workerCount = m_device->config().numCompilerThreads;
+        coreCount = m_device->config().numCompilerThreads;
+
+      // Reduce worker count on 32-bit to save adderss space
+      uint32_t workerCount = coreCount;
+
+      if (env::is32BitHostPlatform())
+        workerCount = std::min(workerCount, 12u);
 
       // Number of workers that can process pipeline pipelines with normal
       // priority. Any other workers can only build high-priority pipelines.
-      uint32_t npWorkerCount = std::max(((workerCount - 1) * 5) / 7, 1u);
-      uint32_t lpWorkerCount = std::max(((workerCount - 1) * 2) / 7, 1u);
+      // Base this on the available core count, not the worker count, since
+      // that is what determines the impact of having multiple threads do
+      // heavy CPU work.
+      uint32_t npWorkerCount = std::clamp(((coreCount - 1) * 5) / 7, 1u, workerCount);
+      uint32_t lpWorkerCount = std::clamp(((coreCount - 1) * 2) / 7, 1u, workerCount);
 
       m_workers.reserve(workerCount);
 
@@ -170,7 +173,7 @@ namespace dxvk {
       if (entry.pipelineLibrary) {
         entry.pipelineLibrary->compilePipeline();
       } else if (entry.graphicsPipeline) {
-        entry.graphicsPipeline->compilePipeline(entry.graphicsState, entry.async);
+        entry.graphicsPipeline->compilePipeline(entry.graphicsState);
         entry.graphicsPipeline->releasePipeline();
       }
 
@@ -213,13 +216,12 @@ namespace dxvk {
     DxvkShaderPipelineLibraryKey key;
     key.addShader(shaders.cs);
 
-    auto layout = createPipelineLayout(shaders.cs->getBindings());
     auto library = findPipelineLibraryLocked(key);
 
     auto iter = m_computePipelines.emplace(
       std::piecewise_construct,
       std::tuple(shaders),
-      std::tuple(m_device, this, shaders, layout, library));
+      std::tuple(m_device, this, shaders, library));
     return &iter.first->second;
   }
   
@@ -234,23 +236,6 @@ namespace dxvk {
     auto pair = m_graphicsPipelines.find(shaders);
     if (pair != m_graphicsPipelines.end())
       return &pair->second;
-
-    DxvkBindingLayout mergedLayout(VK_SHADER_STAGE_ALL_GRAPHICS);
-    mergedLayout.merge(shaders.vs->getBindings());
-
-    if (shaders.tcs != nullptr)
-      mergedLayout.merge(shaders.tcs->getBindings());
-
-    if (shaders.tes != nullptr)
-      mergedLayout.merge(shaders.tes->getBindings());
-
-    if (shaders.gs != nullptr)
-      mergedLayout.merge(shaders.gs->getBindings());
-
-    if (shaders.fs != nullptr)
-      mergedLayout.merge(shaders.fs->getBindings());
-
-    auto layout = createPipelineLayout(mergedLayout);
 
     DxvkShaderPipelineLibrary* vsLibrary = nullptr;
     DxvkShaderPipelineLibrary* fsLibrary = nullptr;
@@ -299,8 +284,7 @@ namespace dxvk {
     auto iter = m_graphicsPipelines.emplace(
       std::piecewise_construct,
       std::tuple(shaders),
-      std::tuple(m_device, this, shaders,
-        layout, vsLibrary, fsLibrary));
+      std::tuple(m_device, this, shaders, vsLibrary, fsLibrary));
     return &iter.first->second;
   }
 
@@ -393,8 +377,8 @@ namespace dxvk {
   }
 
 
-  DxvkBindingSetLayout* DxvkPipelineManager::createDescriptorSetLayout(
-    const DxvkBindingSetLayoutKey& key) {
+  const DxvkDescriptorSetLayout* DxvkPipelineManager::createDescriptorSetLayout(
+    const DxvkDescriptorSetLayoutKey& key) {
     auto pair = m_descriptorSetLayouts.find(key);
     if (pair != m_descriptorSetLayouts.end())
       return &pair->second;
@@ -407,37 +391,27 @@ namespace dxvk {
   }
 
 
-  DxvkBindingLayoutObjects* DxvkPipelineManager::createPipelineLayout(
-    const DxvkBindingLayout& layout) {
-    auto pair = m_pipelineLayouts.find(layout);
+  const DxvkPipelineLayout* DxvkPipelineManager::createPipelineLayout(
+    const DxvkPipelineLayoutKey& key) {
+    auto pair = m_pipelineLayouts.find(key);
     if (pair != m_pipelineLayouts.end())
       return &pair->second;
 
-    std::array<const DxvkBindingSetLayout*, DxvkDescriptorSets::SetCount> setLayouts = { };
-    uint32_t setMask = layout.getSetMask();
-
-    for (uint32_t i = 0; i < setLayouts.size(); i++) {
-      if (setMask & (1u << i))
-        setLayouts[i] = createDescriptorSetLayout(layout.getBindingList(i));
-    }
-
     auto iter = m_pipelineLayouts.emplace(
       std::piecewise_construct,
-      std::tuple(layout),
-      std::tuple(m_device, layout, setLayouts.data()));
+      std::tuple(key),
+      std::tuple(m_device, key));
     return &iter.first->second;
   }
 
 
   DxvkShaderPipelineLibrary* DxvkPipelineManager::createPipelineLibraryLocked(
     const DxvkShaderPipelineLibraryKey& key) {
-    auto bindings = key.getBindings();
-    auto layout = createPipelineLayout(bindings);
 
     auto iter = m_shaderLibraries.emplace(
       std::piecewise_construct,
       std::tuple(key),
-      std::tuple(m_device, this, key, layout));
+      std::tuple(m_device, this, key));
     return &iter.first->second;
   }
 
@@ -446,13 +420,10 @@ namespace dxvk {
     std::lock_guard<dxvk::mutex> lock(m_mutex);
     DxvkShaderPipelineLibraryKey key;
 
-    DxvkBindingLayout bindings(VK_SHADER_STAGE_FRAGMENT_BIT);
-    auto layout = createPipelineLayout(bindings);
-
     auto iter = m_shaderLibraries.emplace(
       std::piecewise_construct,
-      std::tuple(),
-      std::tuple(m_device, this, key, layout));
+      std::tuple(key),
+      std::tuple(m_device, this, key));
     return &iter.first->second;
   }
 

@@ -1103,8 +1103,10 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             m_WeaponMenuSlots[placed].axialR = r;
             m_WeaponMenuSlots[placed].center = m_WeaponMenuOrigin
                 + m_WeaponMenuRight * ox + m_WeaponMenuUp * oy;
-            m_WeaponMenuSlots[placed].equipped = !m_EmptyHands
-                && (m_Game->GetClientEntity(wpn.entityIndex) == active);
+            C_BaseEntity* ent = m_Game->GetClientEntity(wpn.entityIndex);
+            m_WeaponMenuSlots[placed].equipped = !m_EmptyHands && (ent == active);
+            m_WeaponMenuSlots[placed].dry = (kind != KindCrowbar)
+                && m_Game->WeaponHasNoAmmo(ent);
             strncpy_s(m_WeaponMenuSlots[placed].label, LabelForKind(kind), _TRUNCATE);
             ++placed;
         };
@@ -1337,16 +1339,23 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
         // packing ×1.20 leaves a visible gap.
         const float radius = drawR;
         const float edge = radius * 0.08f;
-        const D3DCOLOR fill = hover
-            ? D3DCOLOR_ARGB(210, 48, 36, 10)
-            : D3DCOLOR_ARGB(170, 14, 12, 8);
-        const D3DCOLOR frame = hover
-            ? D3DCOLOR_XRGB(255, 240, 140)
-            : (slot.equipped ? D3DCOLOR_XRGB(255, 176, 0) : D3DCOLOR_ARGB(220, 200, 140, 30));
+        const bool dry = slot.dry && !slot.emptyHand;
+        const D3DCOLOR fill = dry
+            ? (hover ? D3DCOLOR_ARGB(220, 72, 16, 12) : D3DCOLOR_ARGB(190, 42, 10, 8))
+            : (hover ? D3DCOLOR_ARGB(210, 48, 36, 10) : D3DCOLOR_ARGB(170, 14, 12, 8));
+        const D3DCOLOR frame = dry
+            ? (hover ? D3DCOLOR_XRGB(255, 120, 90) : D3DCOLOR_XRGB(255, 56, 40))
+            : (hover ? D3DCOLOR_XRGB(255, 240, 140)
+                : (slot.equipped ? D3DCOLOR_XRGB(255, 176, 0) : D3DCOLOR_ARGB(220, 200, 140, 30)));
         DrawHexFill(device, cx, cy, radius - edge, fill);
         DrawHexRing(device, cx, cy, radius, radius - edge, frame);
         if (hover)
-            DrawHexRing(device, cx, cy, radius + 1.5f, radius - edge * 0.35f, D3DCOLOR_ARGB(160, 255, 255, 200));
+        {
+            const D3DCOLOR glow = dry
+                ? D3DCOLOR_ARGB(170, 255, 90, 70)
+                : D3DCOLOR_ARGB(160, 255, 255, 200);
+            DrawHexRing(device, cx, cy, radius + 1.5f, radius - edge * 0.35f, glow);
+        }
 
         if (slot.emptyHand)
             continue;
@@ -1359,7 +1368,9 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
             const float ih = radius * 0.66f;
             const float x0 = cx - iw * 0.5f;
             const float y0 = cy - ih * 0.5f;
-            const D3DCOLOR tint = hover ? D3DCOLOR_XRGB(255, 255, 255) : D3DCOLOR_XRGB(255, 230, 180);
+            const D3DCOLOR tint = dry
+                ? (hover ? D3DCOLOR_XRGB(255, 170, 150) : D3DCOLOR_XRGB(255, 72, 56))
+                : (hover ? D3DCOLOR_XRGB(255, 255, 255) : D3DCOLOR_XRGB(255, 230, 180));
             device->SetTexture(0, icon);
             device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
             device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
@@ -1386,7 +1397,9 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
         {
             DrawKindIcon(device, cx, cy, radius * 0.28f,
                 static_cast<WeaponKind>(slot.kind),
-                hover ? D3DCOLOR_XRGB(255, 255, 200) : D3DCOLOR_XRGB(255, 176, 0));
+                dry
+                    ? (hover ? D3DCOLOR_XRGB(255, 160, 140) : D3DCOLOR_XRGB(255, 72, 56))
+                    : (hover ? D3DCOLOR_XRGB(255, 255, 200) : D3DCOLOR_XRGB(255, 176, 0)));
         }
     }
 

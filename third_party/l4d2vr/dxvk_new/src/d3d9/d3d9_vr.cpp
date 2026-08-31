@@ -70,6 +70,10 @@ namespace dxvk {
       pDesc->Height = desc->Height;
       pDesc->Format = tex->GetFormatMapping().FormatColor;
       pDesc->SampleCount = uint32_t(image->info().sampleCount);
+      HANDLE sharedHandle = image->sharedHandle();
+      pDesc->SharedHandle = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(sharedHandle));
+      pDesc->SharedHandleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
+      pDesc->SharedHandleValid = (sharedHandle != nullptr && sharedHandle != INVALID_HANDLE_VALUE) ? 1u : 0u;
 
       return D3D_OK;
     }
@@ -100,10 +104,15 @@ namespace dxvk {
         0, image->info().numLayers
       };
 
+      const VkImageLayout readableLayout =
+        (g_Game && g_Game->m_VR && g_Game->m_VR->m_OpenXrHelperBridgeActive)
+          ? VK_IMAGE_LAYOUT_GENERAL
+          : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+
       m_device->TransformImage(
         tex, &subresources,
         image->info().layout,
-        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+        readableLayout);
 
       // This wait may need to be on all Faces and Mip Levels (2 loops).
       if (waitResourceIdle)

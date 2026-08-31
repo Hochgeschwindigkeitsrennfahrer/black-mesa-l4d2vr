@@ -792,14 +792,9 @@ namespace dxvk {
     moduleInfo.tess    = nullptr;
     moduleInfo.xfb     = nullptr;
 
-    Sha1Hash hash = Sha1Hash::compute(
-      pShaderBytecode, BytecodeLength);
-    
-    HRESULT hr = CreateShaderModule(&module,
-      DxvkShaderKey(VK_SHADER_STAGE_VERTEX_BIT, hash),
-      pShaderBytecode, BytecodeLength, pClassLinkage,
-      &moduleInfo);
-    
+    HRESULT hr = CreateShaderModule(&module, VK_SHADER_STAGE_VERTEX_BIT,
+      pShaderBytecode, BytecodeLength, pClassLinkage, &moduleInfo);
+
     if (FAILED(hr))
       return hr;
     
@@ -824,13 +819,8 @@ namespace dxvk {
     moduleInfo.tess    = nullptr;
     moduleInfo.xfb     = nullptr;
 
-    Sha1Hash hash = Sha1Hash::compute(
-      pShaderBytecode, BytecodeLength);
-    
-    HRESULT hr = CreateShaderModule(&module,
-      DxvkShaderKey(VK_SHADER_STAGE_GEOMETRY_BIT, hash),
-      pShaderBytecode, BytecodeLength, pClassLinkage,
-      &moduleInfo);
+    HRESULT hr = CreateShaderModule(&module, VK_SHADER_STAGE_GEOMETRY_BIT,
+      pShaderBytecode, BytecodeLength, pClassLinkage, &moduleInfo);
 
     if (FAILED(hr))
       return hr;
@@ -898,37 +888,15 @@ namespace dxvk {
     
     if (RasterizedStream != D3D11_SO_NO_RASTERIZED_STREAM)
       Logger::err("D3D11: CreateGeometryShaderWithStreamOutput: Rasterized stream not supported");
-    
-    // Compute hash from both the xfb info and the source
-    // code, because both influence the generated code
-    DxbcXfbInfo hashXfb = xfb;
 
-    std::vector<Sha1Data> chunks = {{
-      { pShaderBytecode, BytecodeLength  },
-      { &hashXfb,        sizeof(hashXfb) },
-    }};
-
-    for (uint32_t i = 0; i < hashXfb.entryCount; i++) {
-      const char* semantic = hashXfb.entries[i].semanticName;
-
-      if (semantic) {
-        chunks.push_back({ semantic, std::strlen(semantic) });
-        hashXfb.entries[i].semanticName = nullptr;
-      }
-    }
-
-    Sha1Hash hash = Sha1Hash::compute(chunks.size(), chunks.data());
-    
     // Create the actual shader module
     DxbcModuleInfo moduleInfo;
     moduleInfo.options = m_dxbcOptions;
     moduleInfo.tess    = nullptr;
     moduleInfo.xfb     = &xfb;
-    
-    HRESULT hr = CreateShaderModule(&module,
-      DxvkShaderKey(VK_SHADER_STAGE_GEOMETRY_BIT, hash),
-      pShaderBytecode, BytecodeLength, pClassLinkage,
-      &moduleInfo);
+
+    HRESULT hr = CreateShaderModule(&module, VK_SHADER_STAGE_GEOMETRY_BIT,
+      pShaderBytecode, BytecodeLength, pClassLinkage, &moduleInfo);
 
     if (FAILED(hr))
       return E_INVALIDARG;
@@ -954,14 +922,8 @@ namespace dxvk {
     moduleInfo.tess    = nullptr;
     moduleInfo.xfb     = nullptr;
 
-    Sha1Hash hash = Sha1Hash::compute(
-      pShaderBytecode, BytecodeLength);
-    
-
-    HRESULT hr = CreateShaderModule(&module,
-      DxvkShaderKey(VK_SHADER_STAGE_FRAGMENT_BIT, hash),
-      pShaderBytecode, BytecodeLength, pClassLinkage,
-      &moduleInfo);
+    HRESULT hr = CreateShaderModule(&module, VK_SHADER_STAGE_FRAGMENT_BIT,
+      pShaderBytecode, BytecodeLength, pClassLinkage, &moduleInfo);
 
     if (FAILED(hr))
       return hr;
@@ -993,11 +955,7 @@ namespace dxvk {
     if (tessInfo.maxTessFactor >= 8.0f)
       moduleInfo.tess = &tessInfo;
 
-    Sha1Hash hash = Sha1Hash::compute(
-      pShaderBytecode, BytecodeLength);
-    
-    HRESULT hr = CreateShaderModule(&module,
-      DxvkShaderKey(VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT, hash),
+    HRESULT hr = CreateShaderModule(&module, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
       pShaderBytecode, BytecodeLength, pClassLinkage, &moduleInfo);
 
     if (FAILED(hr))
@@ -1024,11 +982,7 @@ namespace dxvk {
     moduleInfo.tess    = nullptr;
     moduleInfo.xfb     = nullptr;
 
-    Sha1Hash hash = Sha1Hash::compute(
-      pShaderBytecode, BytecodeLength);
-    
-    HRESULT hr = CreateShaderModule(&module,
-      DxvkShaderKey(VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, hash),
+    HRESULT hr = CreateShaderModule(&module, VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT,
       pShaderBytecode, BytecodeLength, pClassLinkage, &moduleInfo);
 
     if (FAILED(hr))
@@ -1055,13 +1009,8 @@ namespace dxvk {
     moduleInfo.tess    = nullptr;
     moduleInfo.xfb     = nullptr;
 
-    Sha1Hash hash = Sha1Hash::compute(
-      pShaderBytecode, BytecodeLength);
-    
-    HRESULT hr = CreateShaderModule(&module,
-      DxvkShaderKey(VK_SHADER_STAGE_COMPUTE_BIT, hash),
-      pShaderBytecode, BytecodeLength, pClassLinkage,
-      &moduleInfo);
+    HRESULT hr = CreateShaderModule(&module, VK_SHADER_STAGE_COMPUTE_BIT,
+      pShaderBytecode, BytecodeLength, pClassLinkage, &moduleInfo);
 
     if (FAILED(hr))
       return hr;
@@ -1855,9 +1804,10 @@ namespace dxvk {
     static bool s_errorShown = false;
 
     if (!std::exchange(s_errorShown, true))
-      Logger::err("D3D11Device::RegisterDeviceRemovedEvent: Not implemented");
+      Logger::warn("D3D11Device::RegisterDeviceRemovedEvent: Stub");
 
-    return E_NOTIMPL;
+    *pdwCookie = 0xdeadbeef;
+    return S_OK;
   }
 
 
@@ -1961,8 +1911,12 @@ namespace dxvk {
 
     enabled.vk13.shaderDemoteToHelperInvocation                   = VK_TRUE;
 
+    // VK_EXT_custom_border_color - enable its features, if respective feature is supported
     enabled.extCustomBorderColor.customBorderColors               = supported.extCustomBorderColor.customBorderColorWithoutFormat;
     enabled.extCustomBorderColor.customBorderColorWithoutFormat   = supported.extCustomBorderColor.customBorderColorWithoutFormat;
+
+    // VK_EXT_dynamic_rendering_unused_attachments - enable its features, if respective feature is supported
+    enabled.extDynamicRenderingUnusedAttachments.dynamicRenderingUnusedAttachments = supported.extDynamicRenderingUnusedAttachments.dynamicRenderingUnusedAttachments;
 
     enabled.extTransformFeedback.transformFeedback                = VK_TRUE;
     enabled.extTransformFeedback.geometryStreams                  = VK_TRUE;
@@ -2009,11 +1963,67 @@ namespace dxvk {
 
     return enabled;
   }
-  
-  
+
+
+  DxvkShaderKey D3D11Device::ComputeShaderKey(
+          VkShaderStageFlagBits   ShaderStage,
+    const void*                   pShaderBytecode,
+          size_t                  BytecodeLength,
+    const DxbcModuleInfo*         pModuleInfo) {
+    constexpr static uint32_t Md5Size = 16;
+
+    // DXBC shaders store an MD5 hash within their header, so just
+    // use that instead of running SHA-1 over the entire binary.
+    Sha1Digest digest = { };
+
+    if (BytecodeLength >= Md5Size + 4u)
+      std::memcpy(&digest[0], reinterpret_cast<const char*>(pShaderBytecode) + 4, Md5Size);
+
+    uint32_t metadata = uint32_t(ShaderStage) | (uint32_t(BytecodeLength) << 8u);
+    std::memcpy(&digest[Md5Size], &metadata, sizeof(metadata));
+
+    // If transform feedback is enabled, hash that state too since it
+    // affects the generated shader code, and factor it into the key.
+    if (pModuleInfo && pModuleInfo->xfb) {
+      std::vector<unsigned char> serialized;
+
+      serialized.push_back(pModuleInfo->xfb->entryCount);
+
+      for (uint32_t i = 0; i < pModuleInfo->xfb->entryCount; i++) {
+        if (pModuleInfo->xfb->entries[i].semanticName) {
+          for (uint32_t j = 0; pModuleInfo->xfb->entries[i].semanticName[j]; j++)
+            serialized.push_back(pModuleInfo->xfb->entries[i].semanticName[j]);
+        }
+
+        serialized.push_back(pModuleInfo->xfb->entries[i].semanticIndex);
+        serialized.push_back(pModuleInfo->xfb->entries[i].componentIndex);
+        serialized.push_back(pModuleInfo->xfb->entries[i].componentCount);
+        serialized.push_back(pModuleInfo->xfb->entries[i].streamId);
+        serialized.push_back(pModuleInfo->xfb->entries[i].bufferId);
+        serialized.push_back(pModuleInfo->xfb->entries[i].offset);
+        serialized.push_back(pModuleInfo->xfb->entries[i].offset >> 8u);
+      }
+
+      for (uint32_t i = 0; i < 4u; i++) {
+        serialized.push_back(pModuleInfo->xfb->strides[i]);
+        serialized.push_back(pModuleInfo->xfb->strides[i] >> 8u);
+      }
+
+      serialized.push_back(pModuleInfo->xfb->rasterizedStream);
+
+      Sha1Digest xfbDigest = Sha1Hash::compute(serialized.data(), serialized.size()).digest();
+
+      for (size_t i = 0; i < xfbDigest.size(); i++)
+        digest[i] ^= xfbDigest[i];
+    }
+
+    return DxvkShaderKey(ShaderStage, Sha1Hash(digest));
+  }
+
+
   HRESULT D3D11Device::CreateShaderModule(
           D3D11CommonShader*      pShaderModule,
-          DxvkShaderKey           ShaderKey,
+          VkShaderStageFlagBits   ShaderStage,
     const void*                   pShaderBytecode,
           size_t                  BytecodeLength,
           ID3D11ClassLinkage*     pClassLinkage,
@@ -2024,10 +2034,12 @@ namespace dxvk {
     if (pClassLinkage != nullptr)
       Logger::warn("D3D11Device::CreateShaderModule: Class linkage not supported");
 
+    DxvkShaderKey shaderKey = ComputeShaderKey(ShaderStage, pShaderBytecode, BytecodeLength, pModuleInfo);
+
     D3D11CommonShader commonShader;
 
     HRESULT hr = m_shaderModules.GetShaderModule(this,
-      &ShaderKey, pModuleInfo, pShaderBytecode, BytecodeLength,
+      &shaderKey, pModuleInfo, pShaderBytecode, BytecodeLength,
       &commonShader);
 
     if (FAILED(hr))
@@ -2466,6 +2478,38 @@ namespace dxvk {
   }
 
 
+  bool D3D11Device::LockImage(
+    const Rc<DxvkImage>&            Image,
+          VkImageUsageFlags         Usage) {
+    bool feedback = false;
+
+    auto chunk = AllocCsChunk(DxvkCsChunkFlag::SingleUse);
+
+    chunk->push([
+      cImage  = Image,
+      cUsage  = Usage,
+      &feedback
+    ] (DxvkContext* ctx) {
+      DxvkImageUsageInfo usageInfo;
+      usageInfo.usage = cUsage;
+      usageInfo.stableGpuAddress = VK_TRUE;
+
+      feedback = ctx->ensureImageCompatibility(cImage, usageInfo);
+    });
+
+    m_context->InjectCsChunk(DxvkCsQueue::HighPriority, std::move(chunk), true);
+
+    if (!feedback) {
+      Logger::err(str::format("Failed to lock image:"
+        "\n  Image format:  ", Image->info().format,
+        "\n  Image usage:   ", std::hex, Image->info().usage,
+        "\n  Desired usage: ", std::hex, Usage));
+    }
+
+    return feedback;
+  }
+
+
 
   D3D11DeviceExt::D3D11DeviceExt(
           D3D11DXGIDevice*        pContainer,
@@ -2813,32 +2857,7 @@ namespace dxvk {
     if (!Image->canRelocate() && (Image->info().usage & Usage))
       return true;
 
-    bool feedback = false;
-
-    auto chunk = m_device->AllocCsChunk(DxvkCsChunkFlag::SingleUse);
-
-    chunk->push([
-      cImage  = Image,
-      cUsage  = Usage,
-      &feedback
-    ] (DxvkContext* ctx) {
-      DxvkImageUsageInfo usageInfo;
-      usageInfo.usage = cUsage;
-      usageInfo.stableGpuAddress = VK_TRUE;
-
-      feedback = ctx->ensureImageCompatibility(cImage, usageInfo);
-    });
-
-    m_device->GetContext()->InjectCsChunk(DxvkCsQueue::HighPriority, std::move(chunk), true);
-
-    if (!feedback) {
-      Logger::err(str::format("Failed to lock image:"
-        "\n  Image format:  ", Image->info().format,
-        "\n  Image usage:   ", std::hex, Image->info().usage,
-        "\n  Desired usage: ", std::hex, Usage));
-    }
-
-    return feedback;
+    return m_device->LockImage(Image, Usage);
   }
 
 
@@ -2893,7 +2912,11 @@ namespace dxvk {
     const D3D11_VIDEO_DECODER_DESC*                     pVideoDesc,
     const D3D11_VIDEO_DECODER_CONFIG*                   pConfig,
           ID3D11VideoDecoder**                          ppDecoder) {
-    Logger::err("D3D11VideoDevice::CreateVideoDecoder: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::CreateVideoDecoder: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -2916,7 +2939,7 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11VideoDevice::CreateAuthenticatedChannel(
           D3D11_AUTHENTICATED_CHANNEL_TYPE              ChannelType,
           ID3D11AuthenticatedChannel**                  ppAuthenticatedChannel) {
-    Logger::err("D3D11VideoDevice::CreateAuthenticatedChannel: Stub");
+    Logger::warn("D3D11VideoDevice::CreateAuthenticatedChannel: Stub");
     return E_NOTIMPL;
   }
 
@@ -2926,7 +2949,7 @@ namespace dxvk {
     const GUID*                                         pDecoderProfile,
     const GUID*                                         pKeyExchangeType,
           ID3D11CryptoSession**                         ppCryptoSession) {
-    Logger::err("D3D11VideoDevice::CreateCryptoSession: Stub");
+    Logger::warn("D3D11VideoDevice::CreateCryptoSession: Stub");
     return E_NOTIMPL;
   }
 
@@ -2935,7 +2958,11 @@ namespace dxvk {
           ID3D11Resource*                               pResource,
     const D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC*         pDesc,
           ID3D11VideoDecoderOutputView**                ppVDOVView) {
-    Logger::err("D3D11VideoDevice::CreateVideoDecoderOutputView: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::CreateVideoDecoderOutputView: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -2984,7 +3011,11 @@ namespace dxvk {
 
 
   UINT STDMETHODCALLTYPE D3D11VideoDevice::GetVideoDecoderProfileCount() {
-    Logger::err("D3D11VideoDevice::GetVideoDecoderProfileCount: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::GetVideoDecoderProfileCount: Stub");
+
     return 0;
   }
 
@@ -2992,7 +3023,11 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11VideoDevice::GetVideoDecoderProfile(
           UINT                                          Index,
           GUID*                                         pDecoderProfile) {
-    Logger::err("D3D11VideoDevice::GetVideoDecoderProfile: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::GetVideoDecoderProfile: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -3001,7 +3036,11 @@ namespace dxvk {
     const GUID*                                         pDecoderProfile,
           DXGI_FORMAT                                   Format,
           BOOL*                                         pSupported) {
-    Logger::err("D3D11VideoDevice::CheckVideoDecoderFormat: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::CheckVideoDecoderFormat: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -3009,8 +3048,17 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D11VideoDevice::GetVideoDecoderConfigCount(
     const D3D11_VIDEO_DECODER_DESC*                     pDesc,
           UINT*                                         pCount) {
-    Logger::err("D3D11VideoDevice::GetVideoDecoderConfigCount: Stub");
-    return E_NOTIMPL;
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::GetVideoDecoderConfigCount: Stub");
+
+    if (!pCount)
+      return E_INVALIDARG;
+
+    *pCount = 0;
+
+    return S_OK;
   }
 
 
@@ -3018,7 +3066,11 @@ namespace dxvk {
     const D3D11_VIDEO_DECODER_DESC*                     pDesc,
           UINT                                          Index,
           D3D11_VIDEO_DECODER_CONFIG*                   pConfig) {
-    Logger::err("D3D11VideoDevice::GetVideoDecoderConfig: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::GetVideoDecoderConfig: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -3027,7 +3079,11 @@ namespace dxvk {
     const GUID*                                         pCryptoType,
     const GUID*                                         pDecoderProfile,
           D3D11_VIDEO_CONTENT_PROTECTION_CAPS*          pCaps) {
-    Logger::err("D3D11VideoDevice::GetContentProtectionCaps: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::GetContentProtectionCaps: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -3037,7 +3093,11 @@ namespace dxvk {
     const GUID*                                         pDecoderProfile,
           UINT                                          Index,
           GUID*                                         pKeyExchangeType) {
-    Logger::err("D3D11VideoDevice::CheckCryptoKeyExchange: Stub");
+    static bool s_errorShown = false;
+
+    if (!std::exchange(s_errorShown, true))
+      Logger::warn("D3D11VideoDevice::CheckCryptoKeyExchange: Stub");
+
     return E_NOTIMPL;
   }
 
@@ -3055,8 +3115,6 @@ namespace dxvk {
     const IUnknown*                                     pData) {
     return m_container->SetPrivateDataInterface(Name, pData);
   }
-
-
 
 
   D3D11ReflexDevice::D3D11ReflexDevice(
@@ -3355,7 +3413,8 @@ namespace dxvk {
     m_d3d11Reflex   (this, &m_d3d11Device),
     m_d3d11on12     (this, &m_d3d11Device, pD3D12Device, pD3D12Queue),
     m_metaDevice    (this),
-    m_dxvkFactory   (this, &m_d3d11Device) {
+    m_dxvkFactory   (this, &m_d3d11Device),
+    m_destructionNotifier(this) {
 
   }
   
@@ -3444,13 +3503,18 @@ namespace dxvk {
       return context->QueryInterface(riid, ppvObject);
     }
 
+    if (riid == __uuidof(ID3DDestructionNotifier)) {
+      *ppvObject = ref(&m_destructionNotifier);
+      return S_OK;
+    }
+
     if (riid == __uuidof(ID3D11Debug))
       return E_NOINTERFACE;      
-    
+
     // Undocumented interfaces that are queried by some games
     if (riid == GUID{0xd56e2a4c,0x5127,0x8437,{0x65,0x8a,0x98,0xc5,0xbb,0x78,0x94,0x98}})
       return E_NOINTERFACE;
-    
+
     if (logQueryInterfaceError(__uuidof(IDXGIDXVKDevice), riid)) {
       Logger::warn("D3D11DXGIDevice::QueryInterface: Unknown interface query");
       Logger::warn(str::format(riid));

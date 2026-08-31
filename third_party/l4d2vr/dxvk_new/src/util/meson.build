@@ -8,9 +8,11 @@ util_src = files([
   'util_matrix.cpp',
   'util_shared_res.cpp',
   'util_sleep.cpp',
+  'util_unmap.cpp',
 
   'thread.cpp',
 
+  'com/com_destruction_notifier.cpp',
   'com/com_guid.cpp',
   'com/com_private_data.cpp',
 

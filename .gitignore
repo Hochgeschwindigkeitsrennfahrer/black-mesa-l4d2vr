@@ -12,6 +12,7 @@ bmvr_heartbeat.txt
 bmvr_skip.txt
 bmvr_in_*.flag
 probe_logs/
+tools/__pycache__/
 CMakeUserPresets.json
 .git.upstream/
 third_party/l4d2vr-openxr/

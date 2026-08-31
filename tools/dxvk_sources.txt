@@ -62,7 +62,6 @@ src/dxvk/dxvk_cmdlist.cpp
 src/dxvk/dxvk_compute.cpp
 src/dxvk/dxvk_context.cpp
 src/dxvk/dxvk_cs.cpp
-src/dxvk/dxvk_descriptor.cpp
 src/dxvk/dxvk_device.cpp
 src/dxvk/dxvk_device_filter.cpp
 src/dxvk/dxvk_extensions.cpp
@@ -125,7 +124,6 @@ src/vulkan/vulkan_names.cpp
 src/d3d9/d3d9_bridge.cpp
 src/d3d9/d3d9_constant_buffer.cpp
 src/d3d9/d3d9_interop.cpp
-src/d3d9/d3d9_mem.cpp
 src/d3d9/d3d9_on_12.cpp
 src/d3d9/d3d9_shader_validator.cpp
 src/d3d9/d3d9_window.cpp
@@ -155,3 +153,8 @@ src/wsi/wsi_platform.cpp
 src/wsi/win32/wsi_monitor_win32.cpp
 src/wsi/win32/wsi_platform_win32.cpp
 src/wsi/win32/wsi_window_win32.cpp
+src/dxvk/dxvk_descriptor_pool.cpp
+src/dxvk/framepacer/dxvk_calibrated_device_timestamps.cpp
+src/dxvk/hud/dxvk_hud_item_latency.cpp
+src/util/com/com_destruction_notifier.cpp
+src/util/util_unmap.cpp

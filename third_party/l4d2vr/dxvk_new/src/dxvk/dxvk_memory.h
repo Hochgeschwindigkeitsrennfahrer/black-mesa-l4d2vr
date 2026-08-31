@@ -6,6 +6,7 @@
 #include "dxvk_access.h"
 #include "dxvk_adapter.h"
 #include "dxvk_allocator.h"
+#include "dxvk_descriptor.h"
 #include "dxvk_hash.h"
 
 #include "../util/util_time.h"
@@ -116,6 +117,8 @@ namespace dxvk {
     VkDeviceSize maxChunkSize = MaxChunkSize;
     /// Next chunk to relocate for defragmentation
     uint32_t nextDefragChunk = ~0u;
+    /// Next chunk to evict resources from
+    uint32_t nextEvictChunk = ~0u;
 
     force_inline int64_t alloc(uint64_t size, uint64_t align) {
       if (size <= DxvkPoolAllocator::MaxSize)
@@ -144,6 +147,8 @@ namespace dxvk {
     uint32_t          memoryTypes   = 0u;
     VkDeviceSize      memoryBudget  = 0u;
     VkMemoryHeap      properties    = { };
+    bool              enforceBudget = false;
+    bool              enableEviction = false;
   };
 
 
@@ -327,9 +332,11 @@ namespace dxvk {
     /// View type
     VkImageViewType viewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
     /// View usage flags
-    VkImageUsageFlags usage = 0u;
+    VkImageUsageFlags usage = VkImageUsageFlags(0u);
     /// View format
     VkFormat format = VK_FORMAT_UNDEFINED;
+    /// Image layout that the view will be used as
+    VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
     /// Aspect flags to include in this view
     VkImageAspectFlags aspects = 0u;
     /// First mip
@@ -348,6 +355,7 @@ namespace dxvk {
       hash.add(uint32_t(viewType));
       hash.add(uint32_t(usage));
       hash.add(uint32_t(format));
+      hash.add(uint32_t(layout));
       hash.add(uint32_t(aspects));
       hash.add(uint32_t(mipIndex) | (uint32_t(mipCount) << 16));
       hash.add(uint32_t(layerIndex) | (uint32_t(layerCount) << 16));
@@ -359,6 +367,7 @@ namespace dxvk {
       return viewType == other.viewType
           && usage == other.usage
           && format == other.format
+          && layout == other.layout
           && aspects == other.aspects
           && mipIndex == other.mipIndex
           && mipCount == other.mipCount
@@ -401,19 +410,19 @@ namespace dxvk {
      * \brief Creates an image view
      *
      * \param [in] key View properties
-     * \returns Image view handle
+     * \returns Pointer to descriptor info
      */
-    VkImageView createImageView(
+    const DxvkDescriptor* createImageView(
       const DxvkImageViewKey&           key);
 
   private:
 
-    Rc<vk::DeviceFn>  m_vkd;
+    DxvkDevice*       m_device = nullptr;
     VkImage           m_image = VK_NULL_HANDLE;
 
     dxvk::mutex       m_mutex;
     std::unordered_map<DxvkImageViewKey,
-      VkImageView, DxvkHash, DxvkEq> m_views;
+      DxvkDescriptor, DxvkHash, DxvkEq> m_views;
 
   };
 
@@ -519,7 +528,7 @@ namespace dxvk {
      * Frees allocation if necessary
      */
     force_inline void decRef() {
-      if (unlikely(m_useCount.fetch_sub(1u, std::memory_order_acquire) == 1u))
+      if (unlikely(m_useCount.fetch_sub(1u, std::memory_order_release) == 1u))
         free();
     }
 
@@ -611,7 +620,7 @@ namespace dxvk {
      * \param [in] key View properties
      * \returns Image view handle
      */
-    VkImageView createImageView(
+    const DxvkDescriptor* createImageView(
       const DxvkImageViewKey&           key);
 
   private:
@@ -895,10 +904,14 @@ namespace dxvk {
   private:
 
     struct FreeList {
-      uint16_t size = 0u;
+      DxvkResourceAllocation* push( DxvkResourceAllocation* allocation );
+
+      alignas(CACHE_LINE_SIZE)
+      std::atomic<uint16_t> size = { 0u };
       uint16_t capacity = 0u;
 
-      DxvkResourceAllocation* head = nullptr;
+      alignas(CACHE_LINE_SIZE)
+      std::atomic<DxvkResourceAllocation*> head = { nullptr };
     };
 
     struct List {
@@ -912,10 +925,8 @@ namespace dxvk {
       high_resolution_clock::time_point drainTime = { };
     };
 
-    alignas(CACHE_LINE_SIZE)
     DxvkMemoryAllocator*        m_allocator = nullptr;
 
-    dxvk::mutex                 m_freeMutex;
     std::array<FreeList, PoolCount> m_freeLists = { };
 
     alignas(CACHE_LINE_SIZE)
@@ -961,6 +972,8 @@ namespace dxvk {
     NoAllocation    = 1,
     /// Avoid using a dedicated allocation for this resource
     NoDedicated     = 2,
+    /// Do not use device memory. Used to evict resources.
+    NoDeviceMemory  = 3,
 
     eFlagEnum
   };
@@ -1270,6 +1283,15 @@ namespace dxvk {
             DxvkPagedResource*          resource);
 
     /**
+     * \brief Requests to make a resource resident
+     *
+     * Attempts to move an evicted resource back to VRAM.
+     * \param [in] resource Resource to relocate
+     */
+    void requestMakeResident(
+            DxvkPagedResource*          resource);
+
+    /**
      * \brief Locks an allocation in place
      *
      * Ensures that the resource is marked as immovable so
@@ -1451,8 +1473,13 @@ namespace dxvk {
     void pickDefragChunk(
             DxvkMemoryType&       type);
 
+    void evictResources(
+            DxvkMemoryType&       type);
+
     void performTimedTasksLocked(
             high_resolution_clock::time_point currentTime);
+
+    bool enableDefrag() const;
 
   };
   

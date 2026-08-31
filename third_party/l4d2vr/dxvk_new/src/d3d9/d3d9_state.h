@@ -20,11 +20,7 @@ namespace dxvk {
   static constexpr uint32_t SamplerStateCount = D3DSAMP_DMAPOFFSET + 1;
   static constexpr uint32_t SamplerCount      = caps::MaxTexturesPS + caps::MaxTexturesVS + 1;
   static constexpr uint32_t TextureStageStateCount = DXVK_TSS_COUNT;
-
-  namespace hacks::PointSize {
-    static constexpr DWORD AlphaToCoverageDisabled = MAKEFOURCC('A', '2', 'M', '0');
-    static constexpr DWORD AlphaToCoverageEnabled  = MAKEFOURCC('A', '2', 'M', '1');
-  }
+  static constexpr uint32_t PaletteEntryCount = 256;
   
   struct D3D9ClipPlane {
     float coeff[4] = {};
@@ -113,6 +109,25 @@ namespace dxvk {
     float Phi;
   };
 
+  constexpr D3DLIGHT9 DefaultLight = {
+    D3DLIGHT_DIRECTIONAL,     // Type
+    {1.0f, 1.0f, 1.0f, 0.0f}, // Diffuse
+    {0.0f, 0.0f, 0.0f, 0.0f}, // Specular
+    {0.0f, 0.0f, 0.0f, 0.0f}, // Ambient
+    {0.0f, 0.0f, 0.0f},       // Position
+    {0.0f, 0.0f, 1.0f},       // Direction
+    0.0f,                     // Range
+    0.0f,                     // Falloff
+    0.0f, 0.0f, 0.0f,         // Attenuations [constant, linear, quadratic]
+    0.0f,                     // Theta
+    0.0f                      // Phi
+  };
+
+  struct D3D9LightState {
+    bool isValid = false;
+    bool isEnabled = false;
+    D3DLIGHT9 light = DefaultLight;
+  };
 
   struct D3D9FixedFunctionVS {
     Matrix4 WorldView;
@@ -168,21 +183,8 @@ namespace dxvk {
     Com<D3D9VertexBuffer, false> vertexBuffer;
 
     UINT              offset = 0;
+    UINT              length = 0;
     UINT              stride = 0;
-  };
-
-  constexpr D3DLIGHT9 DefaultLight = {
-    D3DLIGHT_DIRECTIONAL,     // Type
-    {1.0f, 1.0f, 1.0f, 0.0f}, // Diffuse
-    {0.0f, 0.0f, 0.0f, 0.0f}, // Specular
-    {0.0f, 0.0f, 0.0f, 0.0f}, // Ambient
-    {0.0f, 0.0f, 0.0f},       // Position
-    {0.0f, 0.0f, 1.0f},       // Direction
-    0.0f,                     // Range
-    0.0f,                     // Falloff
-    0.0f, 0.0f, 0.0f,         // Attenuations [constant, linear, quadratic]
-    0.0f,                     // Theta
-    0.0f                      // Phi
   };
 
   template <typename T>
@@ -282,6 +284,8 @@ namespace dxvk {
     D3DVIEWPORT9                                        viewport = {};
     RECT                                                scissorRect = {};
 
+    D3DCLIPSTATUS9                                      clipStatus = {0, 0xffffffff};
+
     ItemType<std::array<
       D3D9ClipPlane,
       caps::MaxClipPlanes>>                             clipPlanes = {};
@@ -289,6 +293,11 @@ namespace dxvk {
     ItemType<std::array<
       std::array<DWORD, TextureStageStateCount>,
       caps::TextureStageCount>>                         textureStages = {};
+
+    std::unordered_map<
+       UINT,
+       std::array<PALETTEENTRY, PaletteEntryCount>>     texturePalettes;
+    UINT                                                texturePaletteNumber = 0u;
 
     ItemType<D3D9ShaderConstantsVSSoftware>             vsConsts;
     ItemType<D3D9ShaderConstantsPS>                     psConsts;
@@ -299,13 +308,10 @@ namespace dxvk {
 
     ItemType<D3DMATERIAL9>                              material = {};
 
-    std::vector<std::optional<D3DLIGHT9>>               lights;
-    std::array<DWORD, caps::MaxEnabledLights>           enabledLightIndices;
+    std::vector<D3D9LightState>                         lights;
 
-    bool IsLightEnabled(DWORD Index) const {
-      const auto& enabledIndices = enabledLightIndices;
-      return std::find(enabledIndices.begin(), enabledIndices.end(), Index) != enabledIndices.end();
-    }
+    float                                               nPatchSegments = 0.0f;
+
   };
 
   using D3D9CapturableState = D3D9State<dynamic_item>;

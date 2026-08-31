@@ -24,6 +24,11 @@ struct D3D9_TEXTURE_VR_DESC {
   uint32_t         Height;
   VkFormat         Format;
   uint32_t         SampleCount;
+
+  // KMT export for L4D2VR's x64 OpenXR helper (OPAQUE_WIN32_KMT).
+  uint64_t         SharedHandle;
+  uint32_t         SharedHandleType;
+  uint32_t         SharedHandleValid;
 };
 
 MIDL_INTERFACE("7e272b32-a49c-46c7-b1a4-ef52936bec87")

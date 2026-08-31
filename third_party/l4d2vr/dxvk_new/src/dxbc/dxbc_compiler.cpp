@@ -237,16 +237,17 @@ namespace dxvk {
     m_module.setDebugName(m_entryPointId, "main");
 
     // Create the shader object
-    DxvkShaderCreateInfo info;
+    DxvkShaderCreateInfo info = { };
     info.stage = m_programInfo.shaderStage();
     info.bindingCount = m_bindings.size();
     info.bindings = m_bindings.data();
     info.inputMask = m_inputMask;
     info.outputMask = m_outputMask;
-    info.pushConstStages = VK_SHADER_STAGE_FRAGMENT_BIT;
-    info.pushConstSize = sizeof(DxbcPushConstants);
     info.inputTopology = m_inputTopology;
     info.outputTopology = m_outputTopology;
+
+    if (m_ps.pushConstantId)
+      info.pushConstSize = sizeof(DxbcPushConstants);
 
     if (m_programInfo.type() == DxbcProgramType::HullShader)
       info.patchVertexCount = m_hs.vertexCountIn;
@@ -854,11 +855,10 @@ namespace dxvk {
     
     // Compute the DXVK binding slot index for the buffer.
     // D3D11 needs to bind the actual buffers to this slot.
-    uint32_t bindingId = computeConstantBufferBinding(
-      m_programInfo.type(), regIdx);
-    
-    m_module.decorateDescriptorSet(varId, 0);
-    m_module.decorateBinding(varId, bindingId);
+    auto bindingId = nextBindingId();
+
+    m_module.decorateDescriptorSet(varId, bindingId.getSet());
+    m_module.decorateBinding(varId, bindingId.getBinding());
 
     DxbcConstantBuffer buf;
     buf.varId  = varId;
@@ -866,12 +866,13 @@ namespace dxvk {
     m_constantBuffers.at(regIdx) = buf;
     
     // Store descriptor info for the shader interface
-    DxvkBindingInfo binding = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    binding.viewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
-    binding.access = VK_ACCESS_UNIFORM_READ_BIT;
-    binding.resourceBinding = bindingId;
-    binding.uboSet = true;
-    m_bindings.push_back(binding);
+    auto& binding = m_bindings.emplace_back();
+    binding.set             = bindingId.getSet();
+    binding.binding         = bindingId.getBinding();
+    binding.resourceIndex   = computeConstantBufferBinding(m_programInfo.type(), regIdx);
+    binding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    binding.access          = VK_ACCESS_UNIFORM_READ_BIT;
+    binding.flags.set(DxvkDescriptorFlag::UniformBuffer);
   }
 
 
@@ -896,17 +897,17 @@ namespace dxvk {
     m_samplers.at(samplerId).typeId = samplerType;
     
     // Compute binding slot index for the sampler
-    uint32_t bindingId = computeSamplerBinding(
-      m_programInfo.type(), samplerId);
-    
-    m_module.decorateDescriptorSet(varId, 0);
-    m_module.decorateBinding(varId, bindingId);
-    
+    auto bindingId = nextBindingId();
+
+    m_module.decorateDescriptorSet(varId, bindingId.getSet());
+    m_module.decorateBinding(varId, bindingId.getBinding());
+
     // Store descriptor info for the shader interface
-    DxvkBindingInfo binding = { VK_DESCRIPTOR_TYPE_SAMPLER };
-    binding.viewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
-    binding.resourceBinding = bindingId;
-    m_bindings.push_back(binding);
+    auto& binding = m_bindings.emplace_back();
+    binding.set             = bindingId.getSet();
+    binding.binding         = bindingId.getBinding();
+    binding.resourceIndex   = computeSamplerBinding(m_programInfo.type(), samplerId);
+    binding.descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLER;
   }
   
   
@@ -1025,12 +1026,10 @@ namespace dxvk {
     
     // Compute the DXVK binding slot index for the resource.
     // D3D11 needs to bind the actual resource to this slot.
-    uint32_t bindingId = isUav
-      ? computeUavBinding(m_programInfo.type(), registerId)
-      : computeSrvBinding(m_programInfo.type(), registerId);
-    
-    m_module.decorateDescriptorSet(varId, 0);
-    m_module.decorateBinding(varId, bindingId);
+    auto bindingId = nextBindingId();
+
+    m_module.decorateDescriptorSet(varId, bindingId.getSet());
+    m_module.decorateBinding(varId, bindingId.getBinding());
     
     // Declare a specialization constant which will
     // store whether or not the resource is bound.
@@ -1076,10 +1075,16 @@ namespace dxvk {
     }
     
     // Store descriptor info for the shader interface
-    DxvkBindingInfo binding = { };
-    binding.viewType = typeInfo.vtype;
-    binding.resourceBinding = bindingId;
-    binding.isMultisampled = typeInfo.ms;
+    auto& binding = m_bindings.emplace_back();
+    binding.set           = bindingId.getSet();
+    binding.binding       = bindingId.getBinding();
+    binding.resourceIndex = isUav
+      ? computeUavBinding(m_programInfo.type(), registerId)
+      : computeSrvBinding(m_programInfo.type(), registerId);
+    binding.viewType      = typeInfo.vtype;
+
+    if (typeInfo.ms)
+      binding.flags.set(DxvkDescriptorFlag::Multisampled);
 
     if (isUav) {
       binding.descriptorType = resourceType == DxbcResourceDim::Buffer
@@ -1100,8 +1105,6 @@ namespace dxvk {
         : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
       binding.access = VK_ACCESS_SHADER_READ_BIT;
     }
-
-    m_bindings.push_back(binding);
   }
   
   
@@ -1140,12 +1143,7 @@ namespace dxvk {
     uint32_t resAlign = isStructured
       ? (resStride & -resStride)
       : 16;
-    
-    // Compute the DXVK binding slot index for the resource.
-    uint32_t bindingId = isUav
-      ? computeUavBinding(m_programInfo.type(), registerId)
-      : computeSrvBinding(m_programInfo.type(), registerId);
-    
+
     // Test whether we should use a raw SSBO for this resource
     bool hasSparseFeedback = isUav
       ? m_analysis->uavInfos[registerId].sparseFeedback
@@ -1187,10 +1185,12 @@ namespace dxvk {
 
     m_module.setDebugName(varId,
       str::format(isUav ? "u" : "t", registerId).c_str());
-    
-    m_module.decorateDescriptorSet(varId, 0);
-    m_module.decorateBinding(varId, bindingId);
-    
+
+    auto bindingId = nextBindingId();
+
+    m_module.decorateDescriptorSet(varId, bindingId.getSet());
+    m_module.decorateBinding(varId, bindingId.getBinding());
+
     if (isUav) {
       DxbcUav uav;
       uav.type          = resType;
@@ -1220,12 +1220,15 @@ namespace dxvk {
     }
     
     // Store descriptor info for the shader interface
-    DxvkBindingInfo binding = { };
-    binding.descriptorType = useRawSsbo
+    auto& binding = m_bindings.emplace_back();
+    binding.set             = bindingId.getSet();
+    binding.binding         = bindingId.getBinding();
+    binding.resourceIndex   = isUav
+      ? computeUavBinding(m_programInfo.type(), registerId)
+      : computeSrvBinding(m_programInfo.type(), registerId);
+    binding.descriptorType  = useRawSsbo
       ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
       : (isUav ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER);
-    binding.viewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
-    binding.resourceBinding = bindingId;
     binding.access = VK_ACCESS_SHADER_READ_BIT;
 
     if (isUav) {
@@ -1241,8 +1244,6 @@ namespace dxvk {
       if (!(binding.access & VK_ACCESS_SHADER_READ_BIT))
         m_module.decorate(varId, spv::DecorationNonReadable);
     }
-
-    m_bindings.push_back(binding);
 
     // If supported, we'll be using raw access chains to access this
     if (!m_hasRawAccessChains && m_moduleInfo.options.supportsRawAccessChains) {
@@ -1473,19 +1474,19 @@ namespace dxvk {
     
     m_module.setDebugName(varId,
       str::format("u", regId, "_meta").c_str());
-    
-    uint32_t bindingId = computeUavCounterBinding(
-      m_programInfo.type(), regId);
-    
-    m_module.decorateDescriptorSet(varId, 0);
-    m_module.decorateBinding(varId, bindingId);
-    
+
+    auto bindingId = nextBindingId();
+
+    m_module.decorateDescriptorSet(varId, bindingId.getSet());
+    m_module.decorateBinding(varId, bindingId.getBinding());
+
     // Declare the storage buffer binding
-    DxvkBindingInfo binding = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER };
-    binding.resourceBinding = bindingId;
-    binding.viewType = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
-    binding.access = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    m_bindings.push_back(binding);
+    auto& binding = m_bindings.emplace_back();
+    binding.set               = bindingId.getSet();
+    binding.binding           = bindingId.getBinding();
+    binding.resourceIndex     = computeUavCounterBinding(m_programInfo.type(), regId);
+    binding.descriptorType    = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    binding.access            = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
 
     return varId;
   }
@@ -2328,33 +2329,48 @@ namespace dxvk {
     // Load source operand as 32-bit float vector.
     const DxbcRegisterValue srcValue = emitRegisterLoad(
       ins.src[0], DxbcRegMask(true, true, true, true));
-    
-    // Either output may be DxbcOperandType::Null, in
-    // which case we don't have to generate any code.
-    if (ins.dst[0].type != DxbcOperandType::Null) {
-      const DxbcRegisterValue sinInput =
-        emitRegisterExtract(srcValue, ins.dst[0].mask);
-      
-      DxbcRegisterValue sin;
-      sin.type = sinInput.type;
-      sin.id = m_module.opSin(
-        getVectorTypeId(sin.type),
-        sinInput.id);
-      
-      emitRegisterStore(ins.dst[0], sin);
+
+    uint32_t typeId = getScalarTypeId(srcValue.type.ctype);
+
+    DxbcRegisterValue sinVector = { };
+    sinVector.type.ctype = DxbcScalarType::Float32;
+
+    DxbcRegisterValue cosVector = { };
+    cosVector.type.ctype = DxbcScalarType::Float32;
+
+    // Only compute sincos for enabled components
+    std::array<uint32_t, 4> sinIds = { };
+    std::array<uint32_t, 4> cosIds = { };
+
+    for (uint32_t i = 0; i < 4; i++) {
+      const uint32_t sinIndex = 0u;
+      const uint32_t cosIndex = 1u;
+
+      if (ins.dst[0].mask[i] || ins.dst[1].mask[i]) {
+        uint32_t sincosId = m_module.opSinCos(m_module.opCompositeExtract(typeId, srcValue.id, 1u, &i), !m_moduleInfo.options.sincosEmulation);
+
+        if (ins.dst[0].type != DxbcOperandType::Null && ins.dst[0].mask[i])
+          sinIds[sinVector.type.ccount++] = m_module.opCompositeExtract(typeId, sincosId, 1u, &sinIndex);
+
+        if (ins.dst[1].type != DxbcOperandType::Null && ins.dst[1].mask[i])
+          cosIds[cosVector.type.ccount++] = m_module.opCompositeExtract(typeId, sincosId, 1u, &cosIndex);
+      }
     }
-    
-    if (ins.dst[1].type != DxbcOperandType::Null) {
-      const DxbcRegisterValue cosInput =
-        emitRegisterExtract(srcValue, ins.dst[1].mask);
-      
-      DxbcRegisterValue cos;
-      cos.type = cosInput.type;
-      cos.id = m_module.opCos(
-        getVectorTypeId(cos.type),
-        cosInput.id);
-      
-      emitRegisterStore(ins.dst[1], cos);
+
+    if (sinVector.type.ccount) {
+      sinVector.id = sinVector.type.ccount > 1u
+        ? m_module.opCompositeConstruct(getVectorTypeId(sinVector.type), sinVector.type.ccount, sinIds.data())
+        : sinIds[0];
+
+      emitRegisterStore(ins.dst[0], sinVector);
+    }
+
+    if (cosVector.type.ccount) {
+      cosVector.id = cosVector.type.ccount > 1u
+        ? m_module.opCompositeConstruct(getVectorTypeId(cosVector.type), cosVector.type.ccount, cosIds.data())
+        : cosIds[0];
+
+      emitRegisterStore(ins.dst[1], cosVector);
     }
   }
   
@@ -6692,8 +6708,8 @@ namespace dxvk {
         { m_hs.builtinTessLevelOuter, 1 },  // FinalTriVeq0EdgeTessFactor
         { m_hs.builtinTessLevelOuter, 2 },  // FinalTriWeq0EdgeTessFactor
         { m_hs.builtinTessLevelInner, 0 },  // FinalTriInsideTessFactor
-        { m_hs.builtinTessLevelOuter, 0 },  // FinalLineDensityTessFactor
         { m_hs.builtinTessLevelOuter, 1 },  // FinalLineDetailTessFactor
+        { m_hs.builtinTessLevelOuter, 0 },  // FinalLineDensityTessFactor
       }};
       
       const TessFactor tessFactor = s_tessFactors.at(uint32_t(sv)
@@ -7968,7 +7984,12 @@ namespace dxvk {
     m_uavRdMask |= readMask;
   }
 
-  
+
+  DxvkShaderBinding DxbcCompiler::nextBindingId() const {
+    return DxvkShaderBinding(m_programInfo.shaderStage(), uint32_t(m_programInfo.type()), m_bindings.size());
+  }
+
+
   DxbcVectorType DxbcCompiler::getInputRegType(uint32_t regIdx) const {
     switch (m_programInfo.type()) {
       case DxbcProgramType::VertexShader: {

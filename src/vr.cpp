@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -861,6 +862,7 @@ bool VR::InitOpenXR()
     }
 
     m_OpenXrHelperBridgeActive = L4D2VR_StartOpenXrHelper(helperConfig);
+    bmvr::SetOpenXrHelperSession(m_OpenXrHelperBridgeActive);
     if (!m_OpenXrHelperBridgeActive)
     {
         Game::logMsg("[VR][OpenXRHelper] helper did not start");
@@ -880,12 +882,14 @@ bool VR::InitOpenXR()
         {
             Game::logMsg("[VR][OpenXRHelper] helper exited before runtime views");
             m_OpenXrHelperBridgeActive = false;
+            bmvr::SetOpenXrHelperSession(false);
             return false;
         }
         if (GetTickCount64() - runtimeViewStartMs > runtimeViewTimeoutMs)
         {
             Game::logMsg("[VR][OpenXRHelper] runtime view projection was not published in time");
             m_OpenXrHelperBridgeActive = false;
+            bmvr::SetOpenXrHelperSession(false);
             return false;
         }
         Sleep(10);
@@ -913,6 +917,7 @@ bool VR::InitOpenXR()
     {
         Game::logMsg("[VR][OpenXRHelper] runtime view projection is invalid");
         m_OpenXrHelperBridgeActive = false;
+        bmvr::SetOpenXrHelperSession(false);
         return false;
     }
 
@@ -923,6 +928,7 @@ bool VR::InitOpenXR()
     {
         Game::logMsg("[VR][OpenXRHelper] runtime view FOV is invalid");
         m_OpenXrHelperBridgeActive = false;
+        bmvr::SetOpenXrHelperSession(false);
         return false;
     }
 
@@ -1080,6 +1086,13 @@ bool VR::ConsumeOpenXrTracking()
 
     m_OpenXrLastHmdPose = openXrPose;
     m_OpenXrLastHmdPoseGeneration = generation;
+    if (openXrPose.reserved0 != 0)
+    {
+        float ipd = 0.f;
+        std::memcpy(&ipd, &openXrPose.reserved0, sizeof(ipd));
+        if (ipd >= 0.04f && ipd <= 0.10f)
+            m_Ipd = ipd;
+    }
     L4D2VR_ReadOpenXrInputState(m_OpenXrLastInputState, &m_OpenXrLastInputStateGeneration);
 
     const L4D2VROpenXrControllerPoseDesc& physicalLeft = PickOpenXrHandPose(
@@ -1190,7 +1203,8 @@ bool VR::ShouldExportOpenXrEyeTexture(TextureID texID, uint32_t sampleCount) con
         texID == Texture_RightEye ||
         texID == Texture_LeftEyeSubmit ||
         texID == Texture_RightEyeSubmit ||
-        texID == Texture_HUD;
+        texID == Texture_HUD ||
+        texID == Texture_OpenXrPublish;
 }
 
 void VR::PublishOpenXrEyeTexture(TextureID texID, const D3D9_TEXTURE_VR_DESC& desc)
@@ -1221,14 +1235,27 @@ void VR::PublishOpenXrEyeTexture(TextureID texID, const D3D9_TEXTURE_VR_DESC& de
     shared.image = desc.Image;
     const uint32_t eyeIndex = isLeft ? L4D2VR_OPENXR_EYE_LEFT : L4D2VR_OPENXR_EYE_RIGHT;
     const bool submitTexture = texID == Texture_LeftEyeSubmit || texID == Texture_RightEyeSubmit;
-    if (submitTexture)
+    // OpenXR helper contain-blits the full eye RT (hands/HUD/wheel are in-eye).
+    // OpenVR-style UV bounds only crop overlay content away from the HMD image.
+    const bool fullEyeBounds = submitTexture || m_OpenXrHelperBridgeActive;
+    if (fullEyeBounds)
     {
         shared.uMin = 0.0f;
         shared.vMin = 0.0f;
         shared.uMax = 1.0f;
         shared.vMax = 1.0f;
-        shared.renderFovXDeg = 0.0f;
-        shared.renderAspect = 0.0f;
+        if (submitTexture)
+        {
+            shared.renderFovXDeg = 0.0f;
+            shared.renderAspect = 0.0f;
+        }
+        else
+        {
+            shared.renderFovXDeg = (std::isfinite(m_Fov) && m_Fov > 1.0f && m_Fov < 179.0f) ? m_Fov : 90.0f;
+            shared.renderAspect = (std::isfinite(m_Aspect) && m_Aspect > 0.1f && m_Aspect < 10.0f)
+                ? m_Aspect
+                : ((desc.Height > 0) ? (static_cast<float>(desc.Width) / static_cast<float>(desc.Height)) : 1.0f);
+        }
     }
     else
     {
@@ -1276,20 +1303,196 @@ void VR::PublishOpenXrResolvedEyeTextures(uint32_t frameId)
     const L4D2VROpenXrSharedTextureDesc right = m_OpenXrSharedEyeTextures[L4D2VR_OPENXR_EYE_RIGHT];
     if (!left.valid || !right.valid)
         return;
-    L4D2VR_PublishOpenXrSharedTexture(L4D2VR_OPENXR_EYE_LEFT, left);
-    L4D2VR_PublishOpenXrSharedTexture(L4D2VR_OPENXR_EYE_RIGHT, right);
+    L4D2VROpenXrSharedTextureDesc publishLeft = left;
+    L4D2VROpenXrSharedTextureDesc publishRight = right;
+    // Hand the helper the rotating publish copy, not the live engine eye RT.
+    // Keep the FOV/aspect the eye export carries: the helper builds the submit
+    // projection from renderFovXDeg/renderAspect.
+    if (m_OpenXrPublishActive && m_OpenXrPublishReady)
+    {
+        const L4D2VROpenXrSharedTextureDesc& slotLeft =
+            m_OpenXrPublishDesc[L4D2VR_OPENXR_EYE_LEFT][m_OpenXrPublishSlot];
+        const L4D2VROpenXrSharedTextureDesc& slotRight =
+            m_OpenXrPublishDesc[L4D2VR_OPENXR_EYE_RIGHT][m_OpenXrPublishSlot];
+        if (slotLeft.valid && slotRight.valid)
+        {
+            const float leftFovX = publishLeft.renderFovXDeg;
+            const float leftAspect = publishLeft.renderAspect;
+            const float rightFovX = publishRight.renderFovXDeg;
+            const float rightAspect = publishRight.renderAspect;
+            publishLeft = slotLeft;
+            publishRight = slotRight;
+            publishLeft.renderFovXDeg = leftFovX;
+            publishLeft.renderAspect = leftAspect;
+            publishRight.renderFovXDeg = rightFovX;
+            publishRight.renderAspect = rightAspect;
+        }
+    }
+    // The helper derives the submitted vertical FOV from renderFovXDeg and
+    // renderAspect. NormalizeViewSetupForVREye renders each eye at the eye RT's
+    // own aspect (logged 3664x3584 -> 1.022), but the export carried m_Aspect
+    // latched at texture creation (logged 1.0972), so the submitted frustum was
+    // ~7% short vertically and the compositor reprojected through the wrong
+    // projection. Derive it from the image actually being submitted.
+    auto useImageAspect = [](L4D2VROpenXrSharedTextureDesc& desc) {
+        if (desc.height == 0)
+            return;
+        const float aspect = static_cast<float>(desc.width) / static_cast<float>(desc.height);
+        if (std::isfinite(aspect) && aspect > 0.1f && aspect < 10.0f)
+            desc.renderAspect = aspect;
+    };
+    useImageAspect(publishLeft);
+    useImageAspect(publishRight);
+    // Hands/HUD/wheel are in-eye overlays; helper contain-blits the full RT.
+    publishLeft.uMin = 0.0f;
+    publishLeft.vMin = 0.0f;
+    publishLeft.uMax = 1.0f;
+    publishLeft.vMax = 1.0f;
+    publishRight.uMin = 0.0f;
+    publishRight.vMin = 0.0f;
+    publishRight.uMax = 1.0f;
+    publishRight.vMax = 1.0f;
+    L4D2VR_PublishOpenXrSharedTexturePair(publishLeft, publishRight);
     L4D2VR_PublishOpenXrSharedTextureFrame(frameId);
     m_OpenXrLastPublishedSharedTextureFrameId.store(frameId, std::memory_order_release);
+}
+
+void VR::ReleaseOpenXrPublishTextures()
+{
+    for (uint32_t eye = 0; eye < L4D2VR_OPENXR_EYE_COUNT; ++eye)
+    {
+        for (uint32_t slot = 0; slot < kOpenXrPublishSlots; ++slot)
+        {
+            ReleaseT(m_D9OpenXrPublishSurface[eye][slot]);
+            ReleaseT(m_D9OpenXrPublishTexture[eye][slot]);
+            m_OpenXrPublishDesc[eye][slot] = L4D2VROpenXrSharedTextureDesc{};
+        }
+    }
+    m_OpenXrPublishReady = false;
+    m_OpenXrPublishActive = false;
+    m_OpenXrPublishWidth = 0;
+    m_OpenXrPublishHeight = 0;
+    m_OpenXrPublishSlot = 0;
+}
+
+// Setup failure repeats every submit until the eye size changes, so an
+// unthrottled log here writes to disk at the publish rate.
+void VR::LogOpenXrPublishSetupFailure(const char* stage, uint32_t eye, uint32_t slot, unsigned hr)
+{
+    static uint32_t s_count = 0;
+    static uint32_t s_lastTick = 0;
+    const uint32_t now = GetTickCount();
+    if (s_count >= 3 && (now - s_lastTick) < 10000)
+    {
+        ++s_count;
+        return;
+    }
+    s_lastTick = now;
+    ++s_count;
+    Game::logMsg("OpenXR publish RT %s failed eye=%u slot=%u hr=0x%08X (occurrence %u; "
+        "rotating publish disabled, helper reads the live eye RT)",
+        stage, eye, slot, hr, s_count);
+}
+
+bool VR::EnsureOpenXrPublishTextures(IDirect3DDevice9* device, UINT w, UINT h)
+{
+    if (m_OpenXrPublishReady && m_OpenXrPublishWidth == w && m_OpenXrPublishHeight == h)
+        return true;
+    ReleaseOpenXrPublishTextures();
+    if (!device || !g_D3DVR9 || w < 64 || h < 64)
+        return false;
+
+    for (uint32_t eye = 0; eye < L4D2VR_OPENXR_EYE_COUNT; ++eye)
+    {
+        for (uint32_t slot = 0; slot < kOpenXrPublishSlots; ++slot)
+        {
+            IDirect3DTexture9** tex = &m_D9OpenXrPublishTexture[eye][slot];
+            IDirect3DSurface9** surf = &m_D9OpenXrPublishSurface[eye][slot];
+            // The DXVK fork only requests an exportable shared handle when
+            // ShouldExportOpenXrEyeTexture accepts m_CreatingTextureID. Without
+            // this the texture is created unshared, GetVRDesc has no handle, and
+            // the whole rotating-publish path silently falls back to letting the
+            // helper read the live engine eye RT (2026-08-31).
+            m_CreatingTextureID = Texture_OpenXrPublish;
+            const HRESULT hr = device->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET,
+                D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, tex, nullptr);
+            m_CreatingTextureID = Texture_None;
+            if (FAILED(hr) || !*tex || FAILED((*tex)->GetSurfaceLevel(0, surf)) || !*surf)
+            {
+                LogOpenXrPublishSetupFailure("create", eye, slot, (unsigned)hr);
+                ReleaseOpenXrPublishTextures();
+                return false;
+            }
+            D3D9_TEXTURE_VR_DESC vrDesc{};
+            const HRESULT descHr = g_D3DVR9->GetVRDesc(*surf, &vrDesc);
+            if (FAILED(descHr) || !vrDesc.Image
+                || !vrDesc.SharedHandleValid || vrDesc.SharedHandle == 0)
+            {
+                LogOpenXrPublishSetupFailure("GetVRDesc", eye, slot, (unsigned)descHr);
+                ReleaseOpenXrPublishTextures();
+                return false;
+            }
+            L4D2VROpenXrSharedTextureDesc& shared = m_OpenXrPublishDesc[eye][slot];
+            shared = L4D2VROpenXrSharedTextureDesc{};
+            shared.valid = 1;
+            shared.width = vrDesc.Width;
+            shared.height = vrDesc.Height;
+            shared.format = static_cast<uint32_t>(vrDesc.Format);
+            shared.sampleCount = vrDesc.SampleCount;
+            shared.handleType = vrDesc.SharedHandleType;
+            shared.queueFamilyIndex = vrDesc.QueueFamilyIndex;
+            shared.kmtHandle = vrDesc.SharedHandle;
+            shared.image = vrDesc.Image;
+            shared.uMin = 0.0f;
+            shared.vMin = 0.0f;
+            shared.uMax = 1.0f;
+            shared.vMax = 1.0f;
+        }
+    }
+
+    m_OpenXrPublishWidth = w;
+    m_OpenXrPublishHeight = h;
+    m_OpenXrPublishSlot = 0;
+    m_OpenXrPublishReady = true;
+    Game::logMsg("OpenXR publish RTs ready %ux%u slots=%u", w, h, kOpenXrPublishSlots);
+    return true;
 }
 
 bool VR::PrepareOpenXrEyeSurfacesForRead()
 {
     if (!m_OpenXrHelperBridgeActive || !g_D3DVR9)
         return false;
+    IDirect3DDevice9* device = nullptr;
+    if (FAILED(g_D3DVR9->GetD3DDevice(&device)) || !device)
+        return false;
+    ResolveMsaaEyesToSubmit(device);
     IDirect3DSurface9* left = m_D9LeftEyeSubmitSurface ? m_D9LeftEyeSubmitSurface : m_D9LeftEyeSurface;
     IDirect3DSurface9* right = m_D9RightEyeSubmitSurface ? m_D9RightEyeSubmitSurface : m_D9RightEyeSurface;
     if (!left || !right)
+    {
+        device->Release();
         return false;
+    }
+
+    m_OpenXrPublishActive = false;
+    D3DSURFACE_DESC eyeDesc{};
+    if (SUCCEEDED(left->GetDesc(&eyeDesc))
+        && EnsureOpenXrPublishTextures(device, eyeDesc.Width, eyeDesc.Height))
+    {
+        const uint32_t slot = (m_OpenXrPublishSlot + 1) % kOpenXrPublishSlots;
+        IDirect3DSurface9* dstLeft = m_D9OpenXrPublishSurface[L4D2VR_OPENXR_EYE_LEFT][slot];
+        IDirect3DSurface9* dstRight = m_D9OpenXrPublishSurface[L4D2VR_OPENXR_EYE_RIGHT][slot];
+        if (dstLeft && dstRight
+            && SUCCEEDED(device->StretchRect(left, nullptr, dstLeft, nullptr, D3DTEXF_NONE))
+            && SUCCEEDED(device->StretchRect(right, nullptr, dstRight, nullptr, D3DTEXF_NONE)))
+        {
+            left = dstLeft;
+            right = dstRight;
+            m_OpenXrPublishSlot = slot;
+            m_OpenXrPublishActive = true;
+        }
+    }
+    device->Release();
     if (FAILED(g_D3DVR9->TransferSurface(left, FALSE)) ||
         FAILED(g_D3DVR9->TransferSurface(right, FALSE)))
         return false;
@@ -2073,11 +2276,12 @@ void VR::ChooseEyeRenderSize()
 Vector VR::GetViewAngle() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
-    float yaw = m_HmdAngAbs.y + m_RotationOffsetY.load(std::memory_order_acquire);
+    const QAngle& ang = m_StereoFramePoseActive ? m_StereoFrameAngles : m_HmdAngAbs;
+    float yaw = ang.y + m_RotationOffsetY.load(std::memory_order_acquire);
     yaw -= 360.f * floorf((yaw + 180.f) / 360.f);
     // L4D2VR GetViewAngle keeps HMD roll. Zeroing it here while OpenVR
     // Submit uses the full pose makes a head tilt rotate the world.
-    return Vector(m_HmdAngAbs.x, yaw, m_HmdAngAbs.z);
+    return Vector(ang.x, yaw, ang.z);
 }
 
 void VR::GetViewBasis(Vector* forward, Vector* right, Vector* up) const
@@ -2102,9 +2306,11 @@ Vector VR::GetViewOrigin(const Vector& setupOrigin) const
     // Same result on a copy: engine eye + (tracking - pose at recenter).
     // Do not apply a recenter latched at the tracking origin (identity / headset
     // on the desk) — that stacks ~64u of standing height on top of setup.origin.
-    if (m_HmdOriginLatched && m_HmdPosAbsZero.z > 24.f)
+    if (m_HmdOriginLatched
+        && (m_OpenXrHelperBridgeActive || m_HmdPosAbsZero.z > 24.f))
     {
-        Vector delta = m_HmdPosAbs - m_HmdPosAbsZero;
+        const Vector& hmdPos = m_StereoFramePoseActive ? m_StereoFrameHmdPosAbs : m_HmdPosAbs;
+        Vector delta = hmdPos - m_HmdPosAbsZero;
         const float yaw = m_RotationOffsetY.load(std::memory_order_acquire);
         PivotYaw(delta, yaw);
         center += delta;
@@ -2971,12 +3177,24 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
     Vector body{};
     {
         std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
-        leftOk = m_LeftControllerTrackingValid;
-        rightOk = m_PhysicalRightTrackingValid;
-        leftAng = m_LeftControllerAngAbs;
-        rightAng = m_PhysicalRightAngAbs;
-        leftPos = m_LeftControllerPosAbs;
-        rightPos = m_PhysicalRightPosAbs;
+        if (m_StereoFramePoseActive)
+        {
+            leftOk = m_StereoFrameLeftCtrlValid;
+            rightOk = m_StereoFrameRightCtrlValid;
+            leftAng = m_StereoFrameLeftCtrlAng;
+            rightAng = m_StereoFrameRightCtrlAng;
+            leftPos = m_StereoFrameLeftCtrlPos;
+            rightPos = m_StereoFrameRightCtrlPos;
+        }
+        else
+        {
+            leftOk = m_LeftControllerTrackingValid;
+            rightOk = m_PhysicalRightTrackingValid;
+            leftAng = m_LeftControllerAngAbs;
+            rightAng = m_PhysicalRightAngAbs;
+            leftPos = m_LeftControllerPosAbs;
+            rightPos = m_PhysicalRightPosAbs;
+        }
         body = m_HasStereoBodyOrigin ? m_StereoBodyOrigin : m_SetupOrigin;
     }
     if (!leftOk && !rightOk)
@@ -3276,8 +3494,45 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
 
 namespace
 {
-    const unsigned short kSegDigit[10] = {
-        0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F
+    // 5x7 glyphs, bit 4 = left column. 0-9 then A-Z. Digit 0 is slashed so
+    // it does not read as O/8; 6/8/9 keep open counters.
+    const uint8_t kHud5x7[36][7] = {
+        { 0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E },
+        { 0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E },
+        { 0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F },
+        { 0x0E, 0x11, 0x01, 0x06, 0x01, 0x11, 0x0E },
+        { 0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02 },
+        { 0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E },
+        { 0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E },
+        { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08 },
+        { 0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E },
+        { 0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C },
+        { 0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 },
+        { 0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E },
+        { 0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E },
+        { 0x1C, 0x12, 0x11, 0x11, 0x11, 0x12, 0x1C },
+        { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F },
+        { 0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10 },
+        { 0x0E, 0x11, 0x10, 0x13, 0x11, 0x11, 0x0F },
+        { 0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11 },
+        { 0x0E, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0E },
+        { 0x01, 0x01, 0x01, 0x01, 0x11, 0x11, 0x0E },
+        { 0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11 },
+        { 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F },
+        { 0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11 },
+        { 0x11, 0x19, 0x15, 0x13, 0x11, 0x11, 0x11 },
+        { 0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E },
+        { 0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10 },
+        { 0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D },
+        { 0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11 },
+        { 0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E },
+        { 0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04 },
+        { 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E },
+        { 0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04 },
+        { 0x11, 0x11, 0x11, 0x15, 0x15, 0x1B, 0x11 },
+        { 0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11 },
+        { 0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04 },
+        { 0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F },
     };
 
     struct HudVert
@@ -3297,158 +3552,67 @@ namespace
         device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(HudVert));
     }
 
-    void HudLine(IDirect3DDevice9* device, float x0, float y0, float x1, float y1, float t, D3DCOLOR color)
+    int HudGlyphIndex(char c)
     {
-        const float dx = x1 - x0;
-        const float dy = y1 - y0;
-        const float len = sqrtf(dx * dx + dy * dy);
-        if (len < 0.01f)
+        if (c >= '0' && c <= '9')
+            return c - '0';
+        if (c >= 'A' && c <= 'Z')
+            return 10 + (c - 'A');
+        return -1;
+    }
+
+    void HudGlyph(IDirect3DDevice9* device, float x, float y, float cell, char c, D3DCOLOR color)
+    {
+        const int idx = HudGlyphIndex(c);
+        if (idx < 0)
             return;
-        const float nx = -dy / len * (t * 0.5f);
-        const float ny = dx / len * (t * 0.5f);
-        HudVert v[4] = {
-            { x0 + nx, y0 + ny, 0.f, 1.f, color },
-            { x0 - nx, y0 - ny, 0.f, 1.f, color },
-            { x1 + nx, y1 + ny, 0.f, 1.f, color },
-            { x1 - nx, y1 - ny, 0.f, 1.f, color }
-        };
-        device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(HudVert));
-    }
-
-    void HudDigit(IDirect3DDevice9* device, float x, float y, float cw, float ch, float t, int digit, D3DCOLOR color)
-    {
-        if (digit < 0 || digit > 9)
-            return;
-        const unsigned short m = kSegDigit[digit];
-        const float mid = y + ch * 0.5f - t * 0.5f;
-        if (m & 0x01) HudQuad(device, x + t, y, cw - 2 * t, t, color);
-        if (m & 0x02) HudQuad(device, x + cw - t, y + t, t, ch * 0.5f - t * 1.5f, color);
-        if (m & 0x04) HudQuad(device, x + cw - t, y + ch * 0.5f + t * 0.5f, t, ch * 0.5f - t * 1.5f, color);
-        if (m & 0x08) HudQuad(device, x + t, y + ch - t, cw - 2 * t, t, color);
-        if (m & 0x10) HudQuad(device, x, y + ch * 0.5f + t * 0.5f, t, ch * 0.5f - t * 1.5f, color);
-        if (m & 0x20) HudQuad(device, x, y + t, t, ch * 0.5f - t * 1.5f, color);
-        if (m & 0x40) HudQuad(device, x + t, mid, cw - 2 * t, t, color);
-    }
-
-    void HudNumber(IDirect3DDevice9* device, float xRight, float y, float cw, float ch, float t, int value, int minDigits, D3DCOLOR color)
-    {
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%d", value < 0 ? 0 : value);
-        const int len = static_cast<int>(strlen(buf));
-        int digits = len < minDigits ? minDigits : len;
-        float x = xRight - digits * (cw + t * 1.5f) + t * 1.5f;
-        for (int pad = len; pad < digits; ++pad)
+        const float fill = cell * 0.84f;
+        for (int row = 0; row < 7; ++row)
         {
-            HudDigit(device, x, y, cw, ch, t, 0, color);
-            x += cw + t * 1.5f;
-        }
-        for (int i = 0; i < len; ++i)
-        {
-            HudDigit(device, x, y, cw, ch, t, buf[i] - '0', color);
-            x += cw + t * 1.5f;
+            const uint8_t bits = kHud5x7[idx][row];
+            for (int col = 0; col < 5; ++col)
+            {
+                if (bits & (0x10 >> col))
+                    HudQuad(device, x + col * cell, y + row * cell, fill, fill, color);
+            }
         }
     }
 
-    void HudLetter(IDirect3DDevice9* device, float x, float y, float cw, float ch, float t, char c, D3DCOLOR color)
-    {
-        const float xR = x + cw - t;
-        const float yM = y + ch * 0.5f - t * 0.5f;
-        const float yB = y + ch - t;
-        const float hU = ch * 0.5f - t * 1.5f;
-        const float xC = x + cw * 0.5f - t * 0.5f;
-        auto barH = [&](float bx, float by, float bw) { HudQuad(device, bx, by, bw, t, color); };
-        auto barV = [&](float bx, float by, float bh) { HudQuad(device, bx, by, t, bh, color); };
-        switch (c)
-        {
-        case 'A':
-            barV(x, y + t, ch - t);
-            barV(xR, y + t, ch - t);
-            barH(x + t, y, cw - 2 * t);
-            barH(x + t, yM, cw - 2 * t);
-            break;
-        case 'C':
-            barH(x + t, y, cw - 2 * t);
-            barV(x, y + t, ch - 2 * t);
-            barH(x + t, yB, cw - 2 * t);
-            break;
-        case 'E':
-            barH(x + t, y, cw - 2 * t);
-            barH(x + t, yM, cw - 2 * t);
-            barH(x + t, yB, cw - 2 * t);
-            barV(x, y + t, ch - 2 * t);
-            break;
-        case 'H':
-            barV(x, y, ch);
-            barV(xR, y, ch);
-            barH(x + t, yM, cw - 2 * t);
-            break;
-        case 'I':
-            barH(x + t, y, cw - 2 * t);
-            barV(xC, y + t, ch - 2 * t);
-            barH(x + t, yB, cw - 2 * t);
-            break;
-        case 'L':
-            barV(x, y, ch - t);
-            barH(x, yB, cw);
-            break;
-        case 'M':
-            barV(x, y, ch);
-            barV(xR, y, ch);
-            HudLine(device, x + t * 0.5f, y + t, xC + t * 0.5f, y + ch * 0.58f, t, color);
-            HudLine(device, xR + t * 0.5f, y + t, xC + t * 0.5f, y + ch * 0.58f, t, color);
-            break;
-        case 'O':
-            barH(x + t, y, cw - 2 * t);
-            barH(x + t, yB, cw - 2 * t);
-            barV(x, y + t, ch - 2 * t);
-            barV(xR, y + t, ch - 2 * t);
-            break;
-        case 'R':
-            barV(x, y, ch);
-            barH(x + t, y, cw - 2 * t);
-            barV(xR, y + t, hU);
-            barH(x + t, yM, cw - 2 * t);
-            HudLine(device, x + cw * 0.42f, y + ch * 0.5f, x + cw, y + ch, t, color);
-            break;
-        case 'S':
-            barH(x + t, y, cw - 2 * t);
-            barV(x, y + t, hU);
-            barH(x + t, yM, cw - 2 * t);
-            barV(xR, y + ch * 0.5f + t * 0.5f, hU);
-            barH(x + t, yB, cw - 2 * t);
-            break;
-        case 'T':
-            barH(x, y, cw);
-            barV(xC, y + t, ch - t);
-            break;
-        case 'U':
-            barV(x, y, ch - t);
-            barV(xR, y, ch - t);
-            barH(x + t, yB, cw - 2 * t);
-            break;
-        default:
-            break;
-        }
-    }
-
-    float HudLabelWidth(const char* text, float cw, float t)
+    float HudTextWidth(const char* text, float cell)
     {
         int n = 0;
         for (const char* p = text; p && *p; ++p)
             ++n;
-        if (n <= 0)
-            return 0.f;
-        return n * cw + (n - 1) * t * 1.2f;
+        return n * 6.f * cell;
     }
 
-    void HudLabel(IDirect3DDevice9* device, float x, float y, float cw, float ch, float t, const char* text, D3DCOLOR color)
+    void HudText(IDirect3DDevice9* device, float x, float y, float cell, const char* text, D3DCOLOR color)
     {
         float cx = x;
         for (const char* p = text; p && *p; ++p)
         {
-            if (*p >= 'A' && *p <= 'Z')
-                HudLetter(device, cx, y, cw, ch, t, *p, color);
-            cx += cw + t * 1.2f;
+            if (*p != ' ')
+                HudGlyph(device, cx, y, cell, *p, color);
+            cx += 6.f * cell;
+        }
+    }
+
+    void HudNumber(IDirect3DDevice9* device, float xRight, float y, float cell, int value, int minDigits, D3DCOLOR color)
+    {
+        char buf[8];
+        snprintf(buf, sizeof(buf), "%d", value < 0 ? 0 : value);
+        const int len = static_cast<int>(strlen(buf));
+        const int digits = len < minDigits ? minDigits : len;
+        float x = xRight - digits * 6.f * cell;
+        for (int pad = len; pad < digits; ++pad)
+        {
+            HudGlyph(device, x, y, cell, '0', color);
+            x += 6.f * cell;
+        }
+        for (int i = 0; i < len; ++i)
+        {
+            HudGlyph(device, x, y, cell, buf[i], color);
+            x += 6.f * cell;
         }
     }
 }
@@ -3483,31 +3647,19 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
     };
 
     const float s = static_cast<float>(h) / 1440.f * 1.44f;
-    const float tMain = 4.8f * s;
-    const float tSmall = 3.4f * s;
-    const float labW = 8.f * s;
-    const float labH = 12.f * s;
-    const float labT = 2.6f * s;
-    const float labSmallW = 6.5f * s;
-    const float labSmallH = 10.f * s;
-    const float labSmallT = 2.2f * s;
-    const float mainNumH = 26.f * s;
-    const float smallNumH = 17.f * s;
-    const float smallPitch = 9.f * s + tSmall * 1.5f;
+    const float cell = 3.2f * s;
+    const float gap = 10.f * s;
     const D3DCOLOR amber = D3DCOLOR_RGBA(255, 176, 0, 230);
     const D3DCOLOR dim = D3DCOLOR_RGBA(255, 176, 0, 160);
 
-    auto drawLabeledNumber = [&](float xRight, float yNum, int value, int minDigits,
-        const char* label, bool compact) {
-        const float cw = compact ? 9.f * s : 14.f * s;
-        const float ch = compact ? smallNumH : mainNumH;
-        const float t = compact ? tSmall : tMain;
-        const float lw = compact ? labSmallW : labW;
-        const float lh = compact ? labSmallH : labH;
-        const float lt = compact ? labSmallT : labT;
-        HudNumber(device, xRight, yNum, cw, ch, t, value, minDigits, compact ? dim : amber);
-        const float labWidth = HudLabelWidth(label, lw, lt);
-        HudLabel(device, xRight - labWidth, yNum + ch + 3.f * s, lw, lh, lt, label, compact ? dim : amber);
+    auto drawRow = [&](float labX, float y, const char* label, int value, int minDigits,
+        D3DCOLOR labColor, D3DCOLOR numColor) {
+        HudText(device, labX, y, cell, label, labColor);
+        // Health/suit can be 100. Always reserve three digit columns so the
+        // extra glyph does not walk left into the caption.
+        const float numCols = (minDigits < 3) ? 3.f : static_cast<float>(minDigits);
+        const float numRight = labX + HudTextWidth(label, cell) + gap + numCols * 6.f * cell;
+        HudNumber(device, numRight, y, cell, value, minDigits, numColor);
     };
 
     if (leftOk && health >= 0 && health <= 200)
@@ -3515,26 +3667,40 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         float px = 0.f, py = 0.f;
         if (project(leftWrist, px, py))
         {
-            drawLabeledNumber(px + 33.f * s, py - 22.f * s, health, 2, "HEALTH", false);
+            const float labX = px - 78.f * s;
+            drawRow(labX, py - 14.f * s, "HEALTH", health, 2, amber, amber);
             if (armor >= 0 && armor <= 200)
-                drawLabeledNumber(px + 22.f * s, py + 24.f * s, armor, 2, "SUIT", true);
+                drawRow(labX, py + 16.f * s, "SUIT", armor, 2, dim, dim);
         }
     }
-    if (rightOk && clip >= 0 && clip <= 255)
+    const bool hasAmmoHud = rightOk
+        && ((clip >= 0 && clip <= 999) || (reserve >= 0 && reserve <= 999)
+            || (secondary >= 0 && secondary <= 999));
+    if (hasAmmoHud)
     {
         float px = 0.f, py = 0.f;
         if (project(rightWrist, px, py))
         {
-            const float ox = px - 68.f * s;
-            drawLabeledNumber(ox + 33.f * s, py - 22.f * s, clip, 2, "AMMO", false);
-            const float rowY = py + 24.f * s;
-            const float resRight = ox + 22.f * s;
-            if (reserve >= 0 && reserve <= 999)
-                drawLabeledNumber(resRight, rowY, reserve, 2, "RES", true);
-            if (secondary >= 0 && secondary <= 255)
+            const float labX = px - 90.f * s;
+            const bool showClip = clip >= 0 && clip <= 999;
+            const int ammoPrimary = showClip ? clip : reserve;
+            if (ammoPrimary >= 0 && ammoPrimary <= 999)
+                drawRow(labX, py - 14.f * s, "AMMO", ammoPrimary, 2, amber, amber);
+            const float y1 = py + 16.f * s;
+            float cursor = labX;
+            if (showClip && reserve >= 0 && reserve <= 999)
             {
-                const float secRight = resRight + 16.f * s + 2.f * smallPitch;
-                drawLabeledNumber(secRight, rowY, secondary, 2, "SEC", true);
+                HudText(device, cursor, y1, cell, "RES", dim);
+                cursor += HudTextWidth("RES", cell) + gap;
+                const float resRight = cursor + 3.f * 6.f * cell;
+                HudNumber(device, resRight, y1, cell, reserve, 2, dim);
+                cursor = resRight + gap;
+            }
+            if (secondary >= 0 && secondary <= 999)
+            {
+                HudText(device, cursor, y1, cell, "SEC", dim);
+                cursor += HudTextWidth("SEC", cell) + gap;
+                HudNumber(device, cursor + 2.f * 6.f * cell, y1, cell, secondary, 2, dim);
             }
         }
     }
@@ -4104,6 +4270,9 @@ void VR::ApplyVrQualityOfLifeCvars()
     // RenderViews reused HW occlusion / areaportals and could latch empty vis.
     // That pair draws every leaf and tanks open/complex maps. Default: restore
     // PVS + occlusion. ForceOpenVis=true in config.txt brings the old path back.
+    // r_visocclusion is a cheat/debug overlay, not HW occlusion. Default 1
+    // was a mistaken "restore vis" write and can crash on Xen. r_occlusion
+    // is the real query. Always leave visocclusion off.
     if (bmvr::g_ForceOpenVis)
     {
         seti("r_occlusion", 0);
@@ -4115,7 +4284,7 @@ void VR::ApplyVrQualityOfLifeCvars()
     {
         seti("r_occlusion", 1);
         seti("r_fastzreject", 1);
-        seti("r_visocclusion", 1);
+        seti("r_visocclusion", 0);
         seti("r_portalsopenall", 0);
     }
     // BM new-renderer CSM logged 8192x8192 (_rt_gbshadowmaprt) inside each
@@ -4269,26 +4438,38 @@ void VR::UpdateAutoMatQueueMode()
         desired, current, ok ? 1 : 0, reason);
 }
 
-void VR::PollSteamVrRecommendedSize()
+void VR::TryApplySteamVrRecommendedEyeSize()
 {
-    if (m_OpenXrHelperBridgeActive || !m_System)
+    if (m_OpenXrHelperBridgeActive)
+        return;
+    vr::IVRSystem* sys = m_System ? m_System : vr::VRSystem();
+    if (!sys)
         return;
     uint32_t recW = 0, recH = 0;
-    m_System->GetRecommendedRenderTargetSize(&recW, &recH);
+    sys->GetRecommendedRenderTargetSize(&recW, &recH);
     if (recW < 640 || recH < 360)
         return;
+    if (recW > 4096)
+        recW = 4096;
+    if (recH > 4096)
+        recH = 4096;
     if (recW == bmvr::g_RecommendedEyeWidth && recH == bmvr::g_RecommendedEyeHeight)
         return;
     const uint32_t prevW = bmvr::g_RecommendedEyeWidth;
     const uint32_t prevH = bmvr::g_RecommendedEyeHeight;
     bmvr::g_RecommendedEyeWidth = recW;
     bmvr::g_RecommendedEyeHeight = recH;
-    if (prevW >= 640 && prevH >= 360)
-    {
+    Game::logMsg("SteamVR recommended RT %ux%u (was %ux%u)", recW, recH, prevW, prevH);
+    if (prevW >= 640 && prevH >= 360
+        && (recW + 32 < prevW || recH + 32 < prevH || prevW + 32 < recW || prevH + 32 < recH))
         m_EyeResizeSettleMs = GetTickCount();
-        Game::logMsg("SteamVR recommended RT %ux%u -> %ux%u (live SS; eyes recreate after settle)",
-            prevW, prevH, recW, recH);
-    }
+}
+
+void VR::PollSteamVrRecommendedSize()
+{
+    if (m_OpenXrHelperBridgeActive)
+        return;
+    TryApplySteamVrRecommendedEyeSize();
 }
 
 void VR::ReclaimCompositorFocus(const char* reason)
@@ -4346,6 +4527,72 @@ float VR::HorizontalFovForAspect(float targetAspect) const
     return 2.0f * atanf(tanHalfY * targetAspect) * (180.0f / 3.14159265358979323846f);
 }
 
+void VR::BeginStereoFramePose()
+{
+    if (m_OpenXrHelperBridgeActive)
+        ConsumeOpenXrTracking();
+    UpdateTracking();
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
+        m_StereoFrameAngles = m_HmdAngAbs;
+        m_StereoFrameHmdPosAbs = m_HmdPosAbs;
+        m_StereoFrameLeftCtrlValid = m_LeftControllerTrackingValid;
+        m_StereoFrameRightCtrlValid = m_PhysicalRightTrackingValid;
+        m_StereoFrameLeftCtrlAng = m_LeftControllerAngAbs;
+        m_StereoFrameRightCtrlAng = m_PhysicalRightAngAbs;
+        m_StereoFrameLeftCtrlPos = m_LeftControllerPosAbs;
+        m_StereoFrameRightCtrlPos = m_PhysicalRightPosAbs;
+    }
+    m_StereoFramePoseActive = true;
+    if (m_OpenXrHelperBridgeActive)
+    {
+        m_OpenXrStereoRenderPose = m_OpenXrLastHmdPose;
+        m_OpenXrStereoRenderPoseValid = m_OpenXrLastHmdPose.valid != 0;
+        const float renderIpd = m_Ipd * m_IpdScale;
+        if (renderIpd >= 0.04f && renderIpd <= 0.10f)
+            std::memcpy(&m_OpenXrStereoRenderPose.reserved0, &renderIpd, sizeof(renderIpd));
+        static int s_stereoPoseLog;
+        if (s_stereoPoseLog < 4)
+        {
+            Game::logMsg("Stereo frame pose latch openxr=%d pos=(%.3f %.3f %.3f) ang=(%.1f %.1f)",
+                m_OpenXrStereoRenderPoseValid ? 1 : 0,
+                m_OpenXrStereoRenderPose.position[0],
+                m_OpenXrStereoRenderPose.position[1],
+                m_OpenXrStereoRenderPose.position[2],
+                m_StereoFrameAngles.x, m_StereoFrameAngles.y);
+            ++s_stereoPoseLog;
+        }
+    }
+}
+
+void VR::EndStereoFramePose()
+{
+    m_StereoFramePoseActive = false;
+}
+
+void VR::LogOpenXrPublishRate()
+{
+    const uint32_t now = GetTickCount();
+    if (m_OpenXrPublishRateTick == 0)
+    {
+        m_OpenXrPublishRateTick = now;
+        return;
+    }
+    const uint32_t dt = now - m_OpenXrPublishRateTick;
+    if (dt < 5000)
+        return;
+    const float scale = 1000.f / static_cast<float>(dt);
+    Game::logMsg("OpenXR publish rate present=%.0f/s published=%.0f/s skipStale=%.0f/s skipRate=%.0f/s slots=%u copy=%d",
+        m_OpenXrSubmitAttempts * scale, m_OpenXrPublishes * scale,
+        m_OpenXrSkippedNoNewFrame * scale, m_OpenXrSkippedHelperBusy * scale,
+        kOpenXrPublishSlots, m_OpenXrPublishActive ? 1 : 0);
+    m_OpenXrPublishRateTick = now;
+    m_OpenXrSubmitAttempts = 0;
+    m_OpenXrPublishes = 0;
+    m_OpenXrSkippedNoNewFrame = 0;
+    m_OpenXrSkippedHelperBusy = 0;
+}
+
 void VR::WaitPosesForStereoFrame()
 {
     if (m_PosesWaitedThisFrame)
@@ -4354,8 +4601,9 @@ void VR::WaitPosesForStereoFrame()
     {
         ConsumeOpenXrTracking();
         UpdateTracking();
-        m_OpenXrStereoRenderPose = m_OpenXrLastHmdPose;
-        m_OpenXrStereoRenderPoseValid = m_OpenXrLastHmdPose.valid != 0;
+        // Game-render pose for OpenXR submit is latched in BeginStereoFramePose
+        // when the stereo pair actually renders. An earlier main RenderView can
+        // call WaitPoses tens of ms before the eyes, which desyncs reprojection.
         m_PosesWaitedThisFrame = true;
         return;
     }
@@ -4580,6 +4828,7 @@ void VR::ReleaseVRRenderTargetsForDeviceReset()
     ReleaseT(m_D9RightEyeTexture);
     ReleaseT(m_D9LeftEyeSubmitTexture);
     ReleaseT(m_D9RightEyeSubmitTexture);
+    ReleaseOpenXrPublishTextures();
     m_LeftEyeMsaaHasScene = false;
     m_RightEyeMsaaHasScene = false;
     ReleaseT(m_D9FrameColorSurface);
@@ -4732,7 +4981,8 @@ bool VR::EnsurePrivateEyeSurfaces(IDirect3DDevice9* device)
             m_RenderHeight = haveH;
             return true;
         }
-        if ((!bmvr::TrySteamVrEyeRt() && !growForFullFrame && !liveOffscreenResize) || (!liveOffscreenResize && haveW + 32 >= w))
+        if ((!bmvr::TrySteamVrEyeRt() && !growForFullFrame && !liveOffscreenResize)
+            || (!liveOffscreenResize && haveW + 32 >= w))
         {
             Game::logMsg("Keep existing D3D eyes %ux%u (requested %ux%u; HWND resize must not recreate)",
                 haveW, haveH, w, h);
@@ -5730,14 +5980,60 @@ void VR::SubmitVRTextures()
     if (m_OpenXrHelperBridgeActive)
     {
         const bool haveNewFrame = m_RenderedNewFrame.load(std::memory_order_acquire);
-        if (!haveNewFrame && !m_DirectEyeSubmit)
+        ++m_OpenXrSubmitAttempts;
+        // Present runs far faster than the compositor consumes (measured
+        // 2026-08-30: ~212 publishes/s against 90Hz SteamVR, stereo pair only
+        // 1.5-5ms). Every publish re-copies two full-res eye textures and
+        // drains the GPU in PrepareOpenXrEyeSurfacesForRead, and the helper has
+        // no lock on the shared images: it blits a 3664x3584 eye while the game
+        // overwrites that same texture 2-3 times, so its swapchain copy mixes
+        // several game frames. That tears only when consecutive frames differ,
+        // i.e. while the head turns. Publish one pair per compositor frame:
+        // require freshly rendered eyes and wait for the helper to finish the
+        // previous submit, which lands our writes in its post-xrEndFrame gap.
+        if (!haveNewFrame)
+        {
+            ++m_OpenXrSkippedNoNewFrame;
+            LogOpenXrPublishRate();
             return;
+        }
+        // Waiting for the helper's submit counter published right after its
+        // xrEndFrame, so the image then sat a whole compositor frame before it
+        // was read and the ghost flipped to leading the turn. Rotating publish
+        // slots make that handshake unnecessary: cap the copy cost instead and
+        // let the helper pick up a much fresher image.
+        //
+        // Must be QPC, not GetTickCount: that counter only advances every
+        // ~15.6ms, so a millisecond gate on it published ~64/s against a 90Hz
+        // compositor and starved every third display frame.
+        const double nowMs = []() {
+            static double s_toMs = 0.0;
+            if (s_toMs == 0.0)
+            {
+                LARGE_INTEGER f{};
+                QueryPerformanceFrequency(&f);
+                s_toMs = f.QuadPart ? 1000.0 / static_cast<double>(f.QuadPart) : 0.0;
+            }
+            LARGE_INTEGER t{};
+            QueryPerformanceCounter(&t);
+            return static_cast<double>(t.QuadPart) * s_toMs;
+        }();
+        // 7ms => ~143/s, so every 11.1ms compositor frame sees a fresh pair.
+        if (m_OpenXrLastPublishMs != 0.0 && (nowMs - m_OpenXrLastPublishMs) < 7.0)
+        {
+            ++m_OpenXrSkippedHelperBusy;
+            LogOpenXrPublishRate();
+            return;
+        }
+        m_OpenXrLastPublishMs = nowMs;
+        LogOpenXrPublishRate();
         if (!PrepareOpenXrEyeSurfacesForRead())
             return;
         if (m_OpenXrStereoRenderPoseValid)
             L4D2VR_PublishOpenXrGameRenderPose(m_OpenXrStereoRenderPose);
         const uint32_t frameId = m_OpenXrSubmitFrameId.fetch_add(1, std::memory_order_acq_rel);
         PublishOpenXrResolvedEyeTextures(frameId);
+        ++m_OpenXrPublishes;
         if (m_HudOverlayReady && m_D9HUDSurface
             && m_HudPaintedThisFrame.load(std::memory_order_acquire)
             && PauseUiActive())
@@ -6052,15 +6348,18 @@ void VR::UpdateTracking()
 
     if (m_GameplayEligible)
     {
-        if (!m_HmdOriginLatched && m_HmdPosAbs.z > 24.f)
+        const bool openXrLatch = m_OpenXrHelperBridgeActive && m_HmdPoseValid;
+        const bool openVrLatch = m_HmdPosAbs.z > 24.f;
+        if (!m_HmdOriginLatched && (openXrLatch || openVrLatch))
         {
             m_HmdPosAbsZero = m_HmdPosAbs;
             m_HmdAngAbsZero = m_HmdAngAbs;
             m_HmdOriginLatched = true;
             m_PrevAppliedHmdYaw = m_HmdAngAbs.y;
             m_PrevAppliedHmdPitch = m_HmdAngAbs.x;
-            Game::logMsg("ResetPosition latch hmd=(%.1f,%.1f,%.1f) (engine eye + 6DOF, L4D2VR CameraAnchor)",
-                m_HmdPosAbs.x, m_HmdPosAbs.y, m_HmdPosAbs.z);
+            Game::logMsg("ResetPosition latch hmd=(%.1f,%.1f,%.1f) openxr=%d (engine eye + 6DOF, L4D2VR CameraAnchor)",
+                m_HmdPosAbs.x, m_HmdPosAbs.y, m_HmdPosAbs.z,
+                openXrLatch ? 1 : 0);
         }
         ++m_GameplayFrames;
         if (m_LookApplyWanted)
@@ -6092,7 +6391,7 @@ void VR::Update()
     if (m_GameplayEligible && !inGame)
         return;
 
-    if (m_OpenXrHelperBridgeActive)
+    if (m_OpenXrHelperBridgeActive && !m_PosesWaitedThisFrame)
         ConsumeOpenXrTracking();
 
     TickCompositorFocus();
