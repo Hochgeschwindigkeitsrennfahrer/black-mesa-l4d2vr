@@ -77,6 +77,30 @@ namespace
         return fallback;
     }
 
+    int ParseFlipSubmitY(std::string value, int fallback)
+    {
+        Trim(value);
+        std::transform(value.begin(), value.end(), value.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+
+        if (value == "auto" || value == "-1")
+            return -1;
+        if (value == "1" || value == "true" || value == "on" || value == "yes")
+            return 1;
+        if (value == "0" || value == "false" || value == "off" || value == "no")
+            return 0;
+        return fallback;
+    }
+
+    const char* FlipSubmitYName(int option)
+    {
+        if (option > 0)
+            return "on";
+        if (option == 0)
+            return "off";
+        return "auto";
+    }
+
     const char* ProjectionEyeName(int eye)
     {
         if (eye == L4D2VR_OPENXR_EYE_LEFT)
@@ -258,6 +282,8 @@ OpenXrHelperLaunchConfig L4D2VR_ReadOpenXrHelperLaunchConfig()
         config.forceMonoProjectionEye = ParseProjectionEye(value, config.forceMonoProjectionEye);
     if (const std::string value = get("OpenXRHelperForceMonoProjectionView"); !value.empty())
         config.forceMonoProjectionView = ParseProjectionEye(value, config.forceMonoProjectionView);
+    if (const std::string value = get("OpenXRHelperFlipSubmitY"); !value.empty())
+        config.flipSubmitY = ParseFlipSubmitY(value, config.flipSubmitY);
     if (const std::string value = get("OpenXRHelperSwapGameEyeOrigins"); !value.empty())
         config.swapGameEyeOrigins = ParseBool(value, config.swapGameEyeOrigins);
     if (const std::string value = get("OpenXRSwapGameEyeOrigins"); !value.empty())
@@ -383,6 +409,7 @@ bool L4D2VR_StartOpenXrHelper(const OpenXrHelperLaunchConfig& config)
         << L" --use-game-render-pose-for-projection " << (config.useGameRenderPoseForProjection ? 1 : 0)
         << L" --force-mono-projection-eye " << config.forceMonoProjectionEye
         << L" --force-mono-projection-view " << config.forceMonoProjectionView
+        << L" --flip-submit-y " << config.flipSubmitY
         << L" --disable-quad-overlays " << (config.disableQuadOverlays ? 1 : 0)
         << L" --log " << QuoteArg(helperLog);
 
@@ -420,7 +447,7 @@ bool L4D2VR_StartOpenXrHelper(const OpenXrHelperLaunchConfig& config)
 
     state->helperPid = pi.dwProcessId;
     Game::logMsg(
-        "[VR][OpenXRHelper] launched pid=%lu frames=%u waitReadySeconds=%u swapProjectionEyes=%d swapProjectionViewOrder=%d mirrorProjectionHorizontal=%d disableProjectionLayer=%d useSymmetricProjectionFov=%d useGameRenderPoseForProjection=%d forceMonoProjectionEye=%s(%d) forceMonoProjectionView=%s(%d) disableQuadOverlays=%d exe=%ls",
+        "[VR][OpenXRHelper] launched pid=%lu frames=%u waitReadySeconds=%u swapProjectionEyes=%d swapProjectionViewOrder=%d mirrorProjectionHorizontal=%d disableProjectionLayer=%d useSymmetricProjectionFov=%d useGameRenderPoseForProjection=%d forceMonoProjectionEye=%s(%d) forceMonoProjectionView=%s(%d) flipSubmitY=%s(%d) disableQuadOverlays=%d exe=%ls",
         static_cast<unsigned long>(pi.dwProcessId),
         config.submitTestFrames,
         config.waitReadySeconds,
@@ -434,6 +461,8 @@ bool L4D2VR_StartOpenXrHelper(const OpenXrHelperLaunchConfig& config)
         config.forceMonoProjectionEye,
         ProjectionEyeName(config.forceMonoProjectionView),
         config.forceMonoProjectionView,
+        FlipSubmitYName(config.flipSubmitY),
+        config.flipSubmitY,
         config.disableQuadOverlays ? 1 : 0,
         helperExe.c_str());
 

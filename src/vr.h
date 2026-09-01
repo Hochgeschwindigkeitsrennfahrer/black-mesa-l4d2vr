@@ -73,6 +73,7 @@ public:
     bool m_OpenXrStereoRenderPoseValid = false;
     L4D2VROpenXrInputStateDesc m_OpenXrLastInputState{};
     uint32_t m_OpenXrLastInputStateGeneration = 0;
+    uint32_t m_ControllerFamily = L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
     L4D2VROpenXrSharedTextureDesc m_OpenXrSharedEyeTextures[L4D2VR_OPENXR_EYE_COUNT]{};
     std::atomic<uint32_t> m_OpenXrSharedEyeTextureReadyMask{ 0 };
     // Dedicated publish copies. Without these the helper blits straight out of
@@ -571,7 +572,11 @@ public:
     bool AimCrosshairVisible() const { return m_AimCrosshairValid; }
     // Gordon has no gloves before the HEV suit (intro tram). Sampled on the
     // game thread; defaults true so a failed netvar scan cannot hide the hands.
+    // Combined with VrHideHandsWithoutSuit — false hides HEV gloves and the
+    // wrist HUD. Bare-hand GLBs still draw when HasBareHands() is true.
     bool HasHevSuit() const { return m_HasHevSuit; }
+    // Raw m_bWearingSuit sample. False on the intro tram; true after EquipSuit.
+    bool WearingHevSuit() const { return m_WearingHevSuit; }
     // True only while a scoped weapon is actually zoomed. Aim then comes from
     // the headset, because the scope picture is centred on the view.
     bool ScopeZoomActive() const { return m_ScopeZoomActive; }
@@ -714,6 +719,7 @@ private:
     Vector m_AimCrosshairWorld{};
     bool m_AimCrosshairValid = false;
     bool m_HasHevSuit = true;
+    bool m_WearingHevSuit = true;
     bool m_ScopeZoomActive = false;
     bool m_CrossbowZoomLatched = false;
     bool m_RpgLaserLatched = false;
@@ -750,10 +756,6 @@ private:
     Vector m_WeaponMenuLatchBillboardRight{};
     Vector m_WeaponMenuLatchBillboardUp{};
     float m_WeaponMenuLatchYaw = 0.f;
-    // The wheel opens with the centre cell hovered, so a hold-and-release that
-    // never moved must cancel instead of holstering. Set once the cursor leaves
-    // the centre.
-    bool m_WeaponMenuLeftCenter = false;
     struct WeaponMenuSlot
     {
         int entityIndex = 0;

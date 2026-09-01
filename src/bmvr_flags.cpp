@@ -1,4 +1,5 @@
 #include "bmvr_flags.h"
+#include "openxr_bridge_protocol.h"
 
 #include <cctype>
 #include <cstdarg>
@@ -29,6 +30,9 @@ namespace bmvr
     float g_ViewmodelAngOffsetY = 0.f;
     float g_ViewmodelAngOffsetZ = 0.f;
     float g_ControllerPitchTilt = -35.f;
+    float g_ControllerPitchTiltTouch = 0.f;
+    float g_ControllerPitchTiltIndex = 0.f;
+    float g_ControllerPitchTiltVive = -45.f;
     float g_AimPitchOffset = 0.f;
     bool g_DisableRecoilAim = true;
     float g_IPDScale = 1.f;
@@ -48,7 +52,7 @@ namespace bmvr
     float g_VrHandsModelScale = 0.85f;
     bool g_VrHandsDebugBoxes = false;
     bool g_HandHud = true;
-    bool g_VrCrosshair = true;
+    bool g_VrCrosshair = false;
     float g_VrCrosshairScale = 1.f;
     bool g_HideHandsWithoutSuit = true;
     bool g_ScopeUsesHmdAim = true;
@@ -64,6 +68,10 @@ namespace bmvr
     // install.ps1 must match this or they overwrite it on every install.
     float g_VrHandsPoseOffY = -0.008f;
     float g_VrHandsPoseOffZ = -0.10f;
+    // Additive on top of VrHandsPoseOffsetMeters for Quest/Touch.
+    float g_VrHandsTouchOffX = 0.f;
+    float g_VrHandsTouchOffY = 0.f;
+    float g_VrHandsTouchOffZ = 0.f;
     float g_VrHandsLeftPoseOffX = 0.f;
     float g_VrHandsLeftPoseOffY = 0.f;
     float g_VrHandsLeftPoseOffZ = 0.f;
@@ -88,7 +96,7 @@ namespace bmvr
     // hitch is separate; do not put WaitGetPoses on the RenderView thread.
     bool g_CompositorPostPresentHandoff = true;
     bool g_ForceOpenVis = false;
-    bool g_StereoBlitGpuFlush = false;
+    bool g_StereoBlitGpuFlush = true;
     // Match L4D2VR weapon tables (designed for VRScale 43.2) to BM 39.37:
     // 0.91 was the 39.37/43.2 ratio; user 2026-08-25: ~25% smaller than that
     // (0.91 x 0.75 = 0.68). Crowbar forced to 1.0 in DME. Hands slightly larger.
@@ -301,6 +309,12 @@ namespace bmvr
                 g_ViewmodelAngOffsetZ = static_cast<float>(atof(val));
             else if (std::strcmp(n, "ControllerPitchTilt") == 0)
                 g_ControllerPitchTilt = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "ControllerPitchTiltTouch") == 0)
+                g_ControllerPitchTiltTouch = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "ControllerPitchTiltIndex") == 0)
+                g_ControllerPitchTiltIndex = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "ControllerPitchTiltVive") == 0)
+                g_ControllerPitchTiltVive = static_cast<float>(atof(val));
             else if (std::strcmp(n, "AimPitchOffset") == 0)
                 g_AimPitchOffset = static_cast<float>(atof(val));
             else if (std::strcmp(n, "DisableRecoilAim") == 0)
@@ -377,6 +391,16 @@ namespace bmvr
                     g_VrHandsPoseOffX = x;
                     g_VrHandsPoseOffY = y;
                     g_VrHandsPoseOffZ = z;
+                }
+            }
+            else if (std::strcmp(n, "QuestHandsPoseOffsetMeters") == 0)
+            {
+                float x = 0.f, y = 0.f, z = 0.f;
+                if (sscanf(val, "%f,%f,%f", &x, &y, &z) == 3)
+                {
+                    g_VrHandsTouchOffX = x;
+                    g_VrHandsTouchOffY = y;
+                    g_VrHandsTouchOffZ = z;
                 }
             }
             else if (std::strcmp(n, "VrHandsLeftPoseOffsetMeters") == 0)
@@ -728,8 +752,10 @@ namespace bmvr
             exeLogN = narrow(exeLog);
             modLogN = narrow(modLog);
         }
+        // Each process start replaces the log so a tester can send the whole
+        // file. Append mode stacked old launches; testers always pasted the header.
         if (!s_exe)
-            s_exe = _fsopen(exeLogN.c_str(), "ab", _SH_DENYNO);
+            s_exe = _fsopen(exeLogN.c_str(), "wb", _SH_DENYNO);
         if (s_exe)
         {
             fputs(buf, s_exe);
@@ -738,7 +764,7 @@ namespace bmvr
         if (_stricmp(exeLogN.c_str(), modLogN.c_str()) != 0)
         {
             if (!s_mod)
-                s_mod = _fsopen(modLogN.c_str(), "ab", _SH_DENYNO);
+                s_mod = _fsopen(modLogN.c_str(), "wb", _SH_DENYNO);
             if (s_mod)
             {
                 fputs(buf, s_mod);
@@ -814,6 +840,35 @@ namespace bmvr
         }
         else
             Log("Disabled %s this launch only (previous launch died; not skip-filed)", label);
+    }
+
+    float EffectiveControllerPitchTilt(uint32_t controllerFamily)
+    {
+        switch (controllerFamily)
+        {
+        case L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH:
+            return g_ControllerPitchTiltTouch;
+        case L4D2VR_OPENXR_CONTROLLER_FAMILY_KNUCKLES:
+            return g_ControllerPitchTiltIndex;
+        case L4D2VR_OPENXR_CONTROLLER_FAMILY_VIVE:
+            return g_ControllerPitchTiltVive;
+        case L4D2VR_OPENXR_CONTROLLER_FAMILY_HP_G2:
+        default:
+            return g_ControllerPitchTilt;
+        }
+    }
+
+    void EffectiveVrHandsPoseOffset(uint32_t controllerFamily, float& x, float& y, float& z)
+    {
+        x = g_VrHandsPoseOffX;
+        y = g_VrHandsPoseOffY;
+        z = g_VrHandsPoseOffZ;
+        if (controllerFamily == L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH)
+        {
+            x += g_VrHandsTouchOffX;
+            y += g_VrHandsTouchOffY;
+            z += g_VrHandsTouchOffZ;
+        }
     }
 
     void InitFromDisk()

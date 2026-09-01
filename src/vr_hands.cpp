@@ -60,21 +60,39 @@ namespace
 
     // L4D2VR VrHandSkeletonRuntime::BuildSummaryCurlPalette — GLB bind locals
     // plus OpenVR summary curls. No ozz.
-    bool AssetIsHevGlove(const VrHandMeshAsset& asset)
+    bool PathContainsI(const std::string& path, const char* needle)
     {
-        const std::string& path = asset.sourcePath;
-        for (size_t i = 0; i + 8 < path.size(); ++i)
+        if (!needle || needle[0] == '\0')
+            return false;
+        const size_t nlen = std::strlen(needle);
+        if (nlen == 0 || nlen > path.size())
+            return false;
+        for (size_t i = 0; i + nlen <= path.size(); ++i)
         {
-            if ((path[i] == 'h' || path[i] == 'H')
-                && (path[i + 1] == 'e' || path[i + 1] == 'E')
-                && (path[i + 2] == 'v' || path[i + 2] == 'V')
-                && path[i + 3] == '_'
-                && (path[i + 4] == 'g' || path[i + 4] == 'G'))
+            size_t j = 0;
+            for (; j < nlen; ++j)
             {
-                return true;
+                char a = path[i + j];
+                char b = needle[j];
+                if (a >= 'A' && a <= 'Z')
+                    a = static_cast<char>(a - 'A' + 'a');
+                if (b >= 'A' && b <= 'Z')
+                    b = static_cast<char>(b - 'A' + 'a');
+                if (a != b)
+                    break;
             }
+            if (j == nlen)
+                return true;
         }
         return false;
+    }
+
+    // HEV and bare-hand rips share ValveBiped hinges (index–pinky opposite
+    // SteamVR glove +Z). Do not negate SteamVR vr_glove fallback assets.
+    bool AssetUsesValveBipedCurl(const VrHandMeshAsset& asset)
+    {
+        return PathContainsI(asset.sourcePath, "hev_glove")
+            || PathContainsI(asset.sourcePath, "bare_hand");
     }
 
     bool BuildSummaryCurlPalette(
@@ -110,10 +128,10 @@ namespace
         for (size_t joint = 0; joint < asset.jointNames.size(); ++joint)
             localMatrices[joint] = BuildBindLocalMatrix(asset, static_cast<int>(joint));
 
-        // HEV ValveBiped index–pinky hinges are opposite SteamVR glove +Z.
-        // Thumb already curls inward on the ripped HEV mesh. Do not negate
+        // HEV/bare ValveBiped index–pinky hinges are opposite SteamVR glove +Z.
+        // Thumb already curls inward on the ripped mesh. Do not negate
         // SteamVR vr_glove fallback assets.
-        const bool hev = AssetIsHevGlove(asset);
+        const bool valveBiped = AssetUsesValveBipedCurl(asset);
         for (int finger = 0; finger < vr::VRFinger_Count; ++finger)
         {
             float curl = std::clamp(summary.flFingerCurl[finger], 0.0f, 1.0f);
@@ -125,7 +143,7 @@ namespace
                 if (curl < minCurl)
                     curl = minCurl;
             }
-            const float sign = (hev && finger > 0) ? -1.f : 1.f;
+            const float sign = (valveBiped && finger > 0) ? -1.f : 1.f;
             for (int segment = 0; segment < 3; ++segment)
             {
                 const std::string jointName = std::string("finger_") +
@@ -217,10 +235,13 @@ struct BmVrGloves::Impl
         std::vector<VrHandMatrixRows3x4> palette;
     };
 
-    Hand hands[2];
+    Hand hev[2];
+    Hand bare[2];
     VrHandRendererD3D9 renderer;
     bool assetAttempted = false;
     bool assetsLoaded = false;
+    bool hevLoaded = false;
+    bool bareLoaded = false;
     bool unavailable = false;
     bool loggedReady = false;
     std::string failure;
@@ -316,6 +337,7 @@ struct BmVrGloves::Impl
         const bool wantHev = bmvr::g_VrHandsUseHevGloves;
         const char* hevNames[2] = { "hev_glove_left_model.glb", "hev_glove_right_model.glb" };
         const char* steamNames[2] = { "vr_glove_left_model.glb", "vr_glove_right_model.glb" };
+        const char* bareNames[2] = { "bare_hand_left_model.glb", "bare_hand_right_model.glb" };
         bool usingHev = false;
         if (wantHev)
         {
@@ -323,11 +345,12 @@ struct BmVrGloves::Impl
             usingHev = ResolveLocalGlb(hevNames[0], leftPath) && ResolveLocalGlb(hevNames[1], rightPath);
         }
 
-        auto loadPair = [&](const char* leftName, const char* rightName, bool local) -> bool {
-            hands[0].fileName = leftName;
-            hands[1].fileName = rightName;
-            for (Hand& hand : hands)
+        auto loadPair = [&](Hand* dest, const char* leftName, const char* rightName, bool local) -> bool {
+            dest[0].fileName = leftName;
+            dest[1].fileName = rightName;
+            for (int i = 0; i < 2; ++i)
             {
+                Hand& hand = dest[i];
                 std::string path;
                 const bool found = local
                     ? ResolveLocalGlb(hand.fileName, path)
@@ -345,28 +368,46 @@ struct BmVrGloves::Impl
             return true;
         };
 
-        if (usingHev && loadPair(hevNames[0], hevNames[1], true))
+        if (usingHev && loadPair(hev, hevNames[0], hevNames[1], true))
         {
-            assetsLoaded = true;
+            hevLoaded = true;
             Game::logMsg(
                 "VR gloves loaded source=hev left=%u verts right=%u verts",
-                static_cast<unsigned>(hands[0].asset.vertices.size()),
-                static_cast<unsigned>(hands[1].asset.vertices.size()));
-            return true;
+                static_cast<unsigned>(hev[0].asset.vertices.size()),
+                static_cast<unsigned>(hev[1].asset.vertices.size()));
         }
-        if (usingHev)
-            Game::logMsg("HEV gloves missing or invalid, falling back to SteamVR GLB");
-        if (!loadPair(steamNames[0], steamNames[1], false))
+        else
+        {
+            if (usingHev)
+                Game::logMsg("HEV gloves missing or invalid, falling back to SteamVR GLB");
+            if (loadPair(hev, steamNames[0], steamNames[1], false))
+            {
+                hevLoaded = true;
+                Game::logMsg(
+                    "VR gloves loaded source=steamvr left=%u verts right=%u verts",
+                    static_cast<unsigned>(hev[0].asset.vertices.size()),
+                    static_cast<unsigned>(hev[1].asset.vertices.size()));
+            }
+        }
+
+        if (loadPair(bare, bareNames[0], bareNames[1], true))
+        {
+            bareLoaded = true;
+            Game::logMsg(
+                "VR bare hands loaded left=%u verts right=%u verts",
+                static_cast<unsigned>(bare[0].asset.vertices.size()),
+                static_cast<unsigned>(bare[1].asset.vertices.size()));
+        }
+        else
+            Game::logMsg("VR bare hands missing; intro will hide hands until HEV suit");
+
+        if (!hevLoaded && !bareLoaded)
         {
             Fail("missing SteamVR glove assets");
             return false;
         }
 
         assetsLoaded = true;
-        Game::logMsg(
-            "VR gloves loaded source=steamvr left=%u verts right=%u verts",
-            static_cast<unsigned>(hands[0].asset.vertices.size()),
-            static_cast<unsigned>(hands[1].asset.vertices.size()));
         return true;
     }
 };
@@ -389,6 +430,11 @@ bool BmVrGloves::AssetsReady() const
     return m_Impl && m_Impl->assetsLoaded;
 }
 
+bool BmVrGloves::HasBareHands() const
+{
+    return m_Impl && m_Impl->bareLoaded;
+}
+
 bool BmVrGloves::Failed() const
 {
     return m_Impl && m_Impl->unavailable;
@@ -404,27 +450,31 @@ bool BmVrGloves::WarmupGpu(IDirect3DDevice9* device)
 {
     if (!device || !m_Impl || !m_Impl->EnsureAssets())
         return false;
-    std::string error;
-    bool ok = m_Impl->renderer.EnsureHandMesh(device, 0, m_Impl->hands[0].asset, error);
-    if (!ok && !error.empty())
-    {
-        static int s_warmLog;
-        if (s_warmLog < 4)
+    auto warmup = [&](int gpuIndex, Impl::Hand& hand, const char* label) {
+        std::string error;
+        if (m_Impl->renderer.EnsureHandMesh(device, gpuIndex, hand.asset, error))
+            return true;
+        if (!error.empty())
         {
-            Game::logMsg("VR glove warmup hand=0: %s", error.c_str());
-            ++s_warmLog;
+            static int s_warmLog;
+            if (s_warmLog < 8)
+            {
+                Game::logMsg("VR glove warmup %s: %s", label, error.c_str());
+                ++s_warmLog;
+            }
         }
+        return false;
+    };
+    bool ok = false;
+    if (m_Impl->hevLoaded)
+    {
+        ok |= warmup(0, m_Impl->hev[0], "hev-left");
+        warmup(1, m_Impl->hev[1], "hev-right");
     }
-    std::string rightError;
-    if (!m_Impl->renderer.EnsureHandMesh(device, 1, m_Impl->hands[1].asset, rightError)
-        && !rightError.empty())
+    if (m_Impl->bareLoaded)
     {
-        static int s_warmRightLog;
-        if (s_warmRightLog < 4)
-        {
-            Game::logMsg("VR glove warmup hand=1: %s", rightError.c_str());
-            ++s_warmRightLog;
-        }
+        ok |= warmup(2, m_Impl->bare[0], "bare-left");
+        warmup(3, m_Impl->bare[1], "bare-right");
     }
     return ok;
 }
@@ -463,6 +513,31 @@ bool BmVrGloves::DrawForEye(
     const Vector* origins[2] = { &leftWorld, &rightWorld };
     const QAngle* angles[2] = { &leftAngles, &rightAngles };
 
+    const bool wearingSuit = g_Game && g_Game->m_VR && g_Game->m_VR->WearingHevSuit();
+    Impl::Hand* pair = nullptr;
+    int gpuBase = 0;
+    const char* source = "hev";
+    if (!wearingSuit && m_Impl->bareLoaded)
+    {
+        pair = m_Impl->bare;
+        gpuBase = 2;
+        source = "bare";
+    }
+    else if (m_Impl->hevLoaded)
+    {
+        pair = m_Impl->hev;
+        gpuBase = 0;
+        source = "hev";
+    }
+    else if (m_Impl->bareLoaded)
+    {
+        pair = m_Impl->bare;
+        gpuBase = 2;
+        source = "bare";
+    }
+    else
+        return false;
+
     for (int i = 0; i < 2; ++i)
     {
         const bool rightHand = (i == 1);
@@ -474,7 +549,7 @@ bool BmVrGloves::DrawForEye(
         if (!valid[i])
             continue;
 
-        Impl::Hand& hand = m_Impl->hands[i];
+        Impl::Hand& hand = pair[i];
         vr::VRSkeletalSummaryData_t summary{};
         const bool gripCurl = rightHand && g_Game && g_Game->m_VR
             && g_Game->m_VR->WantsRightGloveWeaponGripCurl();
@@ -493,9 +568,11 @@ bool BmVrGloves::DrawForEye(
             bmvr::g_VrHandsPoseRotY + (rightHand && gripCurl ? bmvr::g_VrHandsRightGripRotY : 0.f),
             bmvr::g_VrHandsPoseRotZ + (rightHand && gripCurl ? bmvr::g_VrHandsRightGripRotZ : 0.f));
         Vector posOffset(
-            bmvr::g_VrHandsPoseOffX,
-            bmvr::g_VrHandsPoseOffY,
-            bmvr::g_VrHandsPoseOffZ);
+            0.f, 0.f, 0.f);
+        const uint32_t family = (g_Game && g_Game->m_VR)
+            ? g_Game->m_VR->m_ControllerFamily
+            : L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
+        bmvr::EffectiveVrHandsPoseOffset(family, posOffset.x, posOffset.y, posOffset.z);
         if (i == 0)
         {
             posOffset.x += bmvr::g_VrHandsLeftPoseOffX;
@@ -528,7 +605,7 @@ bool BmVrGloves::DrawForEye(
         std::string error;
         if (!m_Impl->renderer.Draw(
                 device,
-                i,
+                gpuBase + i,
                 hand.asset,
                 hand.palette,
                 world,
@@ -554,8 +631,8 @@ bool BmVrGloves::DrawForEye(
     if (drew && !m_Impl->loggedReady)
     {
         m_Impl->loggedReady = true;
-        Game::logMsg("VR gloves drew eye=%d fov=%.1f aspect=%.3f scale=%.2f",
-            stereoEye, horizontalFovDegrees, aspectRatio, scale);
+        Game::logMsg("VR gloves drew source=%s eye=%d fov=%.1f aspect=%.3f scale=%.2f",
+            source, stereoEye, horizontalFovDegrees, aspectRatio, scale);
     }
     return drew;
 }

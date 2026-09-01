@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cstdarg>
 #include <cstdint>
 #include <cmath>
@@ -116,6 +117,8 @@ namespace
         bool useGameRenderPoseForProjection = false;
         int forceMonoProjectionEye = -1;
         int forceMonoProjectionView = -1;
+        // -1 auto (SteamVR / VD-forwarded SteamVR), 0 off, 1 on.
+        int flipSubmitY = -1;
         DWORD parentPid = 0;
     };
 
@@ -246,6 +249,248 @@ namespace
         return false;
     }
 
+    bool ParseFlipSubmitYArg(const wchar_t* value, int& out)
+    {
+        if (!value || !*value)
+            return false;
+
+        if (_wcsicmp(value, L"auto") == 0 || std::wcscmp(value, L"-1") == 0)
+        {
+            out = -1;
+            return true;
+        }
+        if (_wcsicmp(value, L"on") == 0 ||
+            _wcsicmp(value, L"true") == 0 ||
+            _wcsicmp(value, L"yes") == 0 ||
+            std::wcscmp(value, L"1") == 0)
+        {
+            out = 1;
+            return true;
+        }
+        if (_wcsicmp(value, L"off") == 0 ||
+            _wcsicmp(value, L"false") == 0 ||
+            _wcsicmp(value, L"no") == 0 ||
+            std::wcscmp(value, L"0") == 0)
+        {
+            out = 0;
+            return true;
+        }
+        return false;
+    }
+
+    const char* FlipSubmitYOptionName(int option)
+    {
+        if (option > 0)
+            return "on";
+        if (option == 0)
+            return "off";
+        return "auto";
+    }
+
+    std::string ReadTextFileNarrow(const std::wstring& path)
+    {
+        FILE* file = _wfsopen(path.c_str(), L"rb", _SH_DENYNO);
+        if (!file)
+            return {};
+        std::fseek(file, 0, SEEK_END);
+        const long size = std::ftell(file);
+        std::fseek(file, 0, SEEK_SET);
+        if (size <= 0 || size > 4 * 1024 * 1024)
+        {
+            std::fclose(file);
+            return {};
+        }
+        std::string text(static_cast<size_t>(size), '\0');
+        const size_t read = std::fread(text.data(), 1, static_cast<size_t>(size), file);
+        std::fclose(file);
+        text.resize(read);
+        return text;
+    }
+
+    bool ExtractJsonValueAfterKeyI(const std::string& text, const char* key, std::string& out)
+    {
+        if (text.empty() || !key || !*key)
+            return false;
+
+        auto toLower = [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); };
+        std::string lower = text;
+        std::transform(lower.begin(), lower.end(), lower.begin(), toLower);
+        std::string keyLower = key;
+        std::transform(keyLower.begin(), keyLower.end(), keyLower.begin(), toLower);
+
+        const std::string quoted = std::string("\"") + keyLower + "\"";
+        const size_t keyPos = lower.find(quoted);
+        if (keyPos == std::string::npos)
+            return false;
+
+        size_t i = keyPos + quoted.size();
+        while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+            ++i;
+        if (i >= text.size() || text[i] != ':')
+            return false;
+        ++i;
+        while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])))
+            ++i;
+        if (i >= text.size())
+            return false;
+
+        if (text[i] == '"' || text[i] == '\'')
+        {
+            const char quote = text[i++];
+            const size_t start = i;
+            while (i < text.size() && text[i] != quote)
+                ++i;
+            out = text.substr(start, i - start);
+            return true;
+        }
+
+        const size_t start = i;
+        while (i < text.size() && text[i] != ',' && text[i] != '}' && text[i] != '\r' && text[i] != '\n')
+            ++i;
+        out = text.substr(start, i - start);
+        while (!out.empty() && std::isspace(static_cast<unsigned char>(out.back())))
+            out.pop_back();
+        return !out.empty();
+    }
+
+    int ClassifyVirtualDesktopOpenXrChoice(const std::string& value)
+    {
+        if (value.empty())
+            return -1;
+        if (L4D2VR_TextContainsI(value.c_str(), "VDXR") ||
+            L4D2VR_TextContainsI(value.c_str(), "VirtualDesktop") ||
+            L4D2VR_TextContainsI(value.c_str(), "Virtual Desktop"))
+            return 0;
+        if (L4D2VR_TextContainsI(value.c_str(), "SteamVR"))
+            return 1;
+        return -1;
+    }
+
+    int ReadVirtualDesktopOpenXrChoice(std::string& detail)
+    {
+        wchar_t appData[MAX_PATH]{};
+        wchar_t localAppData[MAX_PATH]{};
+        GetEnvironmentVariableW(L"APPDATA", appData, MAX_PATH);
+        GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+
+        std::vector<std::wstring> paths;
+        auto add = [&](const wchar_t* root, const wchar_t* rel)
+        {
+            if (!root || !root[0])
+                return;
+            paths.push_back(std::wstring(root) + rel);
+        };
+        add(appData, L"\\VirtualDesktop\\Settings.json");
+        add(appData, L"\\Virtual Desktop\\Settings.json");
+        add(appData, L"\\Virtual Desktop, Inc\\Virtual Desktop Streamer\\Settings.json");
+        add(appData, L"\\Virtual Desktop, Inc\\Virtual Desktop Streamer\\settings.json");
+        add(localAppData, L"\\VirtualDesktop\\Settings.json");
+        add(localAppData, L"\\Virtual Desktop\\Settings.json");
+
+        const char* keys[] = {
+            "OpenXRRuntime",
+            "OpenXrRuntime",
+            "openXRRuntime",
+            "PreferredOpenXRRuntime",
+            "XRRuntime"
+        };
+
+        for (const std::wstring& path : paths)
+        {
+            const std::string text = ReadTextFileNarrow(path);
+            if (text.empty())
+                continue;
+            for (const char* key : keys)
+            {
+                std::string value;
+                if (!ExtractJsonValueAfterKeyI(text, key, value))
+                    continue;
+                const int choice = ClassifyVirtualDesktopOpenXrChoice(value);
+                if (choice < 0)
+                    continue;
+                char pathNarrow[MAX_PATH]{};
+                WideCharToMultiByte(CP_UTF8, 0, path.c_str(), -1, pathNarrow, MAX_PATH, nullptr, nullptr);
+                detail = std::string(key) + "=" + value + " file=" + pathNarrow;
+                return choice;
+            }
+        }
+
+        const wchar_t* regPaths[] = {
+            L"Software\\Virtual Desktop, Inc\\Virtual Desktop Streamer",
+            L"Software\\Virtual Desktop, Inc\\VirtualDesktop",
+            L"Software\\Guy Godin\\Virtual Desktop"
+        };
+        const wchar_t* regNames[] = {
+            L"OpenXRRuntime",
+            L"OpenXrRuntime",
+            L"XRRuntime"
+        };
+        for (const wchar_t* subkey : regPaths)
+        {
+            HKEY key = nullptr;
+            if (RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_READ, &key) != ERROR_SUCCESS)
+                continue;
+            for (const wchar_t* name : regNames)
+            {
+                wchar_t value[256]{};
+                DWORD size = sizeof(value);
+                DWORD type = 0;
+                if (RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<LPBYTE>(value), &size) != ERROR_SUCCESS)
+                    continue;
+                if (type != REG_SZ && type != REG_EXPAND_SZ)
+                    continue;
+                char narrow[256]{};
+                WideCharToMultiByte(CP_UTF8, 0, value, -1, narrow, sizeof(narrow), nullptr, nullptr);
+                const int choice = ClassifyVirtualDesktopOpenXrChoice(narrow);
+                if (choice < 0)
+                    continue;
+                char keyNarrow[128]{};
+                WideCharToMultiByte(CP_UTF8, 0, name, -1, keyNarrow, sizeof(keyNarrow), nullptr, nullptr);
+                detail = std::string("registry ") + keyNarrow + "=" + narrow;
+                RegCloseKey(key);
+                return choice;
+            }
+            RegCloseKey(key);
+        }
+
+        detail = "Virtual Desktop OpenXR choice not found";
+        return -1;
+    }
+
+    bool ShouldAutoFlipSubmitY(const char* runtimeName, std::string& reason)
+    {
+        if (runtimeName && L4D2VR_TextContainsI(runtimeName, "SteamVR"))
+        {
+            reason = "runtimeName contains SteamVR";
+            return true;
+        }
+
+        const bool virtualDesktopRuntime = runtimeName &&
+            (L4D2VR_TextContainsI(runtimeName, "VirtualDesktop") ||
+                L4D2VR_TextContainsI(runtimeName, "Virtual Desktop") ||
+                L4D2VR_TextContainsI(runtimeName, "VDXR"));
+        if (virtualDesktopRuntime)
+        {
+            std::string detail;
+            const int choice = ReadVirtualDesktopOpenXrChoice(detail);
+            if (choice == 1)
+            {
+                reason = std::string("Virtual Desktop forwards to SteamVR (") + detail + ")";
+                return true;
+            }
+            if (choice == 0)
+            {
+                reason = std::string("Virtual Desktop VDXR (") + detail + ")";
+                return false;
+            }
+            reason = "Virtual Desktop runtime; VDXR assumed (no SteamVR setting found)";
+            return false;
+        }
+
+        reason = "runtime does not need a submit Y-flip";
+        return false;
+    }
+
     const char* ForceMonoProjectionEyeName(int eye)
     {
         if (eye == static_cast<int>(L4D2VR_OPENXR_EYE_LEFT))
@@ -360,6 +605,10 @@ namespace
             else if (const wchar_t* value = needsValue(L"--force-mono-projection-view"))
             {
                 ParseProjectionEyeArg(value, options.forceMonoProjectionView);
+            }
+            else if (const wchar_t* value = needsValue(L"--flip-submit-y"))
+            {
+                ParseFlipSubmitYArg(value, options.flipSubmitY);
             }
             else if (const wchar_t* value = needsValue(L"--parent"))
             {
@@ -1365,6 +1614,15 @@ namespace
             renderPose.position[2]
         };
 
+        if (renderPose.reserved1 & L4D2VR_OPENXR_POSE_FLAG_MONO)
+        {
+            if (outYaw)
+                *outYaw = ExtractOpenXrYaw(pose.orientation);
+            if (outIpd)
+                *outIpd = 0.0f;
+            return pose;
+        }
+
         float ipd = GetLocatedViewIpd(locatedViews, locatedCount);
         if (renderPose.reserved0 != 0)
         {
@@ -1581,6 +1839,7 @@ namespace
         void AddMenuButtonBindings(std::vector<XrActionSuggestedBinding>& bindings);
         void SuggestBindings(Logger& log);
         std::string PathToString(XrPath path) const;
+        uint32_t CurrentControllerFamily() const;
         void LogCurrentInteractionProfiles(Logger& log);
         void ReadBooleanActions(L4D2VROpenXrInputStateDesc& outState);
         void ReadFloatDigitalActions(L4D2VROpenXrInputStateDesc& outState);
@@ -4019,6 +4278,21 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         return buffer;
     }
 
+    uint32_t OpenXrInputBridge::CurrentControllerFamily() const
+    {
+        uint32_t family = L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
+        for (uint32_t hand = 0; hand < L4D2VR_OPENXR_HAND_COUNT; ++hand)
+        {
+            const XrPath path = m_LastInteractionProfiles[hand];
+            if (path == XR_NULL_PATH || path == static_cast<XrPath>(~0ull))
+                continue;
+            const uint32_t classified = L4D2VR_ClassifyOpenXrInteractionProfile(PathToString(path).c_str());
+            if (classified != L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN)
+                family = classified;
+        }
+        return family;
+    }
+
     bool OpenXrInputBridge::CreateAction(XrActionSet set, XrActionType type, const char* name, const char* localizedName, XrAction& out, Logger& log)
     {
         XrActionCreateInfo createInfo{ XR_TYPE_ACTION_CREATE_INFO };
@@ -4518,6 +4792,16 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         SynthesizeControllerFingerCurls(state);
         LocateControllerPoses(displayTime, state, log);
         LocateHandTracking(displayTime, state);
+        state.reserved0 = CurrentControllerFamily();
+        static uint32_t s_loggedFamily = ~0u;
+        if (state.reserved0 != s_loggedFamily)
+        {
+            s_loggedFamily = state.reserved0;
+            log.Print(
+                "OpenXR controller family=%s (%u)",
+                L4D2VR_ControllerFamilyName(state.reserved0),
+                state.reserved0);
+        }
         bridge.PublishInputState(state);
         PumpHaptics(bridge, log);
     }
@@ -4932,6 +5216,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
         int Run(const Options& options)
         {
+            m_FlipSubmitYOption = options.flipSubmitY;
             m_Bridge.Open(options.mappingName, m_Log);
             m_ParentProcess = OpenParentProcess(options.parentPid);
 
@@ -5144,6 +5429,44 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             return loaded;
         }
 
+        void ResolveFlipSubmitY(const char* runtimeName)
+        {
+            if (runtimeName && runtimeName[0])
+                std::snprintf(m_RuntimeName, sizeof(m_RuntimeName), "%s", runtimeName);
+            else
+                m_RuntimeName[0] = '\0';
+
+            std::string reason;
+            if (m_FlipSubmitYOption > 0)
+            {
+                m_FlipSubmitY = true;
+                reason = "config on";
+            }
+            else if (m_FlipSubmitYOption == 0)
+            {
+                m_FlipSubmitY = false;
+                reason = "config off";
+            }
+            else
+            {
+                m_FlipSubmitY = ShouldAutoFlipSubmitY(m_RuntimeName, reason);
+            }
+
+            m_Log.Print(
+                "OpenXR submit Y-flip: %s (%s) runtime=%s option=%s",
+                m_FlipSubmitY ? "on" : "off",
+                reason.c_str(),
+                m_RuntimeName[0] ? m_RuntimeName : "<unknown>",
+                FlipSubmitYOptionName(m_FlipSubmitYOption));
+        }
+
+        void ApplyEyeSubmitYFlip(VkImageBlit& blit) const
+        {
+            if (!m_FlipSubmitY)
+                return;
+            std::swap(blit.dstOffsets[0].y, blit.dstOffsets[1].y);
+        }
+
         bool CreateOpenXrSystem()
         {
             XrInstanceProperties instanceProperties{ XR_TYPE_INSTANCE_PROPERTIES };
@@ -5156,6 +5479,11 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     static_cast<unsigned long long>(XR_VERSION_MAJOR(instanceProperties.runtimeVersion)),
                     static_cast<unsigned long long>(XR_VERSION_MINOR(instanceProperties.runtimeVersion)),
                     static_cast<unsigned long long>(XR_VERSION_PATCH(instanceProperties.runtimeVersion)));
+                ResolveFlipSubmitY(instanceProperties.runtimeName);
+            }
+            else
+            {
+                ResolveFlipSubmitY("");
             }
 
             XrSystemGetInfo systemInfo{ XR_TYPE_SYSTEM_GET_INFO };
@@ -7411,7 +7739,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             m_Vk.vkCmdPipelineBarrier(m_CommandBuffer, srcStage, dstStage, 0, 0, nullptr, 0, nullptr, 1, &barrier);
         }
 
-        bool CmdRenderShaderBlitWithDescriptor(VulkanEyeSwapchain& target, uint32_t imageIndex, const VulkanGameEyeTexture& source, VkDescriptorSet descriptorSet, bool containFit)
+        bool CmdRenderShaderBlitWithDescriptor(VulkanEyeSwapchain& target, uint32_t imageIndex, const VulkanGameEyeTexture& source, VkDescriptorSet descriptorSet, bool containFit, bool flipY)
         {
             if (!m_UseShaderBlit ||
                 imageIndex >= target.framebuffers.size() ||
@@ -7468,8 +7796,13 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 nullptr);
 
             // Sample the bounded source. Eye submits contain-fit (no upscale);
-            // overlays still fill the swapchain.
-            const float bounds[4] = { source.uMin, source.vMin, source.uMax, source.vMax };
+            // overlays still fill the swapchain. SteamVR OpenXR wants a Y-flip
+            // of the eye image; VDXR/Oculus do not. Do not flip overlay quads.
+            float vMin = source.vMin;
+            float vMax = source.vMax;
+            if (flipY)
+                std::swap(vMin, vMax);
+            const float bounds[4] = { source.uMin, vMin, source.uMax, vMax };
             m_Vk.vkCmdPushConstants(
                 m_CommandBuffer,
                 m_BlitPipelineLayout,
@@ -7487,7 +7820,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         {
             if (eyeIndex >= L4D2VR_OPENXR_EYE_COUNT)
                 return false;
-            return CmdRenderShaderBlitWithDescriptor(eye, imageIndex, source, m_BlitDescriptorSets[eyeIndex], true);
+            return CmdRenderShaderBlitWithDescriptor(eye, imageIndex, source, m_BlitDescriptorSets[eyeIndex], true, m_FlipSubmitY);
         }
 
         bool CmdRenderOverlayShaderBlit(uint32_t overlayIndex, VulkanEyeSwapchain& swapchain, uint32_t imageIndex, const VulkanGameEyeTexture& source)
@@ -7495,7 +7828,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             const uint32_t descriptorIndex = OverlayBlitDescriptorIndex(overlayIndex);
             if (overlayIndex >= L4D2VR_OPENXR_OVERLAY_COUNT || descriptorIndex >= m_BlitDescriptorSets.size())
                 return false;
-            return CmdRenderShaderBlitWithDescriptor(swapchain, imageIndex, source, m_BlitDescriptorSets[descriptorIndex], false);
+            return CmdRenderShaderBlitWithDescriptor(swapchain, imageIndex, source, m_BlitDescriptorSets[descriptorIndex], false, false);
         }
 
         bool RenderEye(uint32_t eyeIndex, uint32_t frameIndex, uint32_t sharedFrameId, bool waitForQueueIdle = true)
@@ -7617,6 +7950,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     blit.dstSubresource.layerCount = 1;
                     blit.dstOffsets[0] = { dest.x, dest.y, 0 };
                     blit.dstOffsets[1] = { dest.x + dest.w, dest.y + dest.h, 1 };
+                    ApplyEyeSubmitYFlip(blit);
                     m_Vk.vkCmdBlitImage(m_CommandBuffer, source.image, source.layout,
                         dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
 
@@ -8637,6 +8971,9 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         VkCommandPool m_CommandPool = VK_NULL_HANDLE;
         VkCommandBuffer m_CommandBuffer = VK_NULL_HANDLE;
         bool m_UseShaderBlit = false;
+        int m_FlipSubmitYOption = -1;
+        bool m_FlipSubmitY = false;
+        char m_RuntimeName[XR_MAX_RUNTIME_NAME_SIZE]{};
         VkSampler m_BlitSampler = VK_NULL_HANDLE;
         VkRenderPass m_BlitRenderPass = VK_NULL_HANDLE;
         VkDescriptorSetLayout m_BlitDescriptorSetLayout = VK_NULL_HANDLE;
@@ -8686,6 +9023,7 @@ int wmain(int argc, wchar_t** argv)
         ForceMonoProjectionEyeName(options.forceMonoProjectionView),
         options.forceMonoProjectionView);
     log.Print("OpenXR quad overlays: %s", options.disableQuadOverlays ? "disabled" : "enabled");
+    log.Print("OpenXR submit Y-flip option: %s", FlipSubmitYOptionName(options.flipSubmitY));
 
     OpenXrVulkanSubmitProbe probe(log);
     const int exitCode = probe.Run(options);

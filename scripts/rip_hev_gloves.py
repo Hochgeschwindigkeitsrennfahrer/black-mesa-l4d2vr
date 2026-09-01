@@ -381,7 +381,17 @@ def pad4(n: int) -> int:
     return (n + 3) & ~3
 
 
-def write_glb(path: str, vertices, indices, joint_names, joint_parents, bind_mats, png: bytes):
+def write_glb(
+    path: str,
+    vertices,
+    indices,
+    joint_names,
+    joint_parents,
+    bind_mats,
+    png: bytes,
+    material_name="v_hand",
+    generator="rip_hev_gloves.py",
+):
     # column-major float32 buffers
     def f32(seq):
         return b"".join(struct.pack("<f", float(x)) for x in seq)
@@ -470,7 +480,7 @@ def write_glb(path: str, vertices, indices, joint_names, joint_parents, bind_mat
     nodes.append({"name": "mesh", "mesh": 0, "skin": 0})
 
     gltf = {
-        "asset": {"version": "2.0", "generator": "rip_hev_gloves.py"},
+        "asset": {"version": "2.0", "generator": generator},
         "buffers": [{"byteLength": len(blob)}],
         "bufferViews": views,
         "accessors": accessors,
@@ -479,7 +489,7 @@ def write_glb(path: str, vertices, indices, joint_names, joint_parents, bind_mat
         "textures": [{"sampler": 0, "source": 0}],
         "materials": [
             {
-                "name": "v_hand",
+                "name": material_name,
                 "pbrMetallicRoughness": {
                     "baseColorTexture": {"index": 0},
                     "metallicFactor": 0.0,
@@ -535,7 +545,17 @@ def write_glb(path: str, vertices, indices, joint_names, joint_parents, bind_mat
     print(f"wrote {path} verts={len(vertices)} tris={len(indices)//3} bytes={len(glb)}")
 
 
-def extract_hand(side: str, bones, worlds, verts, tris, png: bytes):
+def extract_hand(
+    side: str,
+    bones,
+    worlds,
+    verts,
+    tris,
+    png: bytes,
+    out_stem="hev_glove",
+    material_name="v_hand",
+    generator="rip_hev_gloves.py",
+):
     names, parents, src_names = joint_plan(side)
     name_to_idx = {b["name"]: i for i, b in enumerate(bones)}
     src_ids = []
@@ -655,31 +675,66 @@ def extract_hand(side: str, bones, worlds, verts, tris, png: bytes):
             f"z=[{min(zs) - max_z:.3f},{0.0:.3f}] wrist=({bind[0][12]:.3f},{bind[0][13]:.3f},{bind[0][14]:.3f})"
         )
 
-    out = os.path.join(OUT_DIR, f"hev_glove_{'left' if side == 'L' else 'right'}_model.glb")
-    write_glb(out, out_verts, out_idx, names, parents, bind, png)
+    out = os.path.join(OUT_DIR, f"{out_stem}_{'left' if side == 'L' else 'right'}_model.glb")
+    write_glb(
+        out,
+        out_verts,
+        out_idx,
+        names,
+        parents,
+        bind,
+        png,
+        material_name=material_name,
+        generator=generator,
+    )
     return out
 
 
-def main():
-    for p in (MDL, VVD, VTX, VTF):
+def run_rip(
+    mdl_path,
+    vvd_path,
+    vtx_path,
+    vtf_path,
+    mesh_vertex_offsets,
+    out_stem,
+    material_name,
+    generator,
+    png_w,
+    png_h,
+):
+    for p in (mdl_path, vvd_path, vtx_path, vtf_path):
         if not os.path.isfile(p):
             print("missing", p)
             return 1
-    mdl = open(MDL, "rb").read()
-    vvd = open(VVD, "rb").read()
-    vtx = open(VTX, "rb").read()
+    mdl = open(mdl_path, "rb").read()
+    vvd = open(vvd_path, "rb").read()
+    vtx = open(vtx_path, "rb").read()
     bones, worlds = load_bones(mdl)
     verts = load_vertices(vvd)
-    # bodypart meshes: 3006 + 910
-    tris = load_indices(vtx, [0, 3006])
+    tris = load_indices(vtx, mesh_vertex_offsets)
     print(f"bones={len(bones)} verts={len(verts)} tris={len(tris)}")
     if len(tris) < 100:
         print("VTX parse produced too few triangles; aborting")
         return 1
-    png = load_vtf_png_bytes(VTF)
-    extract_hand("L", bones, worlds, verts, tris, png)
-    extract_hand("R", bones, worlds, verts, tris, png)
+    png = load_vtf_png_bytes(vtf_path, png_w, png_h)
+    extract_hand("L", bones, worlds, verts, tris, png, out_stem, material_name, generator)
+    extract_hand("R", bones, worlds, verts, tris, png, out_stem, material_name, generator)
     return 0
+
+
+def main():
+    return run_rip(
+        MDL,
+        VVD,
+        VTX,
+        VTF,
+        [0, 3006],
+        "hev_glove",
+        "v_hand",
+        "rip_hev_gloves.py",
+        1024,
+        512,
+    )
 
 
 if __name__ == "__main__":

@@ -1148,7 +1148,6 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
         m_WeaponMenuClickStartMs = now;
         m_WeaponMenuOpenedThisHold = false;
         m_WeaponMenuHover = 0;
-        m_WeaponMenuLeftCenter = false;
     }
 
     if (stickClickHeld)
@@ -1159,7 +1158,6 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             m_WeaponMenuOpen = true;
             m_WeaponMenuOpenedThisHold = true;
             m_WeaponMenuLatched = false;
-            m_WeaponMenuLeftCenter = false;
             m_WeaponMenuHover = 0;
             PulseHandHaptic(vr::TrackedControllerRole_RightHand, 900, 0.35f);
             Game::logMsg("Weapon menu opened (right stick hold)");
@@ -1252,7 +1250,7 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             if (placed >= kMaxMenuSlots)
                 return;
             float ox = 0.f, oy = 0.f;
-            HexToOffset(q, r, kHexWorldHu, ox, oy);
+            HexToOffset(q, r, kHexWorldHu * kHexPackScale, ox, oy);
             m_WeaponMenuSlots[placed].entityIndex = wpn.entityIndex;
             m_WeaponMenuSlots[placed].kind = kind;
             m_WeaponMenuSlots[placed].axialQ = q;
@@ -1328,59 +1326,43 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             QAngle::AngleVectors(m_PhysicalRightAngAbs, &rayDir, nullptr, nullptr);
         }
         const int prevHover = m_WeaponMenuHover;
-        const UINT hw = m_RenderWidth > 64 ? m_RenderWidth : 1584u;
-        const UINT hh = m_RenderHeight > 64 ? m_RenderHeight : 1440u;
-        const float aspect = static_cast<float>(hw) / static_cast<float>(hh);
-        const float projFov = HorizontalFovForAspect(aspect);
-        const float tanHalf = tanf(projFov * 0.5f * 3.14159265f / 180.f);
-        const Vector eye = GetViewOrigin(MenuPlayerBody(this));
-        Vector vf, vr, vu;
-        GetViewBasis(&vf, &vr, &vu);
-        float ocx = 0.f, ocy = 0.f;
-        const bool haveOrigin = (tanHalf > 0.01f)
-            && ProjectWorldToScreen(m_WeaponMenuOrigin, eye, vf, vr, vu, tanHalf, aspect, hw, hh, ocx, ocy);
-        const float drawR = HexDrawRadiusPx(hh);
-        const float packR = drawR * kHexPackScale;
-        Vector planeHit{};
-        bool haveHit = false;
+        // Hover in the wheel plane. Screen projection used the cyclops eye while
+        // the hexes are drawn per stereo eye, so the centre cell looked selected
+        // without the ray actually registering until you left and re-entered.
+        const Vector planeN = m_WeaponMenuFwd;
+        const float planeDenom = rayDir.Dot(planeN);
+        int hover = 0;
+        if (fabsf(planeDenom) > 0.12f)
         {
-            const Vector n = m_WeaponMenuFwd;
-            const float denom = rayDir.Dot(n);
-            if (fabsf(denom) > 0.0001f)
+            const float hitT = (m_WeaponMenuOrigin - rayOrig).Dot(planeN) / planeDenom;
+            if (hitT > 0.02f && hitT < 80.f)
             {
-                const float t = (m_WeaponMenuOrigin - rayOrig).Dot(n) / denom;
-                if (t > 0.04f && t < 80.f)
+                const Vector planeHit = rayOrig + rayDir * hitT;
+                float bestD = 1.0e9f;
+                int best = -1;
+                for (int i = 0; i < m_WeaponMenuCount; ++i)
                 {
-                    planeHit = rayOrig + rayDir * t;
-                    haveHit = true;
+                    float ox = 0.f, oy = 0.f;
+                    HexToOffset(m_WeaponMenuSlots[i].axialQ, m_WeaponMenuSlots[i].axialR,
+                        kHexWorldHu * kHexPackScale, ox, oy);
+                    const Vector slot = m_WeaponMenuOrigin
+                        + m_WeaponMenuRight * ox + m_WeaponMenuUp * oy;
+                    const Vector d = planeHit - slot;
+                    const float lx = d.Dot(m_WeaponMenuRight);
+                    const float ly = d.Dot(m_WeaponMenuUp);
+                    if (!PointInHex(lx, ly, kHexWorldHu * kHexPackScale * 1.12f))
+                        continue;
+                    const float dist = lx * lx + ly * ly;
+                    if (dist < bestD)
+                    {
+                        bestD = dist;
+                        best = i;
+                    }
                 }
+                hover = (best >= 0) ? best : 0;
             }
         }
-        float hx = 0.f, hy = 0.f;
-        if (haveHit && haveOrigin)
-            haveHit = ProjectWorldToScreen(planeHit, eye, vf, vr, vu, tanHalf, aspect, hw, hh, hx, hy);
-        else
-            haveHit = false;
-        if (haveHit)
-        {
-            float bestD = 1.0e9f;
-            for (int i = 0; i < m_WeaponMenuCount; ++i)
-            {
-                float cx = 0.f, cy = 0.f;
-                HexScreenCenter(ocx, ocy, m_WeaponMenuSlots[i].axialQ,
-                    m_WeaponMenuSlots[i].axialR, packR, cx, cy);
-                if (!PointInHex(hx - cx, hy - cy, drawR * 1.08f))
-                    continue;
-                const float d = (hx - cx) * (hx - cx) + (hy - cy) * (hy - cy);
-                if (d < bestD)
-                {
-                    bestD = d;
-                    m_WeaponMenuHover = i;
-                }
-            }
-        }
-        if (m_WeaponMenuHover != 0)
-            m_WeaponMenuLeftCenter = true;
+        m_WeaponMenuHover = hover;
         if (m_WeaponMenuHover >= 0 && m_WeaponMenuHover != prevHover)
             QueueWeaponMenuSound(kWeaponSoundHover);
     }
@@ -1427,7 +1409,6 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
         m_WeaponMenuClickHeld = false;
         m_WeaponMenuOpenedThisHold = false;
         m_WeaponMenuLatched = false;
-        m_WeaponMenuLeftCenter = false;
         m_WeaponMenuHover = -1;
     }
 }
@@ -1481,7 +1462,12 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
         const WeaponMenuSlot& slot = m_WeaponMenuSlots[i];
         const bool hover = (i == m_WeaponMenuHover);
         float cx = 0.f, cy = 0.f;
-        HexScreenCenter(ocx, ocy, slot.axialQ, slot.axialR, packR, cx, cy);
+        float ox = 0.f, oy = 0.f;
+        HexToOffset(slot.axialQ, slot.axialR, kHexWorldHu * kHexPackScale, ox, oy);
+        const Vector slotWorld = m_WeaponMenuOrigin
+            + m_WeaponMenuRight * ox + m_WeaponMenuUp * oy;
+        if (!project(slotWorld, cx, cy))
+            HexScreenCenter(ocx, ocy, slot.axialQ, slot.axialR, packR, cx, cy);
         // ~8% of hex width (pointy-top width = R√3). Ring stays inside R so
         // packing ×1.20 leaves a visible gap.
         const float radius = drawR;

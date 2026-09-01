@@ -43,6 +43,7 @@ public:
         const QAngle& rightAngles);
 
     bool AssetsReady() const;
+    bool HasBareHands() const;
     bool Failed() const;
     const std::string& FailureReason() const;
     bool WarmupGpu(IDirect3DDevice9* device);

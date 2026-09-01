@@ -17,13 +17,18 @@ if (-not (Test-Path $ReadmeSrc)) { throw "Missing $ReadmeSrc" }
 
 $Dist = Join-Path $Root "dist"
 $Stage = Join-Path $Dist "drop-into-Black-Mesa-folder"
-$Zip = Join-Path $Dist "Black-Mesa-VR-drop-in.zip"
+$TestNotes = Join-Path $Root "packaging\TEST_RELEASE.txt"
+$ZipName = if (Test-Path $TestNotes) { "Black-Mesa-VR-test-drop-in.zip" } else { "Black-Mesa-VR-drop-in.zip" }
+$Zip = Join-Path $Dist $ZipName
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }
 if (Test-Path $Zip) { Remove-Item -Force $Zip }
 New-Item -ItemType Directory -Force -Path $Stage | Out-Null
 
 Copy-Item -Force $ReadmeSrc (Join-Path $Stage "BMVR_README.txt")
+if (Test-Path $TestNotes) {
+  Copy-Item -Force $TestNotes (Join-Path $Stage "TEST_RELEASE.txt")
+}
 Copy-Item -Force $Dll (Join-Path $Stage "d3d9.dll")
 Copy-Item -Force $OpenVrSrc (Join-Path $Stage "openvr_api.dll")
 

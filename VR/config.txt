@@ -36,9 +36,10 @@ DesktopLeftoverRender=false
 # r_portalsopenall + r_occlusion 0 workaround if an eye latches skybox-only.
 ForceOpenVis=false
 
-# CPU-wait GPU after the left-eye StretchRect. false (default) lets DXVK
-# pipeline the right eye. true only if both eyes show the same image.
-StereoBlitGpuFlush=false
+# CPU-wait GPU after the left-eye StretchRect from the shared backbuffer.
+# The stereo blit path always waits (same-image-both-eyes hazard). This key
+# is kept for the log / leftover fallback copy.
+StereoBlitGpuFlush=true
 
 # Portal 2 VR / L4D2VR right-stick look. Degrees per ms at full deflection.
 TurnSpeed=0.25
@@ -57,7 +58,13 @@ ViewmodelAngOffsetX=0.0
 ViewmodelAngOffsetY=0.0
 ViewmodelAngOffsetZ=0.0
 # sd805 tilts Vive wands -45°. G2 points more forward.
+# Quest / Touch OpenXR aim already points; ControllerPitchTiltTouch=0
+# is applied automatically when the helper reports a Touch profile.
+# Do not set this to 0 globally — G2 still needs -35.
 ControllerPitchTilt=-35.0
+ControllerPitchTiltTouch=0
+ControllerPitchTiltIndex=0
+ControllerPitchTiltVive=-45.0
 
 # 0.91 was BM/L4D2 scale; user 2026-08-25: ~25% smaller than that → 0.68.
 # Crowbar forced to 1.0 in DME. Hands use VrHandsModelScale separately.
@@ -76,6 +83,10 @@ OpenXRHelperWaitReadySeconds=45
 # Default OpenXR locate-at-submit on a late eye image jitters when you turn
 # your head. SteamVR Motion Smoothing does not apply on this helper path.
 OpenXRHelperUseGameRenderPoseForProjection=true
+# auto = Y-flip the helper's Vulkan eye blit for SteamVR OpenXR (and Virtual
+# Desktop when its OpenXR dropdown is SteamVR). VDXR/Oculus stay unflipped.
+# true/false override. This is the swapchain blit, not the 2D menu capture.
+OpenXRHelperFlipSubmitY=auto
 
 # Compositor timing: true = L4D2VR app PostPresentHandoff (WaitGetPoses off the
 # Vulkan queue; ~90fps). false = runtime handoff (waiter WaitGetPoses ~110ms / ~20fps).
@@ -107,6 +118,8 @@ AntiAliasing=0
 # Motion / comfort
 Haptics=true
 HideCrosshair=true
+# World-space VR reticle on the aim ray. Off by default; true to show it.
+VrCrosshair=false
 # MatchHmdHz no longer caps fps_max at the headset rate (that was 90 on G2).
 # fps_max is 0 (uncapped); SteamVR WaitGetPoses still paces compositor submit.
 MatchHmdHz=false
@@ -128,6 +141,9 @@ VrHandsPoseRotationOffset=0,180,0
 # scaled HEV glove along the controller so the mesh sits on the tracked pose.
 # Y -0.008 sits the glove on the controller (was -0.035, hanging below).
 VrHandsPoseOffsetMeters=0,-0.008,-0.10
+# Extra meters on Quest/Touch only (additive). Raise Y or shorten Z if the
+# HEV glove still sits off the Touch grip after tilt=0.
+QuestHandsPoseOffsetMeters=0,0,0
 VrHandsUseHevGloves=true
 VrHandsDebugBoxes=false
 VrHandHud=true

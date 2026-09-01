@@ -103,7 +103,13 @@ namespace bmvr
     extern float g_ViewmodelAngOffsetY;
     extern float g_ViewmodelAngOffsetZ;
     // L4D2VR tilts Vive wands -45°. G2 points more forward; default -35.
+    // Quest/Touch OpenXR aim already points; that family uses
+    // ControllerPitchTiltTouch (0) instead of this G2 default.
     extern float g_ControllerPitchTilt;
+    extern float g_ControllerPitchTiltTouch;
+    extern float g_ControllerPitchTiltIndex;
+    extern float g_ControllerPitchTiltVive;
+    float EffectiveControllerPitchTilt(uint32_t controllerFamily);
     // Trim applied to the firing pitch only, in degrees, positive = shoot
     // higher. Leaves the viewmodel alone, so it corrects a grip that aims low
     // without disturbing tuned weapon poses. Live-tune with Ctrl+Numpad +/-.
@@ -138,13 +144,14 @@ namespace bmvr
     extern bool g_VrHandsDebugBoxes;
     // Wrist HUD (HL2VR-style): health+suit on the left wrist, ammo on the right.
     extern bool g_HandHud;
-    // World-space aim reticle drawn where the controller's firing ray lands,
-    // styled to match the wrist HUD. Optional: VrCrosshair=false in config.txt.
+    // World-space aim reticle at the controller firing ray. Off by default;
+    // VrCrosshair=true in config.txt turns it on.
     extern bool g_VrCrosshair;
     // Reticle size multiplier, for players who want it smaller or bolder.
     extern float g_VrCrosshairScale;
-    // Hide gloves and wrist HUD until the HEV suit is picked up. Depends on a
-    // scanned m_bWearingSuit offset; set false if the scan ever misfires.
+    // Hide HEV gloves and wrist HUD until the HEV suit is picked up. Bare-hand
+    // GLBs still draw on the intro tram. Depends on a scanned m_bWearingSuit
+    // offset; set false if the scan ever misfires.
     extern bool g_HideHandsWithoutSuit;
     // While scoped (crossbow), aim from the headset instead of the controller so
     // bolts land in the middle of the scope picture.
@@ -162,6 +169,10 @@ namespace bmvr
     extern float g_VrHandsPoseOffX;
     extern float g_VrHandsPoseOffY;
     extern float g_VrHandsPoseOffZ;
+    extern float g_VrHandsTouchOffX;
+    extern float g_VrHandsTouchOffY;
+    extern float g_VrHandsTouchOffZ;
+    void EffectiveVrHandsPoseOffset(uint32_t controllerFamily, float& x, float& y, float& z);
     extern float g_VrHandsLeftPoseOffX;
     extern float g_VrHandsLeftPoseOffY;
     extern float g_VrHandsLeftPoseOffZ;
@@ -178,8 +189,8 @@ namespace bmvr
     // Old stereo vis workaround: r_portalsopenall + r_occlusion 0. Default
     // off — that pair draws the whole map and tanks open/complex areas.
     extern bool g_ForceOpenVis;
-    // CPU-wait the GPU after the left-eye StretchRect. Needed only if both
-    // eyes show the same image (DXVK missed the BB copy hazard). Default off.
+    // CPU-wait the GPU after the left-eye StretchRect. The HMD-fb blit path
+    // always flushes regardless of this flag (shared FullFrame/BB hazard).
     extern bool g_StereoBlitGpuFlush;
     // World-space v_ models vs world props. Applied in DrawModelExecute around
     // the controller (not m_flModelScale at entity origin). Range 0.2–1.5.

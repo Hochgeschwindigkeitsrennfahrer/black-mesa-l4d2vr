@@ -312,3 +312,11 @@ Overnight port of the L4D2VR `main2` multicore **subset** plus remaining safe Qo
 - Viewmodels write `C_BaseAnimating::m_flModelScale` at +0x7C0 (Ghidra DT_BaseAnimating). Default `ViewmodelScale=0.5`.
 - **SteamVR overlay SS still cannot enlarge BM G-buffers past the HWND.** `hmd_world` persist-skip. Eyes can still be the recommended size; unmatched G-buffers upscale from the window blit.
 - **Verified miss (2026-08-26, user):** FullFrame + G-buffer + eyes all 2544×2480 (`worldMatch=1 redirected=1`). Engine PushRT/Viewport stayed **2560×1440** (rewrite never logged). HMD: warped top strip + garbage/black below. Desktop letterbox copied that broken eye. Persist-skip `hmd_world` — do not LITERAL-grow world RTs taller than the HWND. Eyes can still be SteamVR rec; gbmatch squash-blit from the window. Native pixels above the window need `hmd_swap` (already persist-skipped, black desktop) or a larger game window.
+
+## Quest 3 + Virtual Desktop / SteamVR OpenXR (2026-09-01)
+
+User-reported: Quest 3 via Virtual Desktop, world **upside-down** when Streamer Options → OpenXR Runtime = **SteamVR**. Same machine upright when that dropdown is **VDXR**. Windows ActiveRuntime can still be `virtualdesktop-openxr.json` in both cases; the helper's `xrGetInstanceProperties` runtime name plus VD Settings.json/registry decide the blit.
+
+Do **not** Y-flip the 2D/menu capture path (`AGENTS.md`). Flip is the helper Vulkan **eye swapchain blit** only (`OpenXRHelperFlipSubmitY=auto`). SteamVR OpenXR (and VD forwarding to SteamVR) flips; VDXR/Oculus do not. Force with `true`/`false` if auto misses a VD setting file.
+
+Quest / Touch hands sitting **below** the controllers: `ControllerPitchTilt=-35` is a G2/WMR grip correction. Touch OpenXR **aim** already points; extra −35° pitches the gun and gloves down. Per-family table: Touch tilt 0 + aim pose for weapons / grip for gloves; G2 keeps −35 and grip. Log line: `Controller tracking ... tilt=0.0 family=touch`. Extra glove meters: `QuestHandsPoseOffsetMeters`.

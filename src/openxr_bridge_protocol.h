@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cctype>
+#include <cstring>
 
 constexpr uint32_t L4D2VR_OPENXR_BRIDGE_MAGIC = 0x5258344Cu; // L4XR
 constexpr uint32_t L4D2VR_OPENXR_BRIDGE_VERSION = 12;
@@ -57,6 +59,97 @@ enum : uint32_t
     L4D2VR_OPENXR_INPUT_FEATURE_HAND_TRACKING = 1u << 1,
     L4D2VR_OPENXR_INPUT_FEATURE_HAPTICS = 1u << 2
 };
+
+// L4D2VROpenXrInputStateDesc.reserved0. G2/WMR defaults stay on UNKNOWN.
+enum : uint32_t
+{
+    L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN = 0,
+    L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH = 1, // Quest / Rift / Pico Touch-like
+    L4D2VR_OPENXR_CONTROLLER_FAMILY_HP_G2 = 2,
+    L4D2VR_OPENXR_CONTROLLER_FAMILY_KNUCKLES = 3,
+    L4D2VR_OPENXR_CONTROLLER_FAMILY_VIVE = 4
+};
+
+inline bool L4D2VR_TextContainsI(const char* haystack, const char* needle)
+{
+    if (!haystack || !needle || !*needle)
+        return false;
+    for (const char* p = haystack; *p; ++p)
+    {
+        const char* h = p;
+        const char* n = needle;
+        while (*h && *n)
+        {
+            const unsigned char hc = static_cast<unsigned char>(*h);
+            const unsigned char nc = static_cast<unsigned char>(*n);
+            if (std::tolower(hc) != std::tolower(nc))
+                break;
+            ++h;
+            ++n;
+        }
+        if (!*n)
+            return true;
+    }
+    return false;
+}
+
+inline uint32_t L4D2VR_ClassifyOpenXrInteractionProfile(const char* path)
+{
+    if (!path || !*path)
+        return L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
+    if (L4D2VR_TextContainsI(path, "touch_controller") ||
+        L4D2VR_TextContainsI(path, "pico4_controller") ||
+        L4D2VR_TextContainsI(path, "pico_neo") ||
+        L4D2VR_TextContainsI(path, "pico4"))
+        return L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH;
+    if (L4D2VR_TextContainsI(path, "index_controller"))
+        return L4D2VR_OPENXR_CONTROLLER_FAMILY_KNUCKLES;
+    if (L4D2VR_TextContainsI(path, "motion_controller"))
+        return L4D2VR_OPENXR_CONTROLLER_FAMILY_HP_G2;
+    if (L4D2VR_TextContainsI(path, "vive_controller") ||
+        L4D2VR_TextContainsI(path, "vive_cosmos") ||
+        L4D2VR_TextContainsI(path, "vive_focus"))
+        return L4D2VR_OPENXR_CONTROLLER_FAMILY_VIVE;
+    return L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
+}
+
+inline uint32_t L4D2VR_ClassifyOpenVrControllerType(const char* type)
+{
+    if (!type || !*type)
+        return L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
+    if (L4D2VR_TextContainsI(type, "oculus_touch") ||
+        L4D2VR_TextContainsI(type, "oculus_plus") ||
+        L4D2VR_TextContainsI(type, "meta_quest") ||
+        L4D2VR_TextContainsI(type, "rift") ||
+        L4D2VR_TextContainsI(type, "pico"))
+        return L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH;
+    if (L4D2VR_TextContainsI(type, "knuckles"))
+        return L4D2VR_OPENXR_CONTROLLER_FAMILY_KNUCKLES;
+    if (L4D2VR_TextContainsI(type, "hpmotion") ||
+        L4D2VR_TextContainsI(type, "hp_motion") ||
+        L4D2VR_TextContainsI(type, "holographic"))
+        return L4D2VR_OPENXR_CONTROLLER_FAMILY_HP_G2;
+    if (L4D2VR_TextContainsI(type, "vive"))
+        return L4D2VR_OPENXR_CONTROLLER_FAMILY_VIVE;
+    return L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
+}
+
+inline bool L4D2VR_ControllerFamilyPrefersAimPose(uint32_t family)
+{
+    return family == L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH;
+}
+
+inline const char* L4D2VR_ControllerFamilyName(uint32_t family)
+{
+    switch (family)
+    {
+    case L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH: return "touch";
+    case L4D2VR_OPENXR_CONTROLLER_FAMILY_HP_G2: return "g2";
+    case L4D2VR_OPENXR_CONTROLLER_FAMILY_KNUCKLES: return "knuckles";
+    case L4D2VR_OPENXR_CONTROLLER_FAMILY_VIVE: return "vive";
+    default: return "unknown";
+    }
+}
 
 enum class L4D2VROpenXrActionId : uint32_t
 {
@@ -142,6 +235,10 @@ struct L4D2VROpenXrOverlayDesc
     float orientation[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
 };
 
+// reserved1 bits on L4D2VROpenXrPoseDesc. reserved0 is still the packed IPD
+// (0 means "unset" and must not be used for a real 0 mm IPD).
+constexpr uint32_t L4D2VR_OPENXR_POSE_FLAG_MONO = 1u << 0;
+
 struct L4D2VROpenXrPoseDesc
 {
     uint32_t valid = 0;
@@ -206,7 +303,7 @@ struct L4D2VROpenXrInputStateDesc
     uint32_t valid = 0;
     uint32_t featureFlags = 0;
     uint32_t actionCount = L4D2VR_OPENXR_ACTION_COUNT;
-    uint32_t reserved0 = 0;
+    uint32_t reserved0 = 0; // L4D2VR_OPENXR_CONTROLLER_FAMILY_*
     L4D2VROpenXrControllerPoseDesc controllerPoses[L4D2VR_OPENXR_HAND_COUNT] = {};
     L4D2VROpenXrControllerPoseDesc controllerAimPoses[L4D2VR_OPENXR_HAND_COUNT] = {};
     L4D2VROpenXrDigitalActionDesc digitalActions[L4D2VR_OPENXR_ACTION_COUNT] = {};

@@ -2249,8 +2249,14 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             if (!keepNative)
             {
                 const long long t0 = QpcNow();
+                // Always GPU-wait this copy. Both eyes share _rt_FullFrameFB /
+                // the HWND backbuffer; without a flush the right-eye RenderView
+                // overwrites the source before the left StretchRect lands, so
+                // OpenXR/OpenVR submit the same picture twice (Quest 3 / Link
+                // log: same image both eyes). Config StereoBlitGpuFlush cannot
+                // turn this off — DXVK async will miss the hazard.
                 const bool leftBb = m_VR->BlitHmdViewFromBackbuffer(
-                    m_VR->m_D9LeftEyeSurface, bmvr::g_StereoBlitGpuFlush);
+                    m_VR->m_D9LeftEyeSurface, true);
                 if (!leftBb)
                     m_VR->BlitCurrentGameColorTo(
                         m_VR->m_D9LeftEyeSurface, true);

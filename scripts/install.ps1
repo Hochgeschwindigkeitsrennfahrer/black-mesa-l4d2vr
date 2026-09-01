@@ -89,7 +89,7 @@ $HandsDst = Join-Path $VrDst "hands"
 if (Test-Path $HandsSrc) {
   New-Item -ItemType Directory -Force -Path $HandsDst | Out-Null
   Copy-Item -Force (Join-Path $HandsSrc "*.glb") $HandsDst
-  Write-Host "Installed HEV glove GLBs to $HandsDst"
+  Write-Host "Installed hand GLBs to $HandsDst"
 }
 $OffSrc = Join-Path $VrSrc "viewmodel_offsets.txt"
 $OffDst = Join-Path $VrDst "viewmodel_offsets.txt"
@@ -127,6 +127,7 @@ if (-not (Test-Path $CfgDst)) {
   if ($cfgText -notmatch '(?m)^VrHandsUseHevGloves=') { $cfgText += "`r`nVrHandsUseHevGloves=true`r`n" }
   if ($cfgText -notmatch '(?m)^VrHandsDebugBoxes=') { $cfgText += "`r`nVrHandsDebugBoxes=false`r`n" }
   if ($cfgText -notmatch '(?m)^VrHandHud=') { $cfgText += "`r`nVrHandHud=true`r`n" }
+  if ($cfgText -notmatch '(?m)^VrCrosshair=') { $cfgText += "`r`nVrCrosshair=false`r`n" }
   if ($cfgText -notmatch '(?m)^DesktopLeftoverRender=') { $cfgText += "`r`nDesktopLeftoverRender=false`r`n" }
   if ($cfgText -notmatch '(?m)^ForceOpenVis=') { $cfgText += "`r`nForceOpenVis=false`r`n" }
   if ($cfgText -notmatch '(?m)^StereoBlitGpuFlush=') { $cfgText += "`r`nStereoBlitGpuFlush=false`r`n" }

@@ -26,6 +26,8 @@ https://github.com/keyou91/l4d2vr
 
 The VR experience is fully playable, but several features are still a work in progress:
 
+* **Virtual Desktop (Quest):** in Virtual Desktop Streamer on the PC, Options → **OpenXR Runtime** must be **VDXR**. SteamVR in that dropdown renders the game upside-down in the headset. VDXR is the supported setting.
+* **SteamVR OpenXR runtime:** in SteamVR, Settings → OpenXR → set **SteamVR as OpenXR runtime**. If Meta Link / Oculus stays the Windows ActiveRuntime while SteamVR is also running, you get a waiting room plus a second compositor. One runtime, then SteamVR, then the game.
 * Crowbar swinging can be unreliable.
 * Performance can be poor in open and complex scenes.
 * Controls are still a work in progress. Bindings can be configured through the SteamVR controller settings.

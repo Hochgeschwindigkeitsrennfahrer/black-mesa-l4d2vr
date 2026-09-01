@@ -1577,6 +1577,28 @@ namespace
         return aim;
     }
 
+    uint32_t DetectOpenVrControllerFamily(
+        vr::IVRSystem* system,
+        vr::TrackedDeviceIndex_t left,
+        vr::TrackedDeviceIndex_t right)
+    {
+        if (!system)
+            return L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
+        char buf[128]{};
+        const vr::TrackedDeviceIndex_t indices[2] = { right, left };
+        for (vr::TrackedDeviceIndex_t idx : indices)
+        {
+            if (idx == vr::k_unTrackedDeviceIndexInvalid || idx >= vr::k_unMaxTrackedDeviceCount)
+                continue;
+            buf[0] = '\0';
+            system->GetStringTrackedDeviceProperty(idx, vr::Prop_ControllerType_String, buf, sizeof(buf));
+            const uint32_t family = L4D2VR_ClassifyOpenVrControllerType(buf);
+            if (family != L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN)
+                return family;
+        }
+        return L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
+    }
+
     bool FillOpenXrOverlayTextureFromShared(
         L4D2VROpenXrOverlayDesc& overlay,
         const SharedTextureHolder& texture)
@@ -2416,7 +2438,8 @@ void VR::ProcessInput()
     RefreshActiveWeaponModel();
     if (!paused && !m_WeaponMenuOpen)
         UpdateCrowbarMelee();
-    m_HasHevSuit = !bmvr::g_HideHandsWithoutSuit || m_Game->LocalPlayerHasSuit();
+    m_WearingHevSuit = m_Game->LocalPlayerHasSuit();
+    m_HasHevSuit = !bmvr::g_HideHandsWithoutSuit || m_WearingHevSuit;
     const bool scopedWeapon = IsScopedWeaponModel(m_LastViewmodelModel.c_str());
     const bool rpgWeapon = IsRpgWeaponModel(m_LastViewmodelModel.c_str());
     const bool secondaryHeld = !paused && PressedDigitalAction(m_ActionSecondaryAttack);
@@ -3460,8 +3483,8 @@ void VR::UpdateCrowbarMelee()
         std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
         crowbar = m_LastViewmodelModel.find("crowbar") != std::string::npos
             || m_LastViewmodelModel.find("wrench") != std::string::npos;
-        curAng = m_RightControllerAngAbs;
-        curPos = m_RightControllerPosAbs;
+        curAng = m_PhysicalRightTrackingValid ? m_PhysicalRightAngAbs : m_RightControllerAngAbs;
+        curPos = m_PhysicalRightTrackingValid ? m_PhysicalRightPosAbs : m_RightControllerPosAbs;
         speedMs = m_RightControllerSpeedMs;
     }
     if (!crowbar)
@@ -3555,24 +3578,38 @@ void VR::UpdateCrowbarMelee()
         m_MeleeHitEntity = nullptr;
         m_MeleeNextSwingMs = now + kSwingCooldownMs;
         m_MeleeAttackUntilMs = now + kAttackPulseMs;
-        // Trace from the hand along the strike through space, not from the
-        // raised viewmodel pivot along the controller's pointing axis (that
-        // aimed at the ceiling, except on a back-flick that happened to point
-        // at the target).
-        m_MeleeTraceOrigin = hand + motion * 18.f;
-        QAngle::VectorAngles(motion, m_MeleeBladeAngles);
+        // Grip origin, not motion*N (that lifted upward slashes). Direction is
+        // the swing, preferring the more downward of swing vs where the bar
+        // points, so a smash can hit the floor. Upward pitch is capped so the
+        // hull cannot climb back to the ceiling.
+        Vector blade{};
+        QAngle::AngleVectors(curAng, &blade, nullptr, nullptr);
+        if (VectorNormalize(blade) <= 0.01f)
+            blade = motion;
+        Vector dir = motion;
+        if (VectorNormalize(dir) <= 0.01f)
+            dir = blade;
+        if (blade.z < dir.z)
+            dir.z = blade.z;
+        if (dir.z > 0.18f)
+            dir.z = 0.18f;
+        if (VectorNormalize(dir) <= 0.01f)
+            dir = Vector(1.f, 0.f, 0.f);
+        m_MeleeTraceOrigin = hand;
+        QAngle::VectorAngles(dir, m_MeleeBladeAngles);
         if (m_MeleeBladeAngles.x > 180.f) m_MeleeBladeAngles.x -= 360.f;
         if (m_MeleeBladeAngles.x < -180.f) m_MeleeBladeAngles.x += 360.f;
+        // Source: +pitch looks down. Allow a full smash; keep a little up.
+        if (m_MeleeBladeAngles.x < -12.f) m_MeleeBladeAngles.x = -12.f;
         if (m_MeleeBladeAngles.x > 89.f) m_MeleeBladeAngles.x = 89.f;
-        if (m_MeleeBladeAngles.x < -89.f) m_MeleeBladeAngles.x = -89.f;
         m_MeleeBladeAngles.z = 0.f;
         m_MeleeBladeAnglesValid = true;
         static int s_meleeLog;
         if (s_meleeLog < 12)
         {
-            Game::logMsg("Crowbar strike IN_ATTACK speed=%.2f origin=(%.1f,%.1f,%.1f) dir=(%.2f,%.2f,%.2f)",
+            Game::logMsg("Crowbar strike IN_ATTACK speed=%.2f origin=(%.1f,%.1f,%.1f) pitch=%.1f dir=(%.2f,%.2f,%.2f)",
                 speedMs, m_MeleeTraceOrigin.x, m_MeleeTraceOrigin.y, m_MeleeTraceOrigin.z,
-                motion.x, motion.y, motion.z);
+                m_MeleeBladeAngles.x, dir.x, dir.y, dir.z);
             ++s_meleeLog;
         }
 
@@ -3583,9 +3620,13 @@ void VR::UpdateCrowbarMelee()
                 player = m_Game->GetClientEntity(m_Game->m_EngineClient->GetLocalPlayer());
             CTraceFilterSkipSelf filter(player, 0);
             const float range = 56.f;
-            const Vector hullMins(-16.f, -16.f, -16.f);
-            const Vector hullMaxs(16.f, 16.f, 16.f);
-            const Vector end = m_MeleeTraceOrigin + motion * range;
+            Vector strike{};
+            QAngle::AngleVectors(m_MeleeBladeAngles, &strike, nullptr, nullptr);
+            if (VectorNormalize(strike) <= 0.01f)
+                strike = dir;
+            const Vector hullMins(-16.f, -16.f, -28.f);
+            const Vector hullMaxs(16.f, 16.f, 12.f);
+            const Vector end = m_MeleeTraceOrigin + strike * range;
             Ray_t ray;
             ray.Init(m_MeleeTraceOrigin, end, hullMins, hullMaxs);
             CGameTrace tr{};
@@ -3621,9 +3662,7 @@ bool VR::TryGetMeleeTraceOrigin(Vector& origin) const
 
 bool VR::TryGetMeleeAim(Vector& origin, QAngle& angles) const
 {
-    // Latched at the strike edge: hand position along the swing through space.
-    // Do not re-read the viewmodel pose — crowbar oz lifts that pivot ~12 hu
-    // "up" off the blade, which is the "hits above the swing" report.
+    // Grip height. Pitch follows the swing (down to the floor, only a little up).
     if (!m_PerformingMelee || !m_MeleeBladeAnglesValid)
         return false;
     origin = m_MeleeTraceOrigin;
@@ -3759,16 +3798,11 @@ void VR::UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose)
         Vector right{};
         Vector up{};
     };
-    auto sampleIndex = [&](vr::TrackedDeviceIndex_t idx, Sample& out) {
+    uint32_t family = L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
+    float tilt = bmvr::g_ControllerPitchTilt;
+    auto sampleTrackedPose = [&](const vr::TrackedDevicePose_t& pose, vr::TrackedDeviceIndex_t idx, Sample& out) {
         out.valid = false;
         out.idx = vr::k_unTrackedDeviceIndexInvalid;
-        if (idx == vr::k_unTrackedDeviceIndexInvalid || idx >= vr::k_unMaxTrackedDeviceCount)
-            return;
-        vr::TrackedDevicePose_t pose{};
-        {
-            std::lock_guard<std::mutex> lock(m_PoseMutex);
-            pose = m_WaitedPoses[idx];
-        }
         if (!pose.bPoseIsValid || !pose.bDeviceIsConnected)
             return;
         Vector pos = HmdMatrixToSourcePos(pose.mDeviceToAbsoluteTracking, m_VRScale);
@@ -3778,7 +3812,6 @@ void VR::UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose)
         ang.y = WrapYaw(ang.y + m_RotationOffsetY.load(std::memory_order_acquire));
         Vector fwd, right, up;
         QAngle::AngleVectors(ang, &fwd, &right, &up);
-        const float tilt = bmvr::g_ControllerPitchTilt;
         if (tilt != 0.f)
         {
             fwd = VectorRotate(fwd, right, tilt);
@@ -3796,19 +3829,72 @@ void VR::UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose)
         out.right = right;
         out.up = up;
     };
+    auto sampleIndex = [&](vr::TrackedDeviceIndex_t idx, Sample& out) {
+        out.valid = false;
+        out.idx = vr::k_unTrackedDeviceIndexInvalid;
+        if (idx == vr::k_unTrackedDeviceIndexInvalid || idx >= vr::k_unMaxTrackedDeviceCount)
+            return;
+        vr::TrackedDevicePose_t pose{};
+        {
+            std::lock_guard<std::mutex> lock(m_PoseMutex);
+            pose = m_WaitedPoses[idx];
+        }
+        sampleTrackedPose(pose, idx, out);
+    };
+    auto sampleOpenXrDesc = [&](const L4D2VROpenXrControllerPoseDesc& desc, vr::TrackedDeviceIndex_t idx, Sample& out) {
+        out.valid = false;
+        out.idx = vr::k_unTrackedDeviceIndexInvalid;
+        if (!(desc.valid && desc.active))
+            return;
+        sampleTrackedPose(
+            OpenXrPoseToTracked(desc.position, desc.orientation, true),
+            idx,
+            out);
+    };
     auto sampleRole = [&](vr::ETrackedControllerRole role, Sample& out) {
         sampleIndex(m_System->GetTrackedDeviceIndexForControllerRole(role), out);
     };
 
     Sample physLeft{};
     Sample physRight{};
+    Sample weaponLeft{};
+    Sample weaponRight{};
     if (m_OpenXrHelperBridgeActive)
     {
-        sampleIndex(1, physLeft);
-        sampleIndex(2, physRight);
+        family = m_OpenXrLastInputState.reserved0;
+        tilt = bmvr::EffectiveControllerPitchTilt(family);
+        Sample gripLeft{};
+        Sample gripRight{};
+        Sample aimLeft{};
+        Sample aimRight{};
+        sampleOpenXrDesc(
+            m_OpenXrLastInputState.controllerPoses[L4D2VR_OPENXR_HAND_LEFT], 1, gripLeft);
+        sampleOpenXrDesc(
+            m_OpenXrLastInputState.controllerPoses[L4D2VR_OPENXR_HAND_RIGHT], 2, gripRight);
+        sampleOpenXrDesc(
+            m_OpenXrLastInputState.controllerAimPoses[L4D2VR_OPENXR_HAND_LEFT], 1, aimLeft);
+        sampleOpenXrDesc(
+            m_OpenXrLastInputState.controllerAimPoses[L4D2VR_OPENXR_HAND_RIGHT], 2, aimRight);
+        physLeft = gripLeft.valid ? gripLeft : aimLeft;
+        physRight = gripRight.valid ? gripRight : aimRight;
+        weaponLeft = physLeft;
+        weaponRight = physRight;
+        if (L4D2VR_ControllerFamilyPrefersAimPose(family))
+        {
+            if (aimLeft.valid)
+                weaponLeft = aimLeft;
+            if (aimRight.valid)
+                weaponRight = aimRight;
+        }
     }
     else
     {
+        const vr::TrackedDeviceIndex_t leftIdx =
+            m_System->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
+        const vr::TrackedDeviceIndex_t rightIdx =
+            m_System->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_RightHand);
+        family = DetectOpenVrControllerFamily(m_System, leftIdx, rightIdx);
+        tilt = bmvr::EffectiveControllerPitchTilt(family);
         sampleRole(vr::TrackedControllerRole_LeftHand, physLeft);
         sampleRole(vr::TrackedControllerRole_RightHand, physRight);
         if (!physLeft.valid || !physRight.valid)
@@ -3832,8 +3918,24 @@ void VR::UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose)
                     break;
             }
         }
+        if (family == L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN)
+        {
+            family = DetectOpenVrControllerFamily(m_System, physLeft.idx, physRight.idx);
+            const float retitled = bmvr::EffectiveControllerPitchTilt(family);
+            if (retitled != tilt)
+            {
+                tilt = retitled;
+                if (physLeft.valid)
+                    sampleIndex(physLeft.idx, physLeft);
+                if (physRight.valid)
+                    sampleIndex(physRight.idx, physRight);
+            }
+        }
+        weaponLeft = physLeft;
+        weaponRight = physRight;
     }
-    const Sample& aim = (AimControllerRole() == vr::TrackedControllerRole_LeftHand) ? physLeft : physRight;
+    m_ControllerFamily = family;
+    const Sample& aim = (AimControllerRole() == vr::TrackedControllerRole_LeftHand) ? weaponLeft : weaponRight;
     if (!aim.valid)
         return;
 
@@ -3888,11 +3990,12 @@ void VR::UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose)
     static int s_ctrlLog;
     if (s_ctrlLog < 4)
     {
-        Game::logMsg("Controller tracking aim=(%.1f,%.1f,%.1f) left=%d right=%d tilt=%.1f",
+        Game::logMsg("Controller tracking aim=(%.1f,%.1f,%.1f) left=%d right=%d tilt=%.1f family=%s",
             m_RightControllerPosAbs.x, m_RightControllerPosAbs.y, m_RightControllerPosAbs.z,
             m_LeftControllerTrackingValid ? 1 : 0,
             m_PhysicalRightTrackingValid ? 1 : 0,
-            bmvr::g_ControllerPitchTilt);
+            tilt,
+            L4D2VR_ControllerFamilyName(family));
         ++s_ctrlLog;
     }
 }
@@ -4164,7 +4267,7 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
         device->Clear(0, nullptr, D3DCLEAR_ZBUFFER, 0, 1.f, 0);
 
     bool drewGloves = false;
-    if (bmvr::g_VrHandsGlovesEnabled && m_HasHevSuit)
+    if (bmvr::g_VrHandsGlovesEnabled && (m_HasHevSuit || g_VrGloves.HasBareHands()))
     {
         const Vector viewAngles = GetViewAngle();
         drewGloves = g_VrGloves.DrawForEye(
@@ -4188,7 +4291,7 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
     }
 
     const bool drawBoxes = bmvr::g_VrHandsDebugBoxes && m_HasHevSuit;
-    if (bmvr::g_VrHandsGlovesEnabled && m_HasHevSuit && !drewGloves)
+    if (bmvr::g_VrHandsGlovesEnabled && (m_HasHevSuit || g_VrGloves.HasBareHands()) && !drewGloves)
     {
         static int s_gloveFallbackLog;
         if (s_gloveFallbackLog < 3)
@@ -6414,9 +6517,9 @@ bool VR::BlitHmdViewFromBackbuffer(IDirect3DSurface9* dst, bool flushGpu)
     if (s_bbBlitLog < 8 || FAILED(hr))
     {
         Game::logMsg(
-            "HMD BB blit %u,%u %ux%u of BB %ux%u -> eye %ux%u hr=0x%08X (crop=%d squash=%d upscale=%d)",
+            "HMD BB blit %u,%u %ux%u of BB %ux%u -> eye %ux%u hr=0x%08X (crop=%d squash=%d upscale=%d flush=%d)",
             x0, y0, cropW, cropH, bbW, bbH, m_RenderWidth, m_RenderHeight, (unsigned)hr,
-            (srcPtr != nullptr) ? 1 : 0, squashFull ? 1 : 0, upscale ? 1 : 0);
+            (srcPtr != nullptr) ? 1 : 0, squashFull ? 1 : 0, upscale ? 1 : 0, flushGpu ? 1 : 0);
         if (upscale && squashFull)
             Game::logMsg("G-buffer did not grow; upscaling window %ux%u into offscreen eyes %ux%u",
                 bbW, bbH, m_RenderWidth, m_RenderHeight);
@@ -6716,8 +6819,8 @@ void VR::FlushStereoBlitGpu()
     // submit the same image and near field cannot fuse. Event-query flush is
     // not WaitDeviceIdle (that crash-skipped during load).
     // One GetData(FLUSH) waits for the whole left eye. 64 FLUSH polls serialized
-    // complex scenes (~2x GPU time). Off by default (g_StereoBlitGpuFlush);
-    // DXVK StretchRect hazards should keep the BB copy coherent.
+    // complex scenes (~2x GPU time). The HMD-fb blit path always flushes once
+    // after the left copy; DXVK async will otherwise submit the same BB twice.
     if (!g_D3DVR9)
         return;
     IDirect3DDevice9* device = nullptr;
@@ -7116,10 +7219,40 @@ void VR::SubmitVRTextures()
         }
         m_OpenXrLastPublishMs = nowMs;
         LogOpenXrPublishRate();
+        const bool paused = m_Game && SehIsPaused(m_Game->m_EngineClient);
+        const bool stereoLayer = m_DirectEyeSubmit && !paused;
+        // OpenVR copies PrePresent capture into both eyes here. The helper
+        // only reads the private eye RTs, so menu / pass-through frames were
+        // submitted empty (Link desktop in one layer, black stereo in another).
+        if (!stereoLayer && m_D9FrameColorSurface && m_D9LeftEyeSurface)
+        {
+            IDirect3DDevice9* copyDev = nullptr;
+            if (SUCCEEDED(g_D3DVR9->GetD3DDevice(&copyDev)) && copyDev)
+            {
+                copyDev->StretchRect(m_D9FrameColorSurface, nullptr, m_D9LeftEyeSurface, nullptr, D3DTEXF_LINEAR);
+                if (m_D9RightEyeSurface)
+                    copyDev->StretchRect(m_D9FrameColorSurface, nullptr, m_D9RightEyeSurface, nullptr, D3DTEXF_LINEAR);
+                copyDev->Release();
+                static int s_monoCopyLog;
+                if (s_monoCopyLog < 3)
+                {
+                    Game::logMsg("OpenXR mono capture copied to both eyes paused=%d direct=%d",
+                        paused ? 1 : 0, m_DirectEyeSubmit ? 1 : 0);
+                    ++s_monoCopyLog;
+                }
+            }
+        }
         if (!PrepareOpenXrEyeSurfacesForRead())
             return;
-        if (m_OpenXrStereoRenderPoseValid)
+        if (stereoLayer && m_OpenXrStereoRenderPoseValid)
             L4D2VR_PublishOpenXrGameRenderPose(m_OpenXrStereoRenderPose);
+        else if (m_OpenXrLastHmdPose.valid)
+        {
+            L4D2VROpenXrPoseDesc monoPose = m_OpenXrLastHmdPose;
+            monoPose.reserved0 = 0;
+            monoPose.reserved1 |= L4D2VR_OPENXR_POSE_FLAG_MONO;
+            L4D2VR_PublishOpenXrGameRenderPose(monoPose);
+        }
         const uint32_t frameId = m_OpenXrSubmitFrameId.fetch_add(1, std::memory_order_acq_rel);
         PublishOpenXrResolvedEyeTextures(frameId);
         ++m_OpenXrPublishes;
@@ -7141,8 +7274,8 @@ void VR::SubmitVRTextures()
             if (!m_LoggedFirstSubmit)
             {
                 m_LoggedFirstSubmit = true;
-                Game::logMsg("[VR][OpenXRHelper] published shared eye frame %u gameRenderPose=%d",
-                    frameId, m_OpenXrStereoRenderPoseValid ? 1 : 0);
+                Game::logMsg("[VR][OpenXRHelper] published shared eye frame %u gameRenderPose=%d stereoLayer=%d",
+                    frameId, m_OpenXrStereoRenderPoseValid ? 1 : 0, stereoLayer ? 1 : 0);
             }
         }
         return;

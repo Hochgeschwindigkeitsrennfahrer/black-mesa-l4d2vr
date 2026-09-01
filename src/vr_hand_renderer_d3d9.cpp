@@ -640,10 +640,12 @@ bool VrHandRendererD3D9::Draw(
     const bool overlayNoDepth = drawPass == VrHandDrawPass::OverlayNoDepth;
     const bool viewmodelDepthPass = compositePass || standaloneViewmodelPass;
     const bool standaloneGeneratedBox =
-        handIndex == 2 &&
         asset.sourcePath.rfind("generated:magazine_box:", 0) == 0;
-    const bool opaqueStandaloneMagazine = handIndex == 2 && !standaloneGeneratedBox;
-    const bool opaqueStandaloneDebugBox = handIndex == 2 && standaloneGeneratedBox;
+    const bool magazineAsset =
+        standaloneGeneratedBox
+        || asset.sourcePath.find("magazine") != std::string::npos;
+    const bool opaqueStandaloneMagazine = magazineAsset && !standaloneGeneratedBox;
+    const bool opaqueStandaloneDebugBox = standaloneGeneratedBox;
     const bool opaqueStandaloneMesh = opaqueStandaloneMagazine || opaqueStandaloneDebugBox;
 
     // VR gloves use a lightweight directional-light approximation. Reusing that

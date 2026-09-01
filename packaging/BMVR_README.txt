@@ -51,9 +51,21 @@ If the in-game video / renderer menu is "Direct3D 9", also add:
 This DLL is DXVK. Native D3D9 will not show VR.
 
 
-3) Launch
----------
-1. Start SteamVR.
+3) OpenXR runtime (Quest / Virtual Desktop / SteamVR)
+-----------------------------------------------------
+Pick ONE compositor. Mixing them inverts the world or leaves SteamVR in
+the waiting room.
+
+Virtual Desktop (Quest 2/3):
+  Virtual Desktop Streamer → Options → OpenXR Runtime = VDXR
+  SteamVR in that dropdown is a known issue: the game renders upside-down.
+
+SteamVR / Meta Link:
+  SteamVR → Settings → OpenXR → Set SteamVR as OpenXR runtime
+  Do not leave Oculus/Meta as the Windows ActiveRuntime while SteamVR runs.
+
+Then:
+1. Start SteamVR (Link) or Virtual Desktop with VDXR as above.
 2. Launch Black Mesa from Steam (not a leftover desktop shortcut that skips SteamVR).
 3. Confirm Black Mesa\bmvr_log.txt appears this session and starts with:
      BMVR d3d9.dll loaded
@@ -117,6 +129,13 @@ If the gun sits too far forward/back, edit VR\config.txt:
   ViewmodelPosOffsetY=3.0
   ViewmodelPosOffsetZ=-2.0
   ControllerPitchTilt=-35.0
+  ControllerPitchTiltTouch=0
+  OpenXRHelperFlipSubmitY=auto
+
+Quest / Touch: the G2 -35° grip tilt is not applied. Weapons use the OpenXR
+aim pose; gloves stay on grip. Virtual Desktop users must set Streamer
+Options → OpenXR Runtime to VDXR (SteamVR in that dropdown inverts the
+world). Meta Link users must set SteamVR as the OpenXR runtime.
 
 Those take effect on the next launch (config is read at DLL load).
 
@@ -127,9 +146,10 @@ Also in VR\config.txt (defaults):
   OpenXRHelper=true
   OpenXRHelperSubmitTestFrames=0
   ForceOpenVis=false      keep PVS/occlusion (true = old whole-map vis)
-  StereoBlitGpuFlush=false  do not CPU-wait GPU between stereo eyes
+  StereoBlitGpuFlush=true   CPU-wait GPU after the left-eye backbuffer copy
   IPDScale=1.0            HeightOffset=0.0
   Haptics=true            HideCrosshair=true
+  VrCrosshair=false       world-space aim reticle (set true to show it)
   MatchHmdHz=false        (unused for fps; fps_max is 0 / uncapped)
   DisableViewBob=true
   LeftHanded=false        RecenterResetsYaw=true
