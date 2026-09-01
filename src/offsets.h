@@ -107,6 +107,26 @@ public:
     static constexpr int kIClientRenderable_LookupAttachment = 0x90;
     static constexpr int kIClientRenderable_GetAttachmentVec = 0x98;
 
+    // client.dll CTauBeam first-person Fire02 particle path (FUN_10234330).
+    // thiscall, 5 stack args, ret 0x14. Arg1 is six floats: start xyz + end xyz.
+    // Unique bytes: 55 8B EC 83 EC 60 80 7D 14 00 8B 55 08 56 57 8B
+    static constexpr int kCTauBeam_ViewMuzzle = 0x234330;
+
+    // client.dll CTauBeam world beam from explicit start/end (FUN_102346A0).
+    // thiscall, 3 stack args (Vector* start, Vector* end, float), ret 0xC.
+    // Unique bytes: 55 8B EC 83 EC 78 8B 45 08 0F 57 C9 56 57 8B 7D
+    static constexpr int kCTauBeam_WorldBeam = 0x2346A0;
+
+    // client.dll C_Weapon_RPG laser update (FUN_10291F80). Builds a screen-space
+    // reticle from ScreenWidth/Height, which in VR is the HMD centre. thiscall,
+    // 0 stack args. Unique bytes: 55 8B EC 83 EC 44 A1 60 1D 57 10 33 C5 89 45
+    // FC 8B C1 56 89 45 D0
+    static constexpr int kCWeaponRpg_UpdateLaser = 0x291F80;
+    // RecvTable DT_Weapon_RPG: EHANDLE at +0xAE0 (ctor writes -1), m_bLaserOn
+    // RecvProp push 0xAE5 next to the "m_bLaserOn" string at FUN_10291DB0.
+    static constexpr int kCWeaponRpg_hLaserDot = 0xAE0;
+    static constexpr int kCWeaponRpg_bLaserOn = 0xAE5;
+
     // IClientMode slot 32. Reads viewmodel_fov_override then weapon GetViewModelFOV
     // (~54). That is why console fov does not change gun/near scale in VR.
     Offset GetViewModelFOV{ "client.dll", 0x216510,
@@ -142,6 +162,14 @@ public:
         "55 8B EC 83 EC 24 8B 45 08 89 45 DC 8B 45 0C 89 45 EC" };
     Offset PopRenderTargetAndViewport{ "materialsystem.dll", 0x6A250,
         "56 8B F1 83 7E 4C 00 74 15 8B 06 6A 00 FF 50 10 FF 4E 4C" };
+    // Hardware CMatRenderContext vtable: DrawScreenSpaceRectangle is two
+    // slots before the 6-arg PushRT (0x6A3D0). Wrapper ret 0x38. Fire/glass/
+    // AMS overlays pass dest 2560x1440 onto the 3168 G-buffer (bm_c1a1d).
+    Offset DrawScreenSpaceRectangle{ "materialsystem.dll", 0x67DC0,
+        "55 8B EC 8B 4D 08 8B 01 FF 90 7C 01 00 00 D9 EE" };
+    // CopyRenderTargetToTextureEx — UpdateRefractTexture / POT FB blit.
+    Offset CopyRenderTargetToTextureEx{ "materialsystem.dll", 0x67440,
+        "55 8B EC 53 8B 5D 14 56 8B 75 08 57 8B 7D 10 85 F6" };
 
     // Ghidra on Steam client.dll CBlackMesaViewRender_RenderView (0x20EE40):
     // IMaterialSystem +0x19C = GetRenderContext (AddRef'd). Context then:

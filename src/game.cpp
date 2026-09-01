@@ -9,6 +9,7 @@
 #include <unordered_map>
 #include <initializer_list>
 #include <cstdarg>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -446,6 +447,10 @@ namespace
     int g_nvAmmoBase = -1;
     int g_nvPrimaryAmmoType = -1;
     int g_nvSecondaryAmmoType = -1;
+    int g_nvWearingSuit = -1;
+    int g_nvZooming = -1;
+    int g_nvRpgLaserOn = -1;
+    int g_nvRpgLaserDot = -1;
     bool g_nvScanned = false;
 
     const char* FindStringInImage(const unsigned char* base, size_t size, const char* s)
@@ -461,8 +466,11 @@ namespace
     }
 
     // RecvProp offset at +4 from a pointer to the property-name string.
+    // requireAligned rejects offsets that are not dword-aligned, which filters
+    // out garbage for int fields. Single-byte props (bools) are usually not
+    // aligned, so those callers must pass false.
     int FindRecvPropOffsetPlus4(const unsigned char* base, size_t size, const char* propName,
-        int minOff, int maxOff)
+        int minOff, int maxOff, bool requireAligned = true, bool preferLargest = false)
     {
         const char* s = FindStringInImage(base, size, propName);
         if (!s)
@@ -483,14 +491,17 @@ namespace
             ++hits;
             int val = 0;
             memcpy(&val, base + i + 4, sizeof(val));
-            if (val < minOff || val > maxOff || (val & 3) != 0)
+            if (val < minOff || val > maxOff)
+                continue;
+            if (requireAligned && (val & 3) != 0)
                 continue;
             ++plus4Hits;
-            if (best < 0 || val < best)
+            if (best < 0 || (preferLargest ? val > best : val < best))
                 best = val;
         }
-        Game::logMsg("WristHUD RecvProp '%s': hits=%d plus4=%d offset=%d (range %d..%d)",
-            propName, hits, plus4Hits, best, minOff, maxOff);
+        Game::logMsg("WristHUD RecvProp '%s': hits=%d plus4=%d offset=%d (range %d..%d%s)",
+            propName, hits, plus4Hits, best, minOff, maxOff,
+            preferLargest ? ", largest" : "");
         return best;
     }
 
@@ -569,9 +580,133 @@ void Game::ScanWristHudNetVars()
         g_nvPrimaryAmmoType = 0xA5C;
     if (g_nvSecondaryAmmoType < 0)
         g_nvSecondaryAmmoType = 0xA60;
+    // m_bWearingSuit is not a player-relative prop. It lives inside DT_Local,
+    // so its RecvProp offset is measured from CPlayerLocalData and has to be
+    // added to m_Local's own offset. It is also a single byte, so it is not
+    // dword-aligned and the aligned scan would throw it away. Nothing is
+    // hardcoded: a wrong offset here would hide the gloves for a whole
+    // playthrough, so an unresolved scan means "assume suited".
+    const int localData = FindRecvPropOffsetPlus4(base, imgSize, "m_Local", 0x400, 0x2000);
+    const int suitInLocal = FindRecvPropOffsetPlus4(
+        base, imgSize, "m_bWearingSuit", 0x10, 0x400, false);
+    if (localData > 0 && suitInLocal > 0)
+        g_nvWearingSuit = localData + suitInLocal;
+    // Client m_bZooming sits next to m_bFlashlightEnabled in
+    // DT_BlackMesaLocalPlayerExclusive, directly on the player, not in m_Local.
+    // The client RecvProp is near flashlight (+0x17E8). client.dll also contains
+    // the server SendProp leftover at +0x1374; taking the smallest hit in a wide
+    // range landed on that leftover, so zoom never read as 1 and scoped aim
+    // stayed on the controller.
+    const int flashlight = FindRecvPropOffsetPlus4(
+        base, imgSize, "m_bFlashlightEnabled", 0x1700, 0x1A00, false, true);
+    g_nvZooming = FindRecvPropOffsetPlus4(
+        base, imgSize, "m_bZooming", 0x1700, 0x1A00, false, true);
+    if (g_nvZooming < 0 && flashlight > 0)
+        g_nvZooming = flashlight - 1;
+    g_nvRpgLaserOn = FindRecvPropOffsetPlus4(
+        base, imgSize, "m_bLaserOn", 0x800, 0xC00, false);
+    g_nvRpgLaserDot = FindRecvPropOffsetPlus4(
+        base, imgSize, "m_hLaserDot", 0x800, 0xC00);
     Game::logMsg("Wrist HUD netvars health=%d armor=%d clip1=%d clip2=%d ammo=%d primType=%d secType=%d",
         g_nvHealth, g_nvArmor, g_nvClip1, g_nvClip2, g_nvAmmoBase, g_nvPrimaryAmmoType,
         g_nvSecondaryAmmoType);
+    Game::logMsg("VR netvars m_Local=%d m_bWearingSuit(+local)=%d suit=%d zooming=%d flashlight=%d rpgLaserOn=%d rpgLaserDot=%d",
+        localData, suitInLocal, g_nvWearingSuit, g_nvZooming, flashlight,
+        g_nvRpgLaserOn, g_nvRpgLaserDot);
+}
+
+// Reads a networked bool. Returns -1 when the offset is unresolved, has been
+// retired for reading something that was never a bool, or cannot be read.
+int Game::ReadPlayerFlagByte(int& offset)
+{
+    if (offset < 0 || !m_EngineClient || !m_ClientEntityList)
+        return -1;
+    const int local = m_EngineClient->GetLocalPlayer();
+    if (local <= 0)
+        return -1;
+    void* player = m_ClientEntityList->GetClientEntity(local);
+    if (!player)
+        return -1;
+    unsigned char value = 0;
+    __try
+    {
+        value = *reinterpret_cast<volatile unsigned char*>(
+            static_cast<unsigned char*>(player) + offset);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        offset = -1;
+        return -1;
+    }
+    // A scan that landed on something other than a bool is worse than no scan
+    // at all, so retire the offset permanently the first time it disagrees.
+    if (value > 1)
+    {
+        Game::logMsg("VR netvar at +0x%X read %u, not a bool — offset retired", offset, value);
+        offset = -1;
+        return -1;
+    }
+    return value;
+}
+
+bool Game::LocalPlayerHasSuit()
+{
+    ScanWristHudNetVars();
+    const int wearing = ReadPlayerFlagByte(g_nvWearingSuit);
+    if (wearing < 0)
+        return true;
+    static int s_suitLog;
+    static int s_lastWearing = -1;
+    if (wearing != s_lastWearing && s_suitLog < 8)
+    {
+        Game::logMsg("HEV suit %s (m_bWearingSuit at +0x%X)",
+            wearing ? "on" : "off", g_nvWearingSuit);
+        s_lastWearing = wearing;
+        ++s_suitLog;
+    }
+    return wearing != 0;
+}
+
+bool Game::LocalPlayerZooming()
+{
+    ScanWristHudNetVars();
+    return ReadPlayerFlagByte(g_nvZooming) == 1;
+}
+
+int Game::RpgLaserOnOffset() const
+{
+    return g_nvRpgLaserOn > 0 ? g_nvRpgLaserOn : Offsets::kCWeaponRpg_bLaserOn;
+}
+
+int Game::RpgLaserDotOffset() const
+{
+    return g_nvRpgLaserDot > 0 ? g_nvRpgLaserDot : Offsets::kCWeaponRpg_hLaserDot;
+}
+
+C_BaseEntity* Game::FindEntityByNetworkNameContains(const char* token)
+{
+    if (!token || !token[0] || !m_ClientEntityList)
+        return nullptr;
+    char needle[64]{};
+    size_t n = 0;
+    for (; n + 1 < sizeof(needle) && token[n]; ++n)
+        needle[n] = static_cast<char>(tolower(static_cast<unsigned char>(token[n])));
+    needle[n] = 0;
+    const int hi = m_ClientEntityList->GetHighestEntityIndex();
+    for (int e = 1; e <= hi; ++e)
+    {
+        const char* name = GetEntityNetworkName(e);
+        if (!name || !name[0])
+            continue;
+        char lower[80]{};
+        size_t i = 0;
+        for (; i + 1 < sizeof(lower) && name[i]; ++i)
+            lower[i] = static_cast<char>(tolower(static_cast<unsigned char>(name[i])));
+        lower[i] = 0;
+        if (std::strstr(lower, needle))
+            return static_cast<C_BaseEntity*>(m_ClientEntityList->GetClientEntity(e));
+    }
+    return nullptr;
 }
 
 int Game::ReadWeaponClip(C_BaseEntity* weapon)

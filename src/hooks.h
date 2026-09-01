@@ -5,6 +5,14 @@
 class Game;
 class VR;
 class ITexture;
+class IMaterial;
+struct SourceRect_t
+{
+    int x;
+    int y;
+    int width;
+    int height;
+};
 class CViewSetup;
 class CUserCmd;
 class QAngle;
@@ -57,6 +65,12 @@ typedef void(__thiscall* tGetViewport)(void* thisptr, int& x, int& y, int& width
 typedef void(__thiscall* tDrawModelExecute)(void* thisptr, void* state, const ModelRenderInfo_t& info, void* pCustomBoneToWorld);
 typedef void(__thiscall* tPushRenderTargetAndViewport)(void* thisptr, ITexture* pTexture, ITexture* pDepthTexture, int nViewX, int nViewY, int nViewW, int nViewH);
 typedef void(__thiscall* tPopRenderTargetAndViewport)(void* thisptr);
+typedef void(__thiscall* tDrawScreenSpaceRectangle)(void* thisptr, IMaterial* material,
+    int destX, int destY, int width, int height,
+    float srcX0, float srcY0, float srcX1, float srcY1,
+    int srcWidth, int srcHeight, void* clientRenderable, int xDice, int yDice);
+typedef void(__thiscall* tCopyRenderTargetToTextureEx)(void* thisptr, ITexture* texture,
+    int renderTargetId, SourceRect_t* srcRect, SourceRect_t* dstRect);
 typedef void(__thiscall* tVgui_Paint)(void* thisptr, int mode);
 typedef void(__thiscall* tGetBackBufferDimensions)(void* thisptr, int& width, int& height);
 typedef void(__thiscall* tGetScreenSize)(void* thisptr, int& width, int& height);
@@ -70,6 +84,9 @@ typedef Vector*(__thiscall* tWeaponShootPosition)(void* thisptr, Vector* out);
 typedef void(__thiscall* tGetShootAngles)(void* thisptr, QAngle* out);
 typedef int(__thiscall* tGetAttachmentVec)(void* thisptr, int number, Vector* origin, QAngle* angles);
 typedef int(__thiscall* tGetAttachmentMatrix)(void* thisptr, int number, float* matrix);
+typedef void(__thiscall* tTauBeamView)(void* thisptr, Vector* startEnd, void* a2, float a3, int a4, int a5);
+typedef void(__thiscall* tTauBeamWorld)(void* thisptr, Vector* start, Vector* end, float width);
+typedef void(__thiscall* tRpgUpdateLaser)(void* thisptr);
 
 class Hooks
 {
@@ -89,6 +106,8 @@ public:
     static inline Hook<tDrawModelExecute> hkDrawModelExecute;
     static inline Hook<tPushRenderTargetAndViewport> hkPushRenderTargetAndViewport;
     static inline Hook<tPopRenderTargetAndViewport> hkPopRenderTargetAndViewport;
+    static inline Hook<tDrawScreenSpaceRectangle> hkDrawScreenSpaceRectangle;
+    static inline Hook<tCopyRenderTargetToTextureEx> hkCopyRenderTargetToTextureEx;
     static inline Hook<tVgui_Paint> hkVgui_Paint;
     static inline Hook<tGetBackBufferDimensions> hkGetBackBufferDimensions;
     static inline Hook<tGetScreenSize> hkGetScreenSize;
@@ -101,8 +120,12 @@ public:
     static inline Hook<tWeaponShootPosition> hkClientWeaponShootPosition;
     static inline Hook<tWeaponShootPosition> hkServerWeaponShootPosition;
     static inline Hook<tGetShootAngles> hkGetShootAngles;
+    static inline Hook<tGetShootAngles> hkClientGetShootAngles;
     static inline Hook<tGetAttachmentVec> hkGetAttachmentVec;
     static inline Hook<tGetAttachmentMatrix> hkGetAttachmentMatrix;
+    static inline Hook<tTauBeamView> hkTauBeamView;
+    static inline Hook<tTauBeamWorld> hkTauBeamWorld;
+    static inline Hook<tRpgUpdateLaser> hkRpgUpdateLaser;
 
     Hooks() = default;
     explicit Hooks(Game* game);
@@ -122,6 +145,12 @@ public:
     static void __fastcall dDrawModelExecute(void* ecx, void* edx, void* state, const ModelRenderInfo_t& info, void* pCustomBoneToWorld);
     static void __fastcall dPushRenderTargetAndViewport(void* ecx, void* edx, ITexture* pTexture, ITexture* pDepthTexture, int nViewX, int nViewY, int nViewW, int nViewH);
     static void __fastcall dPopRenderTargetAndViewport(void* ecx, void* edx);
+    static void __fastcall dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial* material,
+        int destX, int destY, int width, int height,
+        float srcX0, float srcY0, float srcX1, float srcY1,
+        int srcWidth, int srcHeight, void* clientRenderable, int xDice, int yDice);
+    static void __fastcall dCopyRenderTargetToTextureEx(void* ecx, void* edx, ITexture* texture,
+        int renderTargetId, SourceRect_t* srcRect, SourceRect_t* dstRect);
     static void __fastcall dVGui_Paint(void* ecx, void* edx, int mode);
     static void __fastcall dGetBackBufferDimensions(void* ecx, void* edx, int& width, int& height);
     static void __fastcall dGetScreenSize(void* ecx, void* edx, int& width, int& height);
@@ -134,10 +163,15 @@ public:
     static Vector* __fastcall dClientWeaponShootPosition(void* ecx, void* edx, Vector* out);
     static Vector* __fastcall dServerWeaponShootPosition(void* ecx, void* edx, Vector* out);
     static void __fastcall dGetShootAngles(void* ecx, void* edx, QAngle* out);
+    static void __fastcall dClientGetShootAngles(void* ecx, void* edx, QAngle* out);
     static int __fastcall dGetAttachmentVec(void* ecx, void* edx, int number, Vector* origin, QAngle* angles);
     static int __fastcall dGetAttachmentMatrix(void* ecx, void* edx, int number, float* matrix);
+    static void __fastcall dTauBeamView(void* ecx, void* edx, Vector* startEnd, void* a2, float a3, int a4, int a5);
+    static void __fastcall dTauBeamWorld(void* ecx, void* edx, Vector* start, Vector* end, float width);
+    static void __fastcall dRpgUpdateLaser(void* ecx, void* edx);
     static void EnsureServerFlashlightHook();
     static void EnsureClientFlashlightHook();
     static void EnsureWeaponShootOriginHooks();
+    static void EnsureWeaponVfxHooks();
     static void RestoreViewmodelArmHides();
 };

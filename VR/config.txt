@@ -10,6 +10,18 @@
 # 1.0 = full SteamVR recommended (can be taller than the HWND).
 # 0.5–0.75 if GPU bound. Above 1.0 is extra supersampling on top of SteamVR SS.
 #
+# false (default working path): world still draws at the desktop window
+# (2560x1440) and is stretched into the SteamVR-sized eyes. Raising SS does
+# not add world pixels.
+# true: grow FullFrame + G-buffer to the eye size so SteamVR SS is real
+# source resolution. Revert: set false and restart. A crash disables it
+# for the next launch only.
+# FullFrame grows on this map load (not the next one). Log should say
+# worldMatch=1 / grow LITERAL, not "upscaling window" and not
+# "G-buffer must not outgrow FullFrame" after spawn. Flashlight + no
+# ghost world means G-buffer and FullFrame actually match.
+WorldRenderAtEyeSize=true
+#
 # Dragging SteamVR's resolution / SS slider recreates the eye textures after a
 # short settle (no game restart). World G-buffers still need a map load to grow.
 # VRRenderScale=1.25
@@ -114,7 +126,8 @@ VrHandsPoseRotationOffset=0,180,0
 # Negative Y lowers both hands in view (separate from weapon oz). Negative
 # Z is along aim (controller basis Z is -forward). -0.10 m is ~60% of a
 # scaled HEV glove along the controller so the mesh sits on the tracked pose.
-VrHandsPoseOffsetMeters=0,-0.035,-0.10
+# Y -0.008 sits the glove on the controller (was -0.035, hanging below).
+VrHandsPoseOffsetMeters=0,-0.008,-0.10
 VrHandsUseHevGloves=true
 VrHandsDebugBoxes=false
 VrHandHud=true

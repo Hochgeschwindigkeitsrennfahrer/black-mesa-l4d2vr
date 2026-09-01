@@ -4568,6 +4568,15 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     ((m_FloatDigitalInitialized[i] && m_FloatDigitalDown[i] != down) ||
                         state.changedSinceLastSync) ? 1u : 0u;
                 outState.digitalActions[i].lastChangeTime = static_cast<int64_t>(state.lastChangeTime);
+                // Also expose the undigitised value. Only Walk and Turn are
+                // declared analog, so these slots were unused, and the game
+                // needs the continuous trigger/grip pull to animate fingers:
+                // OpenXR has no equivalent of SteamVR's skeletal summary.
+                outState.analogActions[i].active = 1;
+                outState.analogActions[i].changed = state.changedSinceLastSync ? 1u : 0u;
+                outState.analogActions[i].lastChangeTime = static_cast<int64_t>(state.lastChangeTime);
+                outState.analogActions[i].x = value;
+                outState.analogActions[i].y = 0.0f;
                 m_FloatDigitalActive[i] = true;
                 m_FloatDigitalValues[i] = value;
                 m_FloatDigitalDown[i] = down;

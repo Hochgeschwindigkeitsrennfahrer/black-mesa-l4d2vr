@@ -70,12 +70,13 @@ Then fully quit and restart the game. Eye size is chosen at CreateDevice; changi
 the file while the game is running does nothing.
 
 RenderScale multiplies SteamVR's recommended per-eye size (not the window),
-then aligns to 16 pixels (cap 4096). The headset copies are that size; the
-game still renders at the window (G-buffers stay 2560x1440 on a 1440p
-window) and is scaled into the eyes. Growing the world buffers to SteamVR
-size left a warped strip and garbage in the HMD. Add `hmd_offscreen` to
-bmvr_skip.txt to force window-fit eyes. To get more *source* pixels, raise
-the game's own resolution (window/fullscreen size).
+then aligns to 16 pixels (cap 4096). With WorldRenderAtEyeSize=false the
+headset copies are that size but the game still draws at the window
+(G-buffers stay 2560x1440 on a 1440p window) and is scaled into the eyes.
+
+WorldRenderAtEyeSize=true grows FullFrame + G-buffer to the eye size so
+SteamVR SS is real world pixels. Set it back to false and restart to
+revert. Add `hmd_offscreen` to bmvr_skip.txt to force window-fit eyes.
 
   RenderScale=1.0     SteamVR recommended (typical Index/G2 is taller than 1080p)
   RenderScale=0.75    cheaper if GPU bound

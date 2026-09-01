@@ -33,9 +33,11 @@ namespace
 
     Vector MenuPlayerBody(const VR* vr)
     {
-        Vector body = vr->m_HasStereoBodyOrigin ? vr->m_StereoBodyOrigin : vr->m_SetupOrigin;
-        if (body.LengthSqr() <= 1.f)
-            body = vr->m_SetupOrigin;
+        // Engine pawn origin, not the HMD-adjusted stereo copy. Parenting the
+        // wheel to m_StereoBodyOrigin made it translate with every head move.
+        Vector body = vr->m_SetupOrigin;
+        if (body.LengthSqr() <= 1.f && vr->m_HasStereoBodyOrigin)
+            body = vr->m_StereoBodyOrigin;
         return body;
     }
 
@@ -247,21 +249,37 @@ namespace
         return false;
     }
 
+    // Screen position of each layout cell, in hex radii, with +y up (see
+    // HexToOffset / HexScreenCenter):
+    //
+    //   inner ring   {0,-1} lower-left   {1,-1} lower-right  {1,0} right
+    //                {0,1}  upper-right  {-1,1} upper-left   {-1,0} left
+    //   outer ring   {0,-2} lower-far-left   {2,-1} lower-far-right
+    //                {1,1}  upper-far-right  {-1,2} top
+    //                {-2,1} upper-far-left
+    //
+    // Crowbar and pistol take the two bottom inner cells: those are the ones
+    // the hand falls onto when the wheel opens centred, and they are the two
+    // weapons reached most often. MP5 and shotgun sit adjacent on the right so
+    // swapping between the primaries is one short move. Heavies go outer ring.
     void HexSlotForKind(WeaponKind kind, int& q, int& r)
     {
         switch (kind)
         {
-        case KindGlock: q = 0; r = -1; break;
-        case KindRevolver: q = 0; r = -2; break;
-        case KindMp5: q = 1; r = -1; break;
+        case KindCrowbar: q = 0; r = -1; break;
+        case KindGlock: q = 1; r = -1; break;
+        case KindMp5: q = 1; r = 0; break;
+        case KindShotgun: q = 0; r = 1; break;
+        case KindRevolver: q = -1; r = 1; break;
+        case KindCrossbow: q = -1; r = 0; break;
         case KindGauss: q = 1; r = 1; break;
-        case KindShotgun: q = 1; r = 0; break;
-        case KindCrossbow: q = 2; r = -1; break;
-        case KindCrowbar: q = 0; r = 1; break;
-        case KindRpg: q = -1; r = 1; break;
-        case KindGluon: q = -1; r = 0; break;
-        case KindHivehand: q = -2; r = 1; break;
-        case KindGrenade: q = -1; r = 2; break;
+        case KindRpg: q = -1; r = 2; break;
+        case KindGluon: q = -2; r = 1; break;
+        case KindGrenade: q = 2; r = -1; break;
+        case KindHivehand: q = 0; r = -2; break;
+        case KindSatchel: q = 2; r = 0; break;
+        case KindTripmine: q = -2; r = 0; break;
+        case KindSnark: q = 0; r = 2; break;
         default: q = 99; r = 99; break;
         }
     }
@@ -1129,7 +1147,8 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
     {
         m_WeaponMenuClickStartMs = now;
         m_WeaponMenuOpenedThisHold = false;
-        m_WeaponMenuHover = -1;
+        m_WeaponMenuHover = 0;
+        m_WeaponMenuLeftCenter = false;
     }
 
     if (stickClickHeld)
@@ -1140,6 +1159,8 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             m_WeaponMenuOpen = true;
             m_WeaponMenuOpenedThisHold = true;
             m_WeaponMenuLatched = false;
+            m_WeaponMenuLeftCenter = false;
+            m_WeaponMenuHover = 0;
             PulseHandHaptic(vr::TrackedControllerRole_RightHand, 900, 0.35f);
             Game::logMsg("Weapon menu opened (right stick hold)");
         }
@@ -1155,17 +1176,36 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
                 Vector fwd, right, up;
                 GetViewBasis(&fwd, &right, &up);
                 Vector hand{};
+                Vector aim{};
                 {
                     std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
                     hand = ControllerTrackingToWorld(body, m_PhysicalRightPosAbs);
+                    QAngle::AngleVectors(m_PhysicalRightAngAbs, &aim, nullptr, nullptr);
                 }
+                // Anchor the wheel on the controller's own aim ray rather than
+                // in front of the face. The hover test casts that same ray at
+                // this plane, so putting the origin on it means the wheel opens
+                // with the centre cell under the cursor every time, whatever
+                // way the hand happens to be pointing.
+                if (VectorNormalize(aim) <= 0.01f)
+                    aim = fwd;
                 m_WeaponMenuLatchBody = body;
-                m_WeaponMenuLatchDelta = hand + fwd * kMenuHandForwardHu + up * kMenuHandUpHu - body;
+                m_WeaponMenuLatchWorld = hand + aim * kMenuHandForwardHu;
+                m_WeaponMenuLatchDelta = m_WeaponMenuLatchWorld - body;
                 m_WeaponMenuLatchFwd = fwd;
                 m_WeaponMenuLatchRight = right;
                 m_WeaponMenuLatchUp = up;
                 m_WeaponMenuLatchYaw = m_RotationOffsetY.load(std::memory_order_acquire);
                 m_WeaponMenuLatched = true;
+
+                // Billboard basis is latched with the rest of the pose. Solving
+                // it per frame against the live eye spun the whole wheel under
+                // the cursor as the head moved, which fought the hand.
+                BillboardFacingEye(m_WeaponMenuLatchWorld, GetViewOrigin(body), up, right,
+                    m_WeaponMenuFwd, m_WeaponMenuRight, m_WeaponMenuUp);
+                m_WeaponMenuLatchBillboardFwd = m_WeaponMenuFwd;
+                m_WeaponMenuLatchBillboardRight = m_WeaponMenuRight;
+                m_WeaponMenuLatchBillboardUp = m_WeaponMenuUp;
             }
 
             const float yawDelta = m_RotationOffsetY.load(std::memory_order_acquire)
@@ -1173,10 +1213,13 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             Vector delta = m_WeaponMenuLatchDelta;
             YawAroundZ(delta, yawDelta);
             m_WeaponMenuOrigin = body + delta;
-            Vector hmdF, hmdR, hmdU;
-            GetViewBasis(&hmdF, &hmdR, &hmdU);
-            BillboardFacingEye(m_WeaponMenuOrigin, GetViewOrigin(body), hmdU, hmdR,
-                m_WeaponMenuFwd, m_WeaponMenuRight, m_WeaponMenuUp);
+            // Only snap turning re-orients the wheel; head movement does not.
+            m_WeaponMenuFwd = m_WeaponMenuLatchBillboardFwd;
+            m_WeaponMenuRight = m_WeaponMenuLatchBillboardRight;
+            m_WeaponMenuUp = m_WeaponMenuLatchBillboardUp;
+            YawAroundZ(m_WeaponMenuFwd, yawDelta);
+            YawAroundZ(m_WeaponMenuRight, yawDelta);
+            YawAroundZ(m_WeaponMenuUp, yawDelta);
         }
 
         Game::InventoryWeapon inv[kMaxMenuSlots]{};
@@ -1224,44 +1267,54 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             ++placed;
         };
 
+        static const int kOverflow[][2] = {
+            {2, 0}, {-2, 0}, {0, 2}, {1, -2}, {-1, -1},
+            {2, -2}, {-2, 2}, {2, 1}, {-2, -1}
+        };
+        auto placeOverflow = [&](int& q, int& r) -> bool {
+            for (const auto& c : kLayoutCells)
+            {
+                if (occupy(c[0], c[1]))
+                {
+                    q = c[0];
+                    r = c[1];
+                    return true;
+                }
+            }
+            for (const auto& c : kOverflow)
+            {
+                if (occupy(c[0], c[1]))
+                {
+                    q = c[0];
+                    r = c[1];
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        // Reserved cells first so late-game extras cannot steal crowbar/pistol.
+        bool seated[kMaxMenuSlots]{};
         for (int i = 0; i < n; ++i)
         {
             const WeaponKind kind = KindFromNames(inv[i].modelName, inv[i].networkName);
             int q = 0, r = 0;
             HexSlotForKind(kind, q, r);
-            if (!IsLayoutCell(q, r) || !occupy(q, r))
-            {
-                bool found = false;
-                for (const auto& c : kLayoutCells)
-                {
-                    if (occupy(c[0], c[1]))
-                    {
-                        q = c[0];
-                        r = c[1];
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found)
-                {
-                    static const int kOverflow[][2] = {
-                        {2, 0}, {-2, 0}, {0, 2}, {1, -2}, {-1, -1},
-                        {2, -2}, {-2, 2}, {2, 1}, {-2, -1}
-                    };
-                    for (const auto& c : kOverflow)
-                    {
-                        if (occupy(c[0], c[1]))
-                        {
-                            q = c[0];
-                            r = c[1];
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                if (!found)
-                    continue;
-            }
+            if (q >= 90)
+                continue;
+            if (!occupy(q, r))
+                continue;
+            placeAt(q, r, inv[i], kind);
+            seated[i] = true;
+        }
+        for (int i = 0; i < n; ++i)
+        {
+            if (seated[i])
+                continue;
+            const WeaponKind kind = KindFromNames(inv[i].modelName, inv[i].networkName);
+            int q = 0, r = 0;
+            if (!placeOverflow(q, r))
+                continue;
             placeAt(q, r, inv[i], kind);
         }
         m_WeaponMenuCount = placed;
@@ -1270,14 +1323,11 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
         Vector rayDir{};
         {
             std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
-            Vector body = m_HasStereoBodyOrigin ? m_StereoBodyOrigin : m_SetupOrigin;
-            if (body.LengthSqr() <= 1.f)
-                body = m_SetupOrigin;
+            Vector body = MenuPlayerBody(this);
             rayOrig = ControllerTrackingToWorld(body, m_PhysicalRightPosAbs);
             QAngle::AngleVectors(m_PhysicalRightAngAbs, &rayDir, nullptr, nullptr);
         }
         const int prevHover = m_WeaponMenuHover;
-        m_WeaponMenuHover = -1;
         const UINT hw = m_RenderWidth > 64 ? m_RenderWidth : 1584u;
         const UINT hh = m_RenderHeight > 64 ? m_RenderHeight : 1440u;
         const float aspect = static_cast<float>(hw) / static_cast<float>(hh);
@@ -1329,6 +1379,8 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
                 }
             }
         }
+        if (m_WeaponMenuHover != 0)
+            m_WeaponMenuLeftCenter = true;
         if (m_WeaponMenuHover >= 0 && m_WeaponMenuHover != prevHover)
             QueueWeaponMenuSound(kWeaponSoundHover);
     }
@@ -1337,6 +1389,10 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
     {
         if (m_WeaponMenuOpenedThisHold)
         {
+            // Centre is the default selection (empty hands). Releasing there
+            // holsters; the player has to aim at another cell to pick a gun.
+            if (m_WeaponMenuHover < 0 || m_WeaponMenuHover >= m_WeaponMenuCount)
+                m_WeaponMenuHover = 0;
             if (m_WeaponMenuHover >= 0 && m_WeaponMenuHover < m_WeaponMenuCount)
             {
                 const WeaponMenuSlot& slot = m_WeaponMenuSlots[m_WeaponMenuHover];
@@ -1371,6 +1427,7 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
         m_WeaponMenuClickHeld = false;
         m_WeaponMenuOpenedThisHold = false;
         m_WeaponMenuLatched = false;
+        m_WeaponMenuLeftCenter = false;
         m_WeaponMenuHover = -1;
     }
 }
@@ -1405,36 +1462,13 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
     device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
 
-    Vector rayOrig{};
-    Vector rayDir{};
-    {
-        std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
-        Vector body = m_HasStereoBodyOrigin ? m_StereoBodyOrigin : m_SetupOrigin;
-        if (body.LengthSqr() <= 1.f)
-            body = m_SetupOrigin;
-        rayOrig = ControllerTrackingToWorld(body, m_PhysicalRightPosAbs);
-        QAngle::AngleVectors(m_PhysicalRightAngAbs, &rayDir, nullptr, nullptr);
-    }
-    float lx0 = 0.f, ly0 = 0.f, lx1 = 0.f, ly1 = 0.f;
-    const bool haveLaser0 = project(rayOrig, lx0, ly0);
+    // No pointer beam: the wheel opens centred on the hand's own ray, so the
+    // hovered cell's highlight plus the hover click already say where the hand
+    // is. Drawing a ray from the controller across the wheel only cluttered it.
     float ocx = 0.f, ocy = 0.f;
     const bool haveOrigin = project(m_WeaponMenuOrigin, ocx, ocy);
     const float drawR = HexDrawRadiusPx(h);
     const float packR = drawR * kHexPackScale;
-    bool haveLaser1 = false;
-    if (m_WeaponMenuHover >= 0 && m_WeaponMenuHover < m_WeaponMenuCount && haveOrigin)
-    {
-        const WeaponMenuSlot& hs = m_WeaponMenuSlots[m_WeaponMenuHover];
-        HexScreenCenter(ocx, ocy, hs.axialQ, hs.axialR, packR, lx1, ly1);
-        haveLaser1 = true;
-    }
-    else
-    {
-        Vector laserEnd = rayOrig + rayDir * 40.f;
-        haveLaser1 = project(laserEnd, lx1, ly1);
-    }
-    if (haveLaser0 && haveLaser1)
-        MenuLine(device, lx0, ly0, lx1, ly1, 3.2f, D3DCOLOR_XRGB(255, 220, 80));
 
     if (!haveOrigin)
     {

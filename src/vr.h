@@ -480,6 +480,10 @@ public:
     Vector GetRightControllerAbsPos(const Vector& eyePosition) const;
     QAngle GetRightControllerAbsAngle() const;
     QAngle GetAimAngles() const;
+    // Last aim written to cmd->viewangles. GetShootAngles must use this, not
+    // the player's EyeAngles (those stay on the HMD for the camera).
+    void RememberFireAim(const QAngle& aim);
+    bool TryGetFireAim(QAngle& out) const;
     Vector GetRecommendedViewmodelAbsPos(const Vector& eyePosition) const;
     QAngle GetRecommendedViewmodelAbsAngle() const;
     float HorizontalFovForAspect(float targetAspect) const;
@@ -523,6 +527,11 @@ public:
     bool ComputeHudInset(int fbW, int fbH, int& x, int& y, int& w, int& h) const;
     bool StereoRedirectedToEye() const { return m_StereoRedirectedToEye; }
     IDirect3DSurface9* StereoEyeBlitDest() const { return m_StereoEyeBlitDest; }
+    // True when D3D RT0 is an eye-sized world/eye surface. Lighting apply
+    // Viewport(2560) often happens while a flashlight RT is still the
+    // material-system stack top — IMat must still advertise HMD size.
+    bool D3dRt0IsEyeSized() const;
+    bool CachedRt0MatchesEyes() const;
     void NoteStereoRedirectedToEye() { m_StereoRedirectedToEye = true; }
     // First gameplay RenderViews stay single-threaded. SetThreadMode(2) on
     // the first in-game Present (2026-08-18) ran during spawn Reset to
@@ -554,6 +563,21 @@ public:
     void NoteHudPainted() { m_HudPaintedThisFrame.store(true, std::memory_order_release); }
     bool HudPaintedThisFrame() const { return m_HudPaintedThisFrame.load(std::memory_order_acquire); }
     void UpdateCrowbarMelee();
+    // Traces the firing ray on the game thread and caches where it lands, so
+    // the per-eye overlay only has to project a point. Engine traces are not
+    // safe from the render thread.
+    void UpdateAimCrosshair();
+    // Cleared by UpdateAimCrosshair when the reticle is off or the ray missed.
+    bool AimCrosshairVisible() const { return m_AimCrosshairValid; }
+    // Gordon has no gloves before the HEV suit (intro tram). Sampled on the
+    // game thread; defaults true so a failed netvar scan cannot hide the hands.
+    bool HasHevSuit() const { return m_HasHevSuit; }
+    // True only while a scoped weapon is actually zoomed. Aim then comes from
+    // the headset, because the scope picture is centred on the view.
+    bool ScopeZoomActive() const { return m_ScopeZoomActive; }
+    static bool IsScopedWeaponModel(const char* model);
+    static bool IsRpgWeaponModel(const char* model);
+    bool RpgLaserLatched() const { return m_RpgLaserLatched; }
     bool WeaponMenuOpen() const { return m_WeaponMenuOpen; }
     bool WeaponMenuClickHeld() const { return m_WeaponMenuClickHeld; }
     bool WeaponMenuStickHeld() const;
@@ -565,6 +589,8 @@ public:
     void AfterCreateMoveFireHaptics();
     bool TryGetVrMuzzleWorld(Vector& origin) const;
     bool TryGetVrShootOrigin(Vector& origin) const;
+    // Visual beam/laser segment: muzzle start, aim-ray impact end.
+    bool TryGetVrBeamSegment(Vector& start, Vector& end) const;
     bool ScaleViewmodelRenderableAttachment(void* renderable, Vector& origin) const;
     void FlushPendingWeaponSounds();
     void QueueWeaponMenuSound(uint32_t bit, int kind = 0, int entityIndex = 0);
@@ -574,6 +600,9 @@ public:
     bool IsPerformingMelee() const { return m_PerformingMelee; }
     bool TryGetMeleeBladeViewAngles(QAngle& out) const;
     bool TryGetMeleeTraceOrigin(Vector& origin) const;
+    // Grip position and axis of the crowbar model while a VR swing is live, so
+    // the engine's melee trace runs along the blade the player can see.
+    bool TryGetMeleeAim(Vector& origin, QAngle& angles) const;
     // True while VR should keep fire/reload/equip sequences running.
     bool WantsWeaponActionAnim() const;
     void GetRightGlovePalmOffsetMeters(Vector& meters) const;
@@ -682,6 +711,15 @@ private:
     Vector m_MeleeTraceOrigin{};
     QAngle m_MeleeBladeAngles{};
     bool m_MeleeBladeAnglesValid = false;
+    Vector m_AimCrosshairWorld{};
+    bool m_AimCrosshairValid = false;
+    bool m_HasHevSuit = true;
+    bool m_ScopeZoomActive = false;
+    bool m_CrossbowZoomLatched = false;
+    bool m_RpgLaserLatched = false;
+    QAngle m_LastFireAim{};
+    bool m_HasLastFireAim = false;
+    void DrawAimCrosshair(IDirect3DDevice9* device, float sx, float sy, UINT h) const;
     DWORD m_WeaponActionAnimUntilMs = 0;
     int m_LatchedViewmodelIdleSeq = -1;
     bool m_CrouchToggled = false;
@@ -703,11 +741,19 @@ private:
     Vector m_WeaponMenuRight{};
     Vector m_WeaponMenuUp{};
     Vector m_WeaponMenuLatchBody{};
+    Vector m_WeaponMenuLatchWorld{};
     Vector m_WeaponMenuLatchDelta{};
     Vector m_WeaponMenuLatchFwd{};
     Vector m_WeaponMenuLatchRight{};
     Vector m_WeaponMenuLatchUp{};
+    Vector m_WeaponMenuLatchBillboardFwd{};
+    Vector m_WeaponMenuLatchBillboardRight{};
+    Vector m_WeaponMenuLatchBillboardUp{};
     float m_WeaponMenuLatchYaw = 0.f;
+    // The wheel opens with the centre cell hovered, so a hold-and-release that
+    // never moved must cancel instead of holstering. Set once the cursor leaves
+    // the centre.
+    bool m_WeaponMenuLeftCenter = false;
     struct WeaponMenuSlot
     {
         int entityIndex = 0;

@@ -32,9 +32,18 @@ namespace bmvr
     bool TryMatQueue();
     bool TrySteamVrEyeRt();
     bool TryOffscreenHmd();
-    // LITERAL FullFrame/G-buffer at SteamVR rec. Verified miss 2026-08-26:
-    // worldMatch+redirect still drew HWND 2560x1440 into 2544x2480 (warp).
+    // LITERAL FullFrame/G-buffer at SteamVR rec. The 2026-08-26 miss
+    // (worldMatch+redirect drew HWND 2560x1440 into 2544x2480) is explained:
+    // FullFrame never grew, so worldMatch stayed 0 and the viewport/view-lock
+    // fixes never engaged. Retried behind WorldRenderAtEyeSize in config.txt.
     bool TryOffscreenWorldGrow();
+    // Grow gate for `_rt_FullFrameFB*`. Must not wait for LevelInit: FullFrame
+    // is created during map load before the client hook (bmvr_log 2026-09-01).
+    // Background/menu maps still skip. G-buffers use ComputeGrownWorldGbuffer.
+    bool WorldRtGrowActive();
+    // Peeked from GetLevelNameShort during CreateNamedRT / LevelInit.
+    // background* blocks FullFrame grow so menu maps stay on the HWND path.
+    void NoteEngineMapName(const char* map);
     // gbmatch keeps CViewSetup at HWND/G-buffer size unless FullFrame and
     // G-buffers actually allocated at offscreen eye size (native HMD pixels).
     bool UseGbMatchViewLock();
@@ -60,9 +69,17 @@ namespace bmvr
     // GMod/L4D2VR: OpenVR recommended * RenderScale, 16-aligned, cap 4096.
     // Independent of HWND. False if offscreen path is skipped or rec is unknown.
     bool ComputeOffscreenEyeSize(uint32_t& width, uint32_t& height);
-    // Gameplay G-buffers to ComputeOffscreenEyeSize. Always false after
-    // hmd_world persist-skip (viewport stays HWND).
+    // `_rt_FullFrameFB*` target size. False unless WorldRtGrowActive.
     bool ComputeGrownWorldFramebuffer(uint32_t& width, uint32_t& height);
+    // `_rt_gb*` target size. Additionally requires FullFrame to already be at
+    // eye size, so the two never disagree (that mismatch is the hmd_world warp).
+    bool ComputeGrownWorldGbuffer(uint32_t& width, uint32_t& height);
+    // Size to pass to SetRenderTargetFrameBufferSizeOverrides. Eye size only
+    // after FullFrame already allocated at that size. Otherwise false so the
+    // caller pins HWND — advertising 3168 here before FullFrame grew is what
+    // created 3168 G-buffers behind a 2560 FullFrame (flashlight + ghost world,
+    // 2026-09-01).
+    bool ComputeWorldRtOverrideSize(uint32_t& width, uint32_t& height);
     bool HaveHmdFramebufferSize(uint32_t& width, uint32_t& height);
     bool QueryWindowClientSize(uint32_t& width, uint32_t& height);
     bool ApplyHmdAspectBackbuffer(uint32_t& width, uint32_t& height);
@@ -121,6 +138,17 @@ namespace bmvr
     extern bool g_VrHandsDebugBoxes;
     // Wrist HUD (HL2VR-style): health+suit on the left wrist, ammo on the right.
     extern bool g_HandHud;
+    // World-space aim reticle drawn where the controller's firing ray lands,
+    // styled to match the wrist HUD. Optional: VrCrosshair=false in config.txt.
+    extern bool g_VrCrosshair;
+    // Reticle size multiplier, for players who want it smaller or bolder.
+    extern float g_VrCrosshairScale;
+    // Hide gloves and wrist HUD until the HEV suit is picked up. Depends on a
+    // scanned m_bWearingSuit offset; set false if the scan ever misfires.
+    extern bool g_HideHandsWithoutSuit;
+    // While scoped (crossbow), aim from the headset instead of the controller so
+    // bolts land in the middle of the scope picture.
+    extern bool g_ScopeUsesHmdAim;
     // SteamVR glove local Rx,Ry,Rz (degrees) inside BuildControllerWorld.
     // Default yaw 180: OpenVR glove +Z is opposite Source controller forward,
     // which made the mesh point backward and clip the near plane (mostly invisible).

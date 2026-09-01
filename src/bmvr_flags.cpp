@@ -1,5 +1,6 @@
 #include "bmvr_flags.h"
 
+#include <cctype>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -47,6 +48,10 @@ namespace bmvr
     float g_VrHandsModelScale = 0.85f;
     bool g_VrHandsDebugBoxes = false;
     bool g_HandHud = true;
+    bool g_VrCrosshair = true;
+    float g_VrCrosshairScale = 1.f;
+    bool g_HideHandsWithoutSuit = true;
+    bool g_ScopeUsesHmdAim = true;
     float g_VrHandsPoseRotX = 0.f;
     float g_VrHandsPoseRotY = 180.f;
     float g_VrHandsPoseRotZ = 0.f;
@@ -55,7 +60,9 @@ namespace bmvr
     // wrong way on a given headset.
     // Hands lower in view (controller local +Y = up). Separate from weapon.
     float g_VrHandsPoseOffX = 0.f;
-    float g_VrHandsPoseOffY = -0.035f;
+    // Raised from hanging under the controller. +Y is up. Config and
+    // install.ps1 must match this or they overwrite it on every install.
+    float g_VrHandsPoseOffY = -0.008f;
     float g_VrHandsPoseOffZ = -0.10f;
     float g_VrHandsLeftPoseOffX = 0.f;
     float g_VrHandsLeftPoseOffY = 0.f;
@@ -114,7 +121,21 @@ namespace bmvr
     // filled only the top HWND slice of the eyes (2026-08-26, user miss).
     static bool g_TryOffscreenHmd = true;
     static bool g_TryOffscreenWorldGrow = false;
+    // WorldRenderAtEyeSize=true in VR/config.txt opts back into the world-RT
+    // grow. Set it back to false to return to the window-sized world + eye
+    // upscale that is currently verified. The opt-in also overrides the
+    // policy hmd_world skip; a crash still disables it for one launch.
+    static bool g_WorldEyeSizeOptIn = false;
     static bool g_GameplayWorldRts = false;
+    // `_rt_FullFrameFB*` is created at map-load *before* client LevelInit.
+    // Waiting for that hook (2026-09-01) left FullFrame at 2560x1440 while
+    // SetRenderTargetFrameBufferSizeOverrides(eye) made `_rt_gb*` 3168x3104.
+    // That mismatch is flashlight-dead + ghost world. FullFrame now grows at
+    // CreateNamedRT on the same load; the override stays HWND until FullFrame
+    // actually matches the eyes. background* still blocks grow.
+    static bool g_WorldRtGrowArmed = false;
+    static bool g_EngineMapIsBackground = false;
+    static char g_NotedEngineMap[96] = {};
     static bool g_TryHudOverlay = true;
     static bool g_TryVguiPaint = true;
     static bool g_TryGameUiActivate = true;
@@ -330,6 +351,14 @@ namespace bmvr
                 g_VrHandsDebugBoxes = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrHandHud") == 0)
                 g_HandHud = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrCrosshair") == 0)
+                g_VrCrosshair = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrCrosshairScale") == 0)
+                g_VrCrosshairScale = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "VrHideHandsWithoutSuit") == 0)
+                g_HideHandsWithoutSuit = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "VrScopeUsesHmdAim") == 0)
+                g_ScopeUsesHmdAim = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrHandsPoseRotationOffset") == 0)
             {
                 float x = 0.f, y = 180.f, z = 0.f;
@@ -412,12 +441,18 @@ namespace bmvr
             }
             else if (std::strcmp(n, "ViewmodelDisableMoveBob") == 0)
                 g_DisableViewBob = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "WorldRenderAtEyeSize") == 0)
+            {
+                g_WorldEyeSizeOptIn = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+                g_TryOffscreenWorldGrow = g_WorldEyeSizeOptIn;
+            }
         }
         fclose(f);
-        Log("VR config %ls RenderScale=%.2f TurnSpeed=%.2f snap=%d vm=(%.1f,%.1f,%.1f) tilt=%.1f ipd=%.2f autoQueue=%d aa=%u",
+        Log("VR config %ls RenderScale=%.2f TurnSpeed=%.2f snap=%d vm=(%.1f,%.1f,%.1f) tilt=%.1f ipd=%.2f autoQueue=%d aa=%u worldEyeSize=%d",
             path.c_str(), g_RenderScale, g_TurnSpeed, g_SnapTurning ? 1 : 0,
             g_ViewmodelPosOffsetX, g_ViewmodelPosOffsetY, g_ViewmodelPosOffsetZ,
-            g_ControllerPitchTilt, g_IPDScale, g_AutoMatQueueMode ? 1 : 0, g_AntiAliasing);
+            g_ControllerPitchTilt, g_IPDScale, g_AutoMatQueueMode ? 1 : 0, g_AntiAliasing,
+            g_WorldEyeSizeOptIn ? 1 : 0);
     }
 
     static void ApplySkipName(const std::string& name, const char* via)
@@ -455,7 +490,16 @@ namespace bmvr
         else if (name == "hmd_offscreen")
             g_TryOffscreenHmd = false;
         else if (name == "hmd_world")
+        {
+            // Older builds always wrote this policy skip. WorldRenderAtEyeSize
+            // is an explicit user retry, so the stale line must not win.
+            if (g_WorldEyeSizeOptIn)
+            {
+                Log("Ignoring hmd_world skip (%s): WorldRenderAtEyeSize=true", via ? via : "skip file");
+                return;
+            }
             g_TryOffscreenWorldGrow = false;
+        }
         else if (name == "hud_overlay")
             g_TryHudOverlay = false;
         else if (name == "vgui_paint")
@@ -805,6 +849,11 @@ namespace bmvr
         ConsumeIfStuck(L"steamvr_rt", g_TrySteamVrEyeRt, "steamvr_rt", "SteamVR recommended eye RT (offscreen)");
         ConsumeIfStuck(L"hmd_offscreen", g_TryOffscreenHmd, "hmd_offscreen",
             "offscreen HMD eyes + gameplay FullFrame/G-buffer grow", false);
+        // persist=false: WorldRenderAtEyeSize is an explicit opt-in, so a death
+        // disables it for one launch instead of skip-filing it forever. Set the
+        // config key back to false to revert permanently.
+        ConsumeIfStuck(L"hmd_world", g_TryOffscreenWorldGrow, "hmd_world",
+            "world FullFrame/G-buffer at HMD eye size (WorldRenderAtEyeSize)", false);
         ConsumeIfStuck(L"hud_overlay", g_TryHudOverlay, "hud_overlay", "L4D2VR SteamVR HUD overlay");
         ConsumeIfStuck(L"vgui_paint", g_TryVguiPaint, "vgui_paint", "VGui_Paint redirect onto bmvrHUD");
         ConsumeIfStuck(L"gameui", g_TryGameUiActivate, "gameui", "gameui_activate from engine thread");
@@ -855,14 +904,23 @@ namespace bmvr
         PersistSkip("stereo_fov", "HMD FOV in 16:9 pixels is magnified and not fused");
         PersistSkip("ff_hmdfit", "unbind A2R10 FullFrame whites HMD; G-buffer 1584 vs PushRT 2560");
         PersistSkip("ff_gbfit", "LITERAL FullFrame+G-buffer 1584 died on background04 before stereo; user miss");
-        PersistSkip("hmd_world", "LITERAL FullFrame+G-buffer at SteamVR rec still PushRT 2560x1440; HMD warp + bottom garbage");
+        // 2026-08-26 miss was recorded before PushRT rewrote the viewport to
+        // eye size (dPushRenderTargetAndViewport / OffscreenWorldMatchesEyes),
+        // which is what left the HMD warped with garbage below the HWND slice.
+        // WorldRenderAtEyeSize=true retries it on that fixed path.
+        if (!g_WorldEyeSizeOptIn)
+            PersistSkip("hmd_world", "LITERAL FullFrame+G-buffer at SteamVR rec still PushRT 2560x1440; HMD warp + bottom garbage");
         // Do not PersistSkip fl_gbmatch — other builds wrote a policy skip
         // that silently disabled the flashlight path. Crash-sticky only.
         // Named HDR wrap + rewriting CSimpleWorldView PushRT(NULL) dies after
         // the third bind even when the named RT is 2560x1440. Do not retry it.
         g_TryNamedStereoWrap = false;
-        Log("hmd_offscreen=%d hmd_world=%d (eyes at SteamVR rec; world RTs stay HWND; gbmatch blit)",
-            g_TryOffscreenHmd ? 1 : 0, g_TryOffscreenWorldGrow ? 1 : 0);
+        Log("hmd_offscreen=%d hmd_world=%d optIn=%d (%s)",
+            g_TryOffscreenHmd ? 1 : 0, g_TryOffscreenWorldGrow ? 1 : 0,
+            g_WorldEyeSizeOptIn ? 1 : 0,
+            g_TryOffscreenWorldGrow
+                ? "world FullFrame/G-buffer grown to eye size"
+                : "eyes at SteamVR rec; world RTs stay HWND; gbmatch blit");
         SetStage("init");
     }
 
@@ -882,7 +940,49 @@ namespace bmvr
     bool TrySteamVrEyeRt() { return g_TrySteamVrEyeRt; }
     bool TryOffscreenHmd() { return g_TryOffscreenHmd; }
     bool TryOffscreenWorldGrow() { return g_TryOffscreenWorldGrow; }
-    void SetGameplayWorldRts(bool gameplayMap) { g_GameplayWorldRts = gameplayMap; }
+    static bool MapNameIsGameplay(const char* map)
+    {
+        if (!map || !map[0])
+            return false;
+        const char* slash = strrchr(map, '/');
+        const char* bslash = strrchr(map, '\\');
+        if (bslash && (!slash || bslash > slash))
+            slash = bslash;
+        const char* base = slash ? slash + 1 : map;
+        std::string name(base);
+        const auto dot = name.rfind('.');
+        if (dot != std::string::npos)
+            name = name.substr(0, dot);
+        for (char& c : name)
+            c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+        if (name == "dedicated" || name.rfind("background", 0) == 0)
+            return false;
+        return true;
+    }
+
+    void NoteEngineMapName(const char* map)
+    {
+        if (!map || !map[0])
+            return;
+        if (g_NotedEngineMap[0] && std::strcmp(g_NotedEngineMap, map) == 0)
+            return;
+        std::strncpy(g_NotedEngineMap, map, sizeof(g_NotedEngineMap) - 1);
+        g_NotedEngineMap[sizeof(g_NotedEngineMap) - 1] = 0;
+        const bool gameplay = MapNameIsGameplay(map);
+        g_EngineMapIsBackground = !gameplay;
+        Log("World RT map=%s gameplay=%d backgroundBlock=%d",
+            map, gameplay ? 1 : 0, g_EngineMapIsBackground ? 1 : 0);
+    }
+
+    void SetGameplayWorldRts(bool gameplayMap)
+    {
+        g_GameplayWorldRts = gameplayMap;
+        if (gameplayMap && g_TryOffscreenWorldGrow && !g_WorldRtGrowArmed)
+        {
+            g_WorldRtGrowArmed = true;
+            Log("World RT gameplay map (FullFrame grow is CreateNamedRT, not next-load)");
+        }
+    }
     bool TryHudOverlay() { return g_TryHudOverlay; }
     bool TryVguiPaint() { return g_TryVguiPaint; }
     bool TryGameUiActivate() { return g_TryGameUiActivate; }
@@ -1132,12 +1232,65 @@ namespace bmvr
         return w >= 640 && h >= 360;
     }
 
+    bool WorldRtGrowActive()
+    {
+        // Do not wait for LevelInit. Save-continue creates FullFrame while
+        // GetLevelNameShort is still empty (bmvr_log 2026-09-01). Empty is
+        // allowed; background* is not.
+        return g_TryOffscreenWorldGrow && g_TryOffscreenHmd
+            && !g_EngineMapIsBackground;
+    }
+
     bool ComputeGrownWorldFramebuffer(uint32_t& width, uint32_t& height)
     {
-        // Persist-skipped hmd_world: engine PushRT stays HWND-sized.
-        if (!g_TryOffscreenWorldGrow || !g_TryOffscreenHmd || !g_GameplayWorldRts)
+        if (!WorldRtGrowActive())
             return false;
         return ComputeOffscreenEyeSize(width, height);
+    }
+
+    bool ComputeWorldRtOverrideSize(uint32_t& width, uint32_t& height)
+    {
+        if (!g_TryOffscreenWorldGrow || !g_TryOffscreenHmd)
+            return false;
+        uint32_t eyeW = 0, eyeH = 0;
+        if (!ComputeOffscreenEyeSize(eyeW, eyeH))
+            return false;
+        if (g_FullFrameActualWidth < 640 || g_FullFrameActualHeight < 360)
+            return false;
+        if (!SizesNear(g_FullFrameActualWidth, eyeW) || !SizesNear(g_FullFrameActualHeight, eyeH))
+            return false;
+        width = eyeW;
+        height = eyeH;
+        return true;
+    }
+
+    bool ComputeGrownWorldGbuffer(uint32_t& width, uint32_t& height)
+    {
+        if (!g_GameplayWorldRts)
+            return false;
+        uint32_t eyeW = 0, eyeH = 0;
+        if (!ComputeGrownWorldFramebuffer(eyeW, eyeH))
+            return false;
+        // Eye-sized G-buffers behind a window-sized FullFrame is the 2026-08-26
+        // miss: worldMatch stays 0, the view stays 2560x1440, and the scene
+        // lands in the top slice of the G-buffer. Stay on the working path
+        // until the level load actually grew FullFrame.
+        if (!SizesNear(g_FullFrameActualWidth, eyeW) || !SizesNear(g_FullFrameActualHeight, eyeH))
+        {
+            static uint32_t s_loggedW, s_loggedH;
+            if (s_loggedW != g_FullFrameActualWidth || s_loggedH != g_FullFrameActualHeight)
+            {
+                s_loggedW = g_FullFrameActualWidth;
+                s_loggedH = g_FullFrameActualHeight;
+                Log("World RT grow held: FullFrame %ux%u != eye %ux%u; override stays HWND "
+                    "so G-buffers cannot outgrow FullFrame",
+                    g_FullFrameActualWidth, g_FullFrameActualHeight, eyeW, eyeH);
+            }
+            return false;
+        }
+        width = eyeW;
+        height = eyeH;
+        return true;
     }
 
     bool OffscreenWorldMatchesEyes()

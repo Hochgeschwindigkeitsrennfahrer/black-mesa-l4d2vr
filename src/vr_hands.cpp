@@ -184,9 +184,23 @@ namespace
             outPalette[i] = identity;
     }
 
+    // BuildSummaryCurlPalette only reads flFingerCurl, so go through
+    // VR::GetFingerCurls, which knows both backends. Calling
+    // GetSkeletalSummaryData directly meant the gloves froze in their bind pose
+    // on OpenXR, where there is no OpenVR input session to ask.
     bool TryGetSummary(vr::IVRInput* input, vr::VRActionHandle_t action, vr::VRSkeletalSummaryData_t& out)
     {
         out = {};
+        if (g_Game && g_Game->m_VR)
+        {
+            float curls[5]{};
+            if (g_Game->m_VR->GetFingerCurls(action, curls))
+            {
+                for (int i = 0; i < vr::VRFinger_Count && i < 5; ++i)
+                    out.flFingerCurl[i] = curls[i];
+                return true;
+            }
+        }
         if (!input || action == vr::k_ulInvalidActionHandle)
             return false;
         return input->GetSkeletalSummaryData(action, vr::VRSummaryType_FromAnimation, &out)

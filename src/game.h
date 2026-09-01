@@ -77,6 +77,16 @@ public:
     void PlayUiSound(const char* sample);
     void ScanWristHudNetVars();
     bool ReadWristHudValues(int& health, int& armor, int& clip, int& reserve, int& secondary);
+    // False only when m_bWearingSuit resolved and reads 0 (pre-HEV intro).
+    bool LocalPlayerHasSuit();
+    // True only when m_bZooming resolved and reads 1 (crossbow scope).
+    bool LocalPlayerZooming();
+    int RpgLaserOnOffset() const;
+    int RpgLaserDotOffset() const;
+    C_BaseEntity* FindEntityByNetworkNameContains(const char* token);
+    // Networked bool at a scanned player offset. Retires the offset if it ever
+    // reads a value that is not 0 or 1. Returns -1 when unavailable.
+    int ReadPlayerFlagByte(int& offset);
     int ReadWeaponClip(C_BaseEntity* weapon);
     bool WeaponHasNoAmmo(C_BaseEntity* weapon);
     const char* GetActiveWeaponModelName();

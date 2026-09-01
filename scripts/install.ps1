@@ -119,8 +119,8 @@ if (-not (Test-Path $CfgDst)) {
   $cfgText = [regex]::Replace($cfgText, '(?m)^VrHandsModelScale=.*$', 'VrHandsModelScale=0.85')
   if ($cfgText -notmatch '(?m)^VrHandsPoseRotationOffset=') { $cfgText += "`r`nVrHandsPoseRotationOffset=0,180,0`r`n" }
   $cfgText = [regex]::Replace($cfgText, '(?m)^VrHandsPoseRotationOffset=.*$', 'VrHandsPoseRotationOffset=0,180,0')
-  if ($cfgText -notmatch '(?m)^VrHandsPoseOffsetMeters=') { $cfgText += "`r`nVrHandsPoseOffsetMeters=0,-0.035,-0.10`r`n" }
-  $cfgText = [regex]::Replace($cfgText, '(?m)^VrHandsPoseOffsetMeters=.*$', 'VrHandsPoseOffsetMeters=0,-0.035,-0.10')
+  if ($cfgText -notmatch '(?m)^VrHandsPoseOffsetMeters=') { $cfgText += "`r`nVrHandsPoseOffsetMeters=0,-0.008,-0.10`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^VrHandsPoseOffsetMeters=.*$', 'VrHandsPoseOffsetMeters=0,-0.008,-0.10')
   if ($cfgText -notmatch '(?m)^AutoMatQueueMode=') { $cfgText += "`r`nAutoMatQueueMode=false`r`n" }
   $cfgText = [regex]::Replace($cfgText, '(?m)^AutoMatQueueMode=.*$', 'AutoMatQueueMode=false')
   if ($cfgText -notmatch '(?m)^AntiAliasing=') { $cfgText += "`r`nAntiAliasing=0`r`n" }
@@ -136,8 +136,13 @@ if (-not (Test-Path $CfgDst)) {
   if ($cfgText -notmatch '(?m)^OpenXRHelperWaitReadySeconds=') { $cfgText += "`r`nOpenXRHelperWaitReadySeconds=45`r`n" }
   if ($cfgText -notmatch '(?m)^OpenXRHelperUseGameRenderPoseForProjection=') { $cfgText += "`r`nOpenXRHelperUseGameRenderPoseForProjection=true`r`n" }
   $cfgText = [regex]::Replace($cfgText, '(?m)^OpenXRHelperUseGameRenderPoseForProjection=.*$', 'OpenXRHelperUseGameRenderPoseForProjection=true')
+  # Do not overwrite a user false — that is the revert switch.
+  if ($cfgText -notmatch '(?m)^WorldRenderAtEyeSize=') { $cfgText += "`r`nWorldRenderAtEyeSize=true`r`n" }
   Set-Content -LiteralPath $CfgDst -Value $cfgText -Encoding ASCII -NoNewline
   Write-Host "Updated HudDistance/HudSize/ViewmodelScale/CompositorPostPresentHandoff/gloves/wrist HUD/OpenXR in $CfgDst"
+  if ($cfgText -match '(?m)^WorldRenderAtEyeSize=true') {
+    Write-Host "WorldRenderAtEyeSize=true (world at eye size). Set false in VR\config.txt and restart to revert."
+  }
 }
 Write-Host "Installed SteamVR bindings to $ManifestDst"
 Write-Host "If SteamVR still has X=Flashlight or old jump/crouch, restore BMVR defaults (v3: Y=next, X=prev, right grip=flashlight)."
