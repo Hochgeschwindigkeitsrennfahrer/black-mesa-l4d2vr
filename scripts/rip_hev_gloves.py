@@ -305,20 +305,52 @@ def downsample_rgba(src: bytes, sw: int, sh: int, dw: int, dh: int) -> bytes:
     return bytes(out)
 
 
-def load_vtf_png_bytes(path: str, max_w=1024, max_h=512) -> bytes:
-    data = open(path, "rb").read()
+def dxt5_mip_size(w: int, h: int) -> int:
+    return ((w + 3) // 4) * ((h + 3) // 4) * 16
+
+
+def vtf_highres_offset(data: bytes) -> int:
     header_size = struct.unpack_from("<I", data, 12)[0]
-    w, h = struct.unpack_from("<HH", data, 16)
-    fmt = struct.unpack_from("<i", data, 52)[0]
+    version_minor = struct.unpack_from("<I", data, 8)[0]
+    if version_minor >= 3 and header_size >= 96:
+        num_res = struct.unpack_from("<I", data, 68)[0]
+        if 0 < num_res < 32:
+            for i in range(num_res):
+                off = 80 + i * 8
+                if off + 8 > len(data):
+                    break
+                # ResourceEntryInfo: 3-byte tag + flags, then offset.
+                # 0x30 = high-res IMAGE.
+                if data[off] == 0x30:
+                    return struct.unpack_from("<I", data, off + 4)[0]
     low_w, low_h = data[61], data[62]
-    # skip low-res thumbnail (DXT1)
     thumb = 0
     if low_w and low_h:
         thumb = ((low_w + 3) // 4) * ((low_h + 3) // 4) * 8
-    payload = data[header_size + thumb :]
+    return header_size + thumb
+
+
+def vtf_largest_mip_offset(data: bytes, highres_off: int, w: int, h: int, mip_count: int) -> int:
+    """VTF high-res data is smallest mip first, largest last."""
+    skip = 0
+    mw, mh = max(1, w // 2), max(1, h // 2)
+    for _ in range(max(0, mip_count - 1)):
+        skip += dxt5_mip_size(max(1, mw), max(1, mh))
+        mw = max(1, mw // 2)
+        mh = max(1, mh // 2)
+    return highres_off + skip
+
+
+def load_vtf_png_bytes(path: str, max_w=1024, max_h=512) -> bytes:
+    data = open(path, "rb").read()
+    w, h = struct.unpack_from("<HH", data, 16)
+    fmt = struct.unpack_from("<i", data, 52)[0]
+    mip_count = data[56]
     if fmt != 15:
         raise RuntimeError(f"unsupported VTF format {fmt}")
-    print(f"decoding DXT5 {w}x{h} (this takes a few seconds)")
+    highres = vtf_highres_offset(data)
+    payload = data[vtf_largest_mip_offset(data, highres, w, h, mip_count) :]
+    print(f"decoding DXT5 {w}x{h} mips={mip_count} (this takes a few seconds)")
     rgba = decode_dxt5(payload, w, h)
     dw, dh = max_w, max_h
     rgba = downsample_rgba(rgba, w, h, dw, dh)

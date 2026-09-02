@@ -488,11 +488,20 @@ public:
     Vector GetRecommendedViewmodelAbsPos(const Vector& eyePosition) const;
     QAngle GetRecommendedViewmodelAbsAngle() const;
     float HorizontalFovForAspect(float targetAspect) const;
+    // HMD FOV, or a narrower frustum while the crossbow scope is up. Used for
+    // stereo CViewSetup / viewmodel / in-eye overlays. Submit still uses m_Fov.
+    float WorldRenderFov() const;
+    // Incoming engine CViewSetup.fov before we overwrite it. Turns VR zoom
+    // off when the engine is clearly unscoped, so a stuck latch cannot keep
+    // the picture magnified.
+    void NoteEngineScopeFov(float engineFov);
     void CaptureFrameBeforePresent();
     bool BlitCurrentGameColorTo(IDirect3DSurface9* dst, bool flushGpu = false);
     bool BlitHmdViewFromBackbuffer(IDirect3DSurface9* dst, bool flushGpu = false);
+    void FlushStereoBlitGpu();
     IDirect3DSurface9* ColorTargetForStereoEye(int stereoEye) const;
     void BeginStereoEyeBlit(IDirect3DSurface9* dst);
+    void ClearStereoEyeSurfaces();
     bool EndStereoEyeBlit();
     bool StereoUnbindMatchesEye() const;
     void CaptureGameColorOnUnbind(IDirect3DSurface9* oldRt, uint32_t vpX, uint32_t vpY, uint32_t vpW, uint32_t vpH);
@@ -533,6 +542,7 @@ public:
     // material-system stack top — IMat must still advertise HMD size.
     bool D3dRt0IsEyeSized() const;
     bool CachedRt0MatchesEyes() const;
+    void NoteCachedRt0Size(UINT w, UINT h);
     void NoteStereoRedirectedToEye() { m_StereoRedirectedToEye = true; }
     // First gameplay RenderViews stay single-threaded. SetThreadMode(2) on
     // the first in-game Present (2026-08-18) ran during spawn Reset to
@@ -674,6 +684,7 @@ private:
         bool leftOk, const Vector& leftWrist, bool rightOk, const Vector& rightWrist,
         const Vector& eyeOrig, const Vector& fwd, const Vector& right, const Vector& up);
     void RefreshActiveWeaponModel();
+    void RefreshHeldWeaponState();
     void ApplyViewmodelBasisOffsets();
     void ApplyTwoHandShotgunAim();
     bool m_TwoHandShotgunActive = false;
@@ -687,7 +698,6 @@ private:
     DWORD m_LastCompositorReclaimMs = 0;
     uint32_t m_MatQueueOkPresents = 0;
     IDirect3DQuery9* m_BlitEventQuery = nullptr;
-    void FlushStereoBlitGpu();
     UINT KnownWindowWidth() const;
     UINT KnownWindowHeight() const;
     static bool ResolveSurfaceSize(IDirect3DSurface9* surf, UINT& w, UINT& h, D3DSURFACE_DESC* outDesc = nullptr);
@@ -710,6 +720,7 @@ private:
     DWORD m_PrevControllerTick = 0;
     DWORD m_MeleeAttackUntilMs = 0;
     DWORD m_MeleeNextSwingMs = 0;
+    DWORD m_PrevMeleeSampleMs = 0;
     bool m_PerformingMelee = false;
     bool m_MeleeNewSwing = true;
     void* m_MeleeHitEntity = nullptr;
@@ -722,6 +733,8 @@ private:
     bool m_WearingHevSuit = true;
     bool m_ScopeZoomActive = false;
     bool m_CrossbowZoomLatched = false;
+    float m_EngineViewFov = 0.f;
+    bool m_SawEngineZoomFov = false;
     bool m_RpgLaserLatched = false;
     QAngle m_LastFireAim{};
     bool m_HasLastFireAim = false;
@@ -738,6 +751,9 @@ private:
     bool m_WeaponMenuOpenedThisHold = false;
     bool m_WeaponMenuLatched = false;
     bool m_EmptyHands = false;
+    // True while inventory has a weapon and empty-hands is not selected.
+    // Sampled on the game thread for right-glove visibility.
+    bool m_HasHeldWeapon = false;
     DWORD m_WeaponMenuClickStartMs = 0;
     int m_WeaponMenuHover = -1;
     uint32_t m_PrevHeldButtons = 0;

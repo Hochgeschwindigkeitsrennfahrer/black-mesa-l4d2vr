@@ -108,7 +108,8 @@ namespace
         std::wstring mappingName;
         uint32_t targetFrames = kDefaultTargetFrames;
         uint32_t waitReadySeconds = kDefaultWaitReadySeconds;
-        bool swapProjectionEyes = false;
+        // -1 auto (Oculus/Meta OpenXR), 0 off, 1 on.
+        int swapProjectionEyes = -1;
         bool swapProjectionViewOrder = false;
         bool mirrorProjectionHorizontal = false;
         bool disableQuadOverlays = false;
@@ -457,38 +458,161 @@ namespace
         return -1;
     }
 
-    bool ShouldAutoFlipSubmitY(const char* runtimeName, std::string& reason)
+    bool ReadWindowsOpenXrActiveRuntime(std::string& pathOut)
     {
-        if (runtimeName && L4D2VR_TextContainsI(runtimeName, "SteamVR"))
-        {
-            reason = "runtimeName contains SteamVR";
-            return true;
-        }
+        pathOut.clear();
+        HKEY key = nullptr;
+        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Khronos\\OpenXR\\1", 0, KEY_READ, &key) != ERROR_SUCCESS)
+            return false;
+        wchar_t value[MAX_PATH]{};
+        DWORD size = sizeof(value);
+        DWORD type = 0;
+        const LONG rc = RegQueryValueExW(
+            key,
+            L"ActiveRuntime",
+            nullptr,
+            &type,
+            reinterpret_cast<LPBYTE>(value),
+            &size);
+        RegCloseKey(key);
+        if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) || !value[0])
+            return false;
+        char narrow[MAX_PATH]{};
+        if (WideCharToMultiByte(CP_UTF8, 0, value, -1, narrow, sizeof(narrow), nullptr, nullptr) <= 0)
+            return false;
+        pathOut = narrow;
+        return true;
+    }
 
-        const bool virtualDesktopRuntime = runtimeName &&
+    bool RuntimeNameLooksLikeSteamVR(const char* runtimeName)
+    {
+        return runtimeName &&
+            (L4D2VR_TextContainsI(runtimeName, "SteamVR") ||
+                L4D2VR_TextContainsI(runtimeName, "steamxr"));
+    }
+
+    bool RuntimeNameLooksLikeVirtualDesktop(const char* runtimeName)
+    {
+        return runtimeName &&
             (L4D2VR_TextContainsI(runtimeName, "VirtualDesktop") ||
                 L4D2VR_TextContainsI(runtimeName, "Virtual Desktop") ||
                 L4D2VR_TextContainsI(runtimeName, "VDXR"));
-        if (virtualDesktopRuntime)
+    }
+
+    bool RuntimeNameLooksLikeOculus(const char* runtimeName)
+    {
+        if (!runtimeName || !*runtimeName)
+            return false;
+        if (RuntimeNameLooksLikeSteamVR(runtimeName) || RuntimeNameLooksLikeVirtualDesktop(runtimeName))
+            return false;
+        return L4D2VR_TextContainsI(runtimeName, "Oculus") ||
+            L4D2VR_TextContainsI(runtimeName, "Meta");
+    }
+
+    bool ShouldAutoFlipSubmitY(const char* runtimeName, uint32_t controllerFamily, std::string& reason)
+    {
+        // SteamVR OpenXR on Quest (Touch) is inverted; VDXR/WMR/Oculus are not.
+        // A negative viewport Y-flip on G2/SteamVR made yellow/white bands
+        // (2026-09-01). Transfer-blit dstOffsets Y-swap is a no-op on NVIDIA.
+        // Auto-flip only SteamVR+Touch, via a second blit VS that negates
+        // NDC Y. UV 0/1 swap did not change the Quest SteamVR image
+        // (2026-09-01). Transfer dstOffsets swap is a no-op on NVIDIA.
+        const bool steamVrConvention = RuntimeNameLooksLikeSteamVR(runtimeName);
+        bool vdForwardsSteamVr = false;
+        if (RuntimeNameLooksLikeVirtualDesktop(runtimeName))
         {
             std::string detail;
             const int choice = ReadVirtualDesktopOpenXrChoice(detail);
             if (choice == 1)
             {
+                vdForwardsSteamVr = true;
                 reason = std::string("Virtual Desktop forwards to SteamVR (") + detail + ")";
-                return true;
             }
-            if (choice == 0)
+            else if (choice == 0)
             {
                 reason = std::string("Virtual Desktop VDXR (") + detail + ")";
                 return false;
             }
-            reason = "Virtual Desktop runtime; VDXR assumed (no SteamVR setting found)";
+            else
+            {
+                reason = "Virtual Desktop runtime; VDXR assumed (no SteamVR setting found)";
+                return false;
+            }
+        }
+
+        if (!steamVrConvention && !vdForwardsSteamVr)
+        {
+            if (RuntimeNameLooksLikeOculus(runtimeName))
+            {
+                reason = "Oculus/Meta OpenXR; no submit Y-flip";
+                return false;
+            }
+            reason = "runtime does not need a submit Y-flip";
             return false;
         }
 
-        reason = "runtime does not need a submit Y-flip";
+        if (controllerFamily == L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH)
+        {
+            reason = steamVrConvention
+                ? "SteamVR + Touch; vertex NDC Y-flip"
+                : (reason + "; Touch; vertex NDC Y-flip");
+            return true;
+        }
+
+        reason = steamVrConvention
+            ? "SteamVR without Touch (G2 stays unflipped; negative viewport banned)"
+            : (reason + "; waiting for Touch family");
         return false;
+    }
+
+    bool ShouldAutoSwapProjectionEyes(const char* runtimeName, std::string& reason)
+    {
+        (void)runtimeName;
+        // SteamVR Quest fused without an image swap (only inverted). Link still
+        // duplicated with swap auto-on, so swapping images is not the fix.
+        reason = "do not swap projection images (Link duplication is not L/R swap)";
+        return false;
+    }
+
+    // L4D2VR / OpenVR GetProjectionRaw UV crop: the game renders a symmetric
+    // oversized FOV, then each eye submits only the visible frustum. Match
+    // src/vr.cpp InitOpenXrHelperSceneBackend.
+    bool ComputeProjectionCropUv(
+        const XrFovf& leftFov,
+        const XrFovf& rightFov,
+        uint32_t eyeIndex,
+        float& uMin,
+        float& vMin,
+        float& uMax,
+        float& vMax)
+    {
+        const float lLeft = std::tan(leftFov.angleLeft);
+        const float lRight = std::tan(leftFov.angleRight);
+        const float lDown = std::tan(leftFov.angleDown);
+        const float lUp = std::tan(leftFov.angleUp);
+        const float rLeft = std::tan(rightFov.angleLeft);
+        const float rRight = std::tan(rightFov.angleRight);
+        const float rDown = std::tan(rightFov.angleDown);
+        const float rUp = std::tan(rightFov.angleUp);
+        if (!(std::isfinite(lLeft) && std::isfinite(lRight) && std::isfinite(lDown) && std::isfinite(lUp) &&
+            std::isfinite(rLeft) && std::isfinite(rRight) && std::isfinite(rDown) && std::isfinite(rUp)))
+        {
+            return false;
+        }
+        const float tanHalfFovX = std::max({ -lLeft, lRight, -rLeft, rRight });
+        const float tanHalfFovY = std::max({ -lDown, lUp, -rDown, rUp });
+        if (!(tanHalfFovX > 0.001f && tanHalfFovY > 0.001f))
+            return false;
+        const XrFovf& fov = (eyeIndex == L4D2VR_OPENXR_EYE_RIGHT) ? rightFov : leftFov;
+        const float left = std::tan(fov.angleLeft);
+        const float right = std::tan(fov.angleRight);
+        const float down = std::tan(fov.angleDown);
+        const float up = std::tan(fov.angleUp);
+        uMin = std::clamp(0.5f + 0.5f * left / tanHalfFovX, 0.0f, 1.0f);
+        uMax = std::clamp(0.5f + 0.5f * right / tanHalfFovX, 0.0f, 1.0f);
+        vMin = std::clamp(0.5f - 0.5f * up / tanHalfFovY, 0.0f, 1.0f);
+        vMax = std::clamp(0.5f - 0.5f * down / tanHalfFovY, 0.0f, 1.0f);
+        return uMax > uMin + 0.05f && vMax > vMin + 0.05f;
     }
 
     const char* ForceMonoProjectionEyeName(int eye)
@@ -508,7 +632,7 @@ namespace
             return static_cast<uint32_t>(options.forceMonoProjectionEye);
         }
 
-        return options.swapProjectionEyes ? (viewEye ^ 1u) : viewEye;
+        return options.swapProjectionEyes > 0 ? (viewEye ^ 1u) : viewEye;
     }
 
     uint32_t SelectProjectionViewEye(const Options& options, uint32_t viewEye)
@@ -558,9 +682,7 @@ namespace
             }
             else if (const wchar_t* value = needsValue(L"--swap-projection-eyes"))
             {
-                uint32_t enabled = 0;
-                if (ParseUintArg(value, enabled))
-                    options.swapProjectionEyes = enabled != 0;
+                ParseFlipSubmitYArg(value, options.swapProjectionEyes);
             }
             else if (const wchar_t* value = needsValue(L"--swap-projection-view-order"))
             {
@@ -1062,6 +1184,9 @@ namespace
             return false;
         }
     }
+
+    constexpr char kOpenXrBlitVertFlipSpvBase64[] =
+        "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";
 
     constexpr char kOpenXrBlitVertSpvBase64[] =
         "AwIjBwAAAQALAAgAMwAAAAAAAAARAAIAAQAAAAsABgABAAAAR0xTTC5zdGQuNDUwAAAAAA4AAwAAAAAAAQAAAA8ACAAAAAAABAAAAG1haW4AAAAAHwAAACMAAAAvAAAAAwADAAIAAADCAQAABQAEAAQAAABtYWluAAAAAAUAAwAMAAAAcG9zAAUAAwATAAAAdXYAAAUABgAdAAAAZ2xfUGVyVmVydGV4AAAAAAYABgAdAAAAAAAAAGdsX1Bvc2l0aW9uAAYABwAdAAAAAQAAAGdsX1BvaW50U2l6ZQAAAAAGAAcAHQAAAAIAAABnbF9DbGlwRGlzdGFuY2UABgAHAB0AAAADAAAAZ2xfQ3VsbERpc3RhbmNlAAUAAwAfAAAAAAAAAAUABgAjAAAAZ2xfVmVydGV4SW5kZXgAAAUAAwAvAAAAdlV2AEcAAwAdAAAAAgAAAEgABQAdAAAAAAAAAAsAAAAAAAAASAAFAB0AAAABAAAACwAAAAEAAABIAAUAHQAAAAIAAAALAAAAAwAAAEgABQAdAAAAAwAAAAsAAAAEAAAARwAEACMAAAALAAAAKgAAAEcABAAvAAAAHgAAAAAAAAATAAIAAgAAACEAAwADAAAAAgAAABYAAwAGAAAAIAAAABcABAAHAAAABgAAAAIAAAAVAAQACAAAACAAAAAAAAAAKwAEAAgAAAAJAAAAAwAAABwABAAKAAAABwAAAAkAAAAgAAQACwAAAAcAAAAKAAAAKwAEAAYAAAANAAAAAACAvywABQAHAAAADgAAAA0AAAANAAAAKwAEAAYAAAAPAAAAAABAQCwABQAHAAAAEAAAAA8AAAANAAAALAAFAAcAAAARAAAADQAAAA8AAAAsAAYACgAAABIAAAAOAAAAEAAAABEAAAArAAQABgAAABQAAAAAAAAALAAFAAcAAAAVAAAAFAAAABQAAAArAAQABgAAABYAAAAAAABALAAFAAcAAAAXAAAAFgAAABQAAAAsAAUABwAAABgAAAAUAAAAFgAAACwABgAKAAAAGQAAABUAAAAXAAAAGAAAABcABAAaAAAABgAAAAQAAAArAAQACAAAABsAAAABAAAAHAAEABwAAAAGAAAAGwAAAB4ABgAdAAAAGgAAAAYAAAAcAAAAHAAAACAABAAeAAAAAwAAAB0AAAA7AAQAHgAAAB8AAAADAAAAFQAEACAAAAAgAAAAAQAAACsABAAgAAAAIQAAAAAAAAAgAAQAIgAAAAEAAAAgAAAAOwAEACIAAAAjAAAAAQAAACAABAAlAAAABwAAAAcAAAArAAQABgAAACgAAAAAAIA/IAAEACwAAAADAAAAGgAAACAABAAuAAAAAwAAAAcAAAA7AAQALgAAAC8AAAADAAAANgAFAAIAAAAEAAAAAAAAAAMAAAD4AAIABQAAADsABAALAAAADAAAAAcAAAA7AAQACwAAABMAAAAHAAAAPgADAAwAAAASAAAAPgADABMAAAAZAAAAPQAEACAAAAAkAAAAIwAAAEEABQAlAAAAJgAAAAwAAAAkAAAAPQAEAAcAAAAnAAAAJgAAAFEABQAGAAAAKQAAACcAAAAAAAAAUQAFAAYAAAAqAAAAJwAAAAEAAABQAAcAGgAAACsAAAApAAAAKgAAABQAAAAoAAAAQQAFACwAAAAtAAAAHwAAACEAAAA+AAMALQAAACsAAAA9AAQAIAAAADAAAAAjAAAAQQAFACUAAAAxAAAAEwAAADAAAAA9AAQABwAAADIAAAAxAAAAPgADAC8AAAAyAAAA/QABADgAAQA=";
@@ -1779,6 +1904,7 @@ namespace
         bool InitializeSession(XrSession session, XrSpace appSpace, bool handTrackingEnabled, Logger& log);
         void Shutdown();
         void UpdateFrame(XrTime displayTime, BridgeWriter& bridge, Logger& log);
+        uint32_t CurrentControllerFamily() const;
 
     private:
         struct BooleanActionDef
@@ -1839,7 +1965,6 @@ namespace
         void AddMenuButtonBindings(std::vector<XrActionSuggestedBinding>& bindings);
         void SuggestBindings(Logger& log);
         std::string PathToString(XrPath path) const;
-        uint32_t CurrentControllerFamily() const;
         void LogCurrentInteractionProfiles(Logger& log);
         void ReadBooleanActions(L4D2VROpenXrInputStateDesc& outState);
         void ReadFloatDigitalActions(L4D2VROpenXrInputStateDesc& outState);
@@ -5217,6 +5342,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         int Run(const Options& options)
         {
             m_FlipSubmitYOption = options.flipSubmitY;
+            m_SwapProjectionEyesOption = options.swapProjectionEyes;
             m_Bridge.Open(options.mappingName, m_Log);
             m_ParentProcess = OpenParentProcess(options.parentPid);
 
@@ -5241,7 +5367,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             if (!CreateSwapchains())
                 return Fail(19, "OpenXR Vulkan swapchain creation failed");
 
-            const int exitCode = FrameLoop(options);
+            Options runtimeOptions = options;
+            runtimeOptions.swapProjectionEyes = m_SwapProjectionEyes ? 1 : 0;
+            runtimeOptions.flipSubmitY = m_FlipSubmitY ? 1 : 0;
+            const int exitCode = FrameLoop(runtimeOptions);
             if (exitCode != 0)
                 m_Bridge.Update(L4D2VROpenXrBridgeStatus::Failed, exitCode, 0, "OpenXR Vulkan frame loop failed");
             return exitCode;
@@ -5449,19 +5578,80 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             }
             else
             {
-                m_FlipSubmitY = ShouldAutoFlipSubmitY(m_RuntimeName, reason);
+                m_FlipSubmitY = ShouldAutoFlipSubmitY(
+                    m_RuntimeName, L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN, reason);
             }
 
+            m_UseRuntimeProjectionFov = RuntimeNameLooksLikeOculus(m_RuntimeName);
+
+            std::string activeRuntime;
+            if (ReadWindowsOpenXrActiveRuntime(activeRuntime))
+                m_Log.Print("Windows OpenXR ActiveRuntime: %s", activeRuntime.c_str());
+
             m_Log.Print(
-                "OpenXR submit Y-flip: %s (%s) runtime=%s option=%s",
+                "OpenXR submit Y-flip: %s (%s) runtime=%s option=%s method=vertex-ndc-y-flip",
                 m_FlipSubmitY ? "on" : "off",
                 reason.c_str(),
                 m_RuntimeName[0] ? m_RuntimeName : "<unknown>",
                 FlipSubmitYOptionName(m_FlipSubmitYOption));
+            m_Log.Print(
+                "OpenXR projection FOV source: %s",
+                m_UseRuntimeProjectionFov ? "runtime (Oculus/Meta)" : "game-when-full-bounds");
+        }
+
+        void RefreshFlipSubmitY()
+        {
+            if (m_FlipSubmitYOption >= 0)
+                return;
+            std::string reason;
+            const uint32_t family = m_InputBridge.CurrentControllerFamily();
+            const bool want = ShouldAutoFlipSubmitY(m_RuntimeName, family, reason);
+            if (want == m_FlipSubmitY && family == m_FlipSubmitYFamily)
+                return;
+            m_FlipSubmitY = want;
+            m_FlipSubmitYFamily = family;
+            m_Log.Print(
+                "OpenXR submit Y-flip: %s (%s) family=%s(%u) method=vertex-ndc-y-flip",
+                m_FlipSubmitY ? "on" : "off",
+                reason.c_str(),
+                L4D2VR_ControllerFamilyName(family),
+                family);
+        }
+
+        void ResolveSwapProjectionEyes(const char* runtimeName)
+        {
+            if (runtimeName && runtimeName[0] && !m_RuntimeName[0])
+                std::snprintf(m_RuntimeName, sizeof(m_RuntimeName), "%s", runtimeName);
+
+            std::string reason;
+            if (m_SwapProjectionEyesOption > 0)
+            {
+                m_SwapProjectionEyes = true;
+                reason = "config on";
+            }
+            else if (m_SwapProjectionEyesOption == 0)
+            {
+                m_SwapProjectionEyes = false;
+                reason = "config off";
+            }
+            else
+            {
+                m_SwapProjectionEyes = ShouldAutoSwapProjectionEyes(m_RuntimeName, reason);
+            }
+
+            m_Log.Print(
+                "OpenXR projection eye swap: %s (%s) runtime=%s option=%s",
+                m_SwapProjectionEyes ? "on" : "off",
+                reason.c_str(),
+                m_RuntimeName[0] ? m_RuntimeName : "<unknown>",
+                FlipSubmitYOptionName(m_SwapProjectionEyesOption));
         }
 
         void ApplyEyeSubmitYFlip(VkImageBlit& blit) const
         {
+            // NVIDIA treats blit offsets as min/max, so swapping dst Y is a
+            // no-op (Quest SteamVR stayed inverted, 2026-09-01). Shader UV
+            // swap is the real flip. Keep this only for the transfer fallback.
             if (!m_FlipSubmitY)
                 return;
             std::swap(blit.dstOffsets[0].y, blit.dstOffsets[1].y);
@@ -5480,10 +5670,12 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     static_cast<unsigned long long>(XR_VERSION_MINOR(instanceProperties.runtimeVersion)),
                     static_cast<unsigned long long>(XR_VERSION_PATCH(instanceProperties.runtimeVersion)));
                 ResolveFlipSubmitY(instanceProperties.runtimeName);
+                ResolveSwapProjectionEyes(instanceProperties.runtimeName);
             }
             else
             {
                 ResolveFlipSubmitY("");
+                ResolveSwapProjectionEyes("");
             }
 
             XrSystemGetInfo systemInfo{ XR_TYPE_SYSTEM_GET_INFO };
@@ -6113,11 +6305,14 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             }
 
             VkShaderModule vertexShader = CreateShaderModuleFromBase64(kOpenXrBlitVertSpvBase64, "blit vertex");
+            VkShaderModule vertexFlipShader = CreateShaderModuleFromBase64(kOpenXrBlitVertFlipSpvBase64, "blit vertex Y-flip");
             VkShaderModule fragmentShader = CreateShaderModuleFromBase64(kOpenXrBlitFragSpvBase64, "blit fragment");
-            if (vertexShader == VK_NULL_HANDLE || fragmentShader == VK_NULL_HANDLE)
+            if (vertexShader == VK_NULL_HANDLE || vertexFlipShader == VK_NULL_HANDLE || fragmentShader == VK_NULL_HANDLE)
             {
                 if (vertexShader != VK_NULL_HANDLE)
                     m_Vk.vkDestroyShaderModule(m_VkDevice, vertexShader, nullptr);
+                if (vertexFlipShader != VK_NULL_HANDLE)
+                    m_Vk.vkDestroyShaderModule(m_VkDevice, vertexFlipShader, nullptr);
                 if (fragmentShader != VK_NULL_HANDLE)
                     m_Vk.vkDestroyShaderModule(m_VkDevice, fragmentShader, nullptr);
                 return false;
@@ -6181,17 +6376,33 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             pipelineInfo.subpass = 0;
 
             result = m_Vk.vkCreateGraphicsPipelines(m_VkDevice, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_BlitPipeline);
+            stages[0].module = vertexFlipShader;
+            const VkResult flipResult = m_Vk.vkCreateGraphicsPipelines(
+                m_VkDevice, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &m_BlitPipelineFlipY);
 
             m_Vk.vkDestroyShaderModule(m_VkDevice, fragmentShader, nullptr);
+            m_Vk.vkDestroyShaderModule(m_VkDevice, vertexFlipShader, nullptr);
             m_Vk.vkDestroyShaderModule(m_VkDevice, vertexShader, nullptr);
 
             if (result != VK_SUCCESS || m_BlitPipeline == VK_NULL_HANDLE)
             {
                 m_Log.Print("vkCreateGraphicsPipelines(blit) failed: %s (%d)", VkResultName(result), static_cast<int>(result));
+                if (m_BlitPipelineFlipY != VK_NULL_HANDLE && m_Vk.vkDestroyPipeline)
+                {
+                    m_Vk.vkDestroyPipeline(m_VkDevice, m_BlitPipelineFlipY, nullptr);
+                    m_BlitPipelineFlipY = VK_NULL_HANDLE;
+                }
                 return false;
             }
+            if (flipResult != VK_SUCCESS || m_BlitPipelineFlipY == VK_NULL_HANDLE)
+            {
+                m_Log.Print("vkCreateGraphicsPipelines(blit Y-flip) failed: %s (%d)", VkResultName(flipResult), static_cast<int>(flipResult));
+                m_BlitPipelineFlipY = VK_NULL_HANDLE;
+            }
 
-            m_Log.Print("Created sRGB-correct Vulkan blit pipeline for swapchain format=%u", static_cast<unsigned int>(colorFormat));
+            m_Log.Print("Created sRGB-correct Vulkan blit pipeline for swapchain format=%u flipPipeline=%u",
+                static_cast<unsigned int>(colorFormat),
+                m_BlitPipelineFlipY != VK_NULL_HANDLE ? 1u : 0u);
             return true;
         }
 
@@ -7784,7 +7995,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             scissor.extent = { static_cast<uint32_t>(dest.w), static_cast<uint32_t>(dest.h) };
             m_Vk.vkCmdSetScissor(m_CommandBuffer, 0, 1, &scissor);
 
-            m_Vk.vkCmdBindPipeline(m_CommandBuffer, VK_PIPELINE_BIND_POINT_GRAPHICS, m_BlitPipeline);
+            m_Vk.vkCmdBindPipeline(
+                m_CommandBuffer,
+                VK_PIPELINE_BIND_POINT_GRAPHICS,
+                (flipY && m_BlitPipelineFlipY != VK_NULL_HANDLE) ? m_BlitPipelineFlipY : m_BlitPipeline);
             m_Vk.vkCmdBindDescriptorSets(
                 m_CommandBuffer,
                 VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -7795,14 +8009,11 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 0,
                 nullptr);
 
-            // Sample the bounded source. Eye submits contain-fit (no upscale);
-            // overlays still fill the swapchain. SteamVR OpenXR wants a Y-flip
-            // of the eye image; VDXR/Oculus do not. Do not flip overlay quads.
-            float vMin = source.vMin;
-            float vMax = source.vMax;
-            if (flipY)
-                std::swap(vMin, vMax);
-            const float bounds[4] = { source.uMin, vMin, source.uMax, vMax };
+            // Sample the bounded source. Do not swap vMin/vMax: mix(0,1,t) vs
+            // mix(1,0,t) did not change the Quest SteamVR image (2026-09-01).
+            // Do not use a negative viewport: G2/SteamVR got yellow/white bands.
+            // SteamVR+Touch binds a VS that negates NDC Y. Overlays pass flipY=false.
+            const float bounds[4] = { source.uMin, source.vMin, source.uMax, source.vMax };
             m_Vk.vkCmdPushConstants(
                 m_CommandBuffer,
                 m_BlitPipelineLayout,
@@ -7816,11 +8027,11 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             return true;
         }
 
-        bool CmdRenderShaderBlit(uint32_t eyeIndex, VulkanEyeSwapchain& eye, uint32_t imageIndex, const VulkanGameEyeTexture& source)
+        bool CmdRenderShaderBlit(uint32_t eyeIndex, VulkanEyeSwapchain& eye, uint32_t imageIndex, const VulkanGameEyeTexture& source, bool containFit)
         {
             if (eyeIndex >= L4D2VR_OPENXR_EYE_COUNT)
                 return false;
-            return CmdRenderShaderBlitWithDescriptor(eye, imageIndex, source, m_BlitDescriptorSets[eyeIndex], true, m_FlipSubmitY);
+            return CmdRenderShaderBlitWithDescriptor(eye, imageIndex, source, m_BlitDescriptorSets[eyeIndex], containFit, m_FlipSubmitY);
         }
 
         bool CmdRenderOverlayShaderBlit(uint32_t overlayIndex, VulkanEyeSwapchain& swapchain, uint32_t imageIndex, const VulkanGameEyeTexture& source)
@@ -7862,14 +8073,60 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 const VulkanGameEyeTexture& source = m_GameEyes[eyeIndex];
                 if (source.image == VK_NULL_HANDLE)
                     return false;
-                const bool useShaderBlit = m_UseShaderBlit;
-                static bool s_loggedBlitPath = false;
-                if (!s_loggedBlitPath && eyeIndex == 0)
+                VulkanGameEyeTexture blitSource = source;
+                L4D2VROpenXrPoseDesc cropPose{};
+                const bool poseMono =
+                    m_Bridge.ReadGameRenderPose(cropPose) &&
+                    (cropPose.reserved1 & L4D2VR_OPENXR_POSE_FLAG_MONO) != 0;
+                const bool cropProjection = m_UseRuntimeProjectionFov && m_HaveLocatedFov && !poseMono;
+                if (cropProjection)
                 {
-                    s_loggedBlitPath = true;
-                    m_Log.Print("Using %s Vulkan eye blit path for swapchain format=%u",
+                    float uMin = 0.0f, vMin = 0.0f, uMax = 1.0f, vMax = 1.0f;
+                    if (ComputeProjectionCropUv(
+                        m_LocatedFov[L4D2VR_OPENXR_EYE_LEFT],
+                        m_LocatedFov[L4D2VR_OPENXR_EYE_RIGHT],
+                        eyeIndex,
+                        uMin, vMin, uMax, vMax))
+                    {
+                        blitSource.uMin = uMin;
+                        blitSource.vMin = vMin;
+                        blitSource.uMax = uMax;
+                        blitSource.vMax = vMax;
+                    }
+                    static bool s_loggedProjectionCrop = false;
+                    if (!s_loggedProjectionCrop && eyeIndex == 0)
+                    {
+                        s_loggedProjectionCrop = true;
+                        float rU0 = 0.0f, rV0 = 0.0f, rU1 = 1.0f, rV1 = 1.0f;
+                        ComputeProjectionCropUv(
+                            m_LocatedFov[L4D2VR_OPENXR_EYE_LEFT],
+                            m_LocatedFov[L4D2VR_OPENXR_EYE_RIGHT],
+                            L4D2VR_OPENXR_EYE_RIGHT,
+                            rU0, rV0, rU1, rV1);
+                        m_Log.Print(
+                            "OpenXR projection UV crop: on (Oculus/Meta hidden-area) L=(%.4f %.4f %.4f %.4f) R=(%.4f %.4f %.4f %.4f)",
+                            blitSource.uMin, blitSource.vMin, blitSource.uMax, blitSource.vMax,
+                            rU0, rV0, rU1, rV1);
+                    }
+                }
+                // Shader mix(vMin,vMax) UV swap did not change the Quest
+                // SteamVR image (2026-09-01). Transfer dstOffsets swap is a
+                // no-op on NVIDIA. Negative viewport made yellow bands on G2.
+                // SteamVR+Touch uses a second blit VS that negates NDC Y.
+                const bool flipY = m_FlipSubmitY;
+                const bool useShaderBlit = m_UseShaderBlit;
+                const bool containFit = !cropProjection;
+                static int s_loggedBlitKey = -1;
+                const int blitKey = (flipY ? 1 : 0) | (cropProjection ? 2 : 0) | (useShaderBlit ? 4 : 0);
+                if (eyeIndex == 0 && s_loggedBlitKey != blitKey)
+                {
+                    s_loggedBlitKey = blitKey;
+                    m_Log.Print("Using %s Vulkan eye blit path for swapchain format=%u flipY=%u crop=%u ndcYFlip=%u",
                         useShaderBlit ? "sRGB shader" : "transfer",
-                        static_cast<unsigned int>(eye.format));
+                        static_cast<unsigned int>(eye.format),
+                        flipY ? 1u : 0u,
+                        cropProjection ? 1u : 0u,
+                        (flipY && useShaderBlit && m_BlitPipelineFlipY != VK_NULL_HANDLE) ? 1u : 0u);
                 }
                 {
                     static uint32_t s_eyeBlitLogBudget = 48;
@@ -7878,23 +8135,25 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                         --s_eyeBlitLogBudget;
                         uint32_t srcW = 0;
                         uint32_t srcH = 0;
-                        BoundedSourcePixels(source.width, source.height, source.uMin, source.vMin, source.uMax, source.vMax, srcW, srcH);
-                        const ContainBlitRect dest = ComputeContainBlitRect(srcW, srcH, eye.width, eye.height);
+                        BoundedSourcePixels(blitSource.width, blitSource.height, blitSource.uMin, blitSource.vMin, blitSource.uMax, blitSource.vMax, srcW, srcH);
+                        const ContainBlitRect dest = containFit
+                            ? ComputeContainBlitRect(srcW, srcH, eye.width, eye.height)
+                            : ContainBlitRect{ 0, 0, static_cast<int32_t>(eye.width), static_cast<int32_t>(eye.height) };
                         m_Log.Print(
-                            "[OpenXR][EyeBlit] eye=%s(%u) frame=%u sourceGen=%u sourceHandle=0x%llX sourceImage=0x%llX sourceSize=%ux%u sourceFormat=%u sourceBounds=(%.4f %.4f %.4f %.4f) dstSwapchain=0x%llX dstImage=0x%llX dstImageIndex=%u dstSize=%ux%u containBlit=(%d,%d %dx%d) path=%s",
+                            "[OpenXR][EyeBlit] eye=%s(%u) frame=%u sourceGen=%u sourceHandle=0x%llX sourceImage=0x%llX sourceSize=%ux%u sourceFormat=%u sourceBounds=(%.4f %.4f %.4f %.4f) dstSwapchain=0x%llX dstImage=0x%llX dstImageIndex=%u dstSize=%ux%u containBlit=(%d,%d %dx%d) path=%s crop=%u",
                             EyeName(eyeIndex),
                             eyeIndex,
                             frameIndex,
-                            source.generation,
-                            static_cast<unsigned long long>(source.kmtHandle),
-                            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(source.image)),
-                            source.width,
-                            source.height,
-                            static_cast<unsigned int>(source.format),
-                            source.uMin,
-                            source.vMin,
-                            source.uMax,
-                            source.vMax,
+                            blitSource.generation,
+                            static_cast<unsigned long long>(blitSource.kmtHandle),
+                            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(blitSource.image)),
+                            blitSource.width,
+                            blitSource.height,
+                            static_cast<unsigned int>(blitSource.format),
+                            blitSource.uMin,
+                            blitSource.vMin,
+                            blitSource.uMax,
+                            blitSource.vMax,
                             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(eye.handle)),
                             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(dstImage)),
                             imageIndex,
@@ -7904,7 +8163,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                             dest.y,
                             dest.w,
                             dest.h,
-                            useShaderBlit ? "shader" : "transfer");
+                            useShaderBlit ? "shader" : "transfer",
+                            cropProjection ? 1u : 0u);
                     }
                 }
                 if (useShaderBlit)
@@ -7912,7 +8172,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     CmdTransitionImage(dstImage, eye.layouts[imageIndex], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                         0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
                         VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
-                    if (!CmdRenderShaderBlit(eyeIndex, eye, imageIndex, source))
+                    if (!CmdRenderShaderBlit(eyeIndex, eye, imageIndex, blitSource, containFit))
                         return false;
                     eye.layouts[imageIndex] = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 }
@@ -7929,18 +8189,20 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     clearRange.layerCount = 1;
                     m_Vk.vkCmdClearColorImage(m_CommandBuffer, dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &clearRange);
 
-                    const int32_t srcX0 = static_cast<int32_t>(std::floor(source.uMin * static_cast<float>(source.width)));
-                    const int32_t srcY0 = static_cast<int32_t>(std::floor(source.vMin * static_cast<float>(source.height)));
-                    const int32_t srcX1 = static_cast<int32_t>(std::ceil(source.uMax * static_cast<float>(source.width)));
-                    const int32_t srcY1 = static_cast<int32_t>(std::ceil(source.vMax * static_cast<float>(source.height)));
-                    const int32_t srcMinX = std::clamp(srcX0, 0, static_cast<int32_t>(source.width) - 1);
-                    const int32_t srcMinY = std::clamp(srcY0, 0, static_cast<int32_t>(source.height) - 1);
-                    const int32_t srcMaxX = std::clamp(srcX1, srcMinX + 1, static_cast<int32_t>(source.width));
-                    const int32_t srcMaxY = std::clamp(srcY1, srcMinY + 1, static_cast<int32_t>(source.height));
+                    const int32_t srcX0 = static_cast<int32_t>(std::floor(blitSource.uMin * static_cast<float>(blitSource.width)));
+                    const int32_t srcY0 = static_cast<int32_t>(std::floor(blitSource.vMin * static_cast<float>(blitSource.height)));
+                    const int32_t srcX1 = static_cast<int32_t>(std::ceil(blitSource.uMax * static_cast<float>(blitSource.width)));
+                    const int32_t srcY1 = static_cast<int32_t>(std::ceil(blitSource.vMax * static_cast<float>(blitSource.height)));
+                    const int32_t srcMinX = std::clamp(srcX0, 0, static_cast<int32_t>(blitSource.width) - 1);
+                    const int32_t srcMinY = std::clamp(srcY0, 0, static_cast<int32_t>(blitSource.height) - 1);
+                    const int32_t srcMaxX = std::clamp(srcX1, srcMinX + 1, static_cast<int32_t>(blitSource.width));
+                    const int32_t srcMaxY = std::clamp(srcY1, srcMinY + 1, static_cast<int32_t>(blitSource.height));
                     uint32_t srcW = 0;
                     uint32_t srcH = 0;
-                    BoundedSourcePixels(source.width, source.height, source.uMin, source.vMin, source.uMax, source.vMax, srcW, srcH);
-                    const ContainBlitRect dest = ComputeContainBlitRect(srcW, srcH, eye.width, eye.height);
+                    BoundedSourcePixels(blitSource.width, blitSource.height, blitSource.uMin, blitSource.vMin, blitSource.uMax, blitSource.vMax, srcW, srcH);
+                    const ContainBlitRect dest = containFit
+                        ? ComputeContainBlitRect(srcW, srcH, eye.width, eye.height)
+                        : ContainBlitRect{ 0, 0, static_cast<int32_t>(eye.width), static_cast<int32_t>(eye.height) };
                     VkImageBlit blit{};
                     blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                     blit.srcSubresource.layerCount = 1;
@@ -7951,7 +8213,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     blit.dstOffsets[0] = { dest.x, dest.y, 0 };
                     blit.dstOffsets[1] = { dest.x + dest.w, dest.y + dest.h, 1 };
                     ApplyEyeSubmitYFlip(blit);
-                    m_Vk.vkCmdBlitImage(m_CommandBuffer, source.image, source.layout,
+                    m_Vk.vkCmdBlitImage(m_CommandBuffer, blitSource.image, blitSource.layout,
                         dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
 
                     CmdTransitionImage(dstImage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -8100,6 +8362,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             const bool fullSourceBounds = IsFullSourceBounds(source);
             const bool useGameProjectionFov =
                 haveGameFov &&
+                !m_UseRuntimeProjectionFov &&
                 (useSymmetricProjectionFov || fullSourceBounds);
 
             static bool s_loggedProjection = false;
@@ -8251,6 +8514,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     return 23;
 
                 m_InputBridge.UpdateFrame(frameState.predictedDisplayTime, m_Bridge, m_Log);
+                RefreshFlipSubmitY();
 
                 bool layerReady = false;
                 uint32_t overlayLayerCount = 0;
@@ -8271,6 +8535,12 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                         static_cast<uint32_t>(locatedViews.size()), &locatedCount, locatedViews.data());
                     if (!Succeeded(m_Log, "xrLocateViews", result))
                         return 24;
+                    if (locatedCount >= 2)
+                    {
+                        m_LocatedFov[L4D2VR_OPENXR_EYE_LEFT] = locatedViews[L4D2VR_OPENXR_EYE_LEFT].fov;
+                        m_LocatedFov[L4D2VR_OPENXR_EYE_RIGHT] = locatedViews[L4D2VR_OPENXR_EYE_RIGHT].fov;
+                        m_HaveLocatedFov = true;
+                    }
                     m_Bridge.PublishHmdPose(BuildHmdPoseFromLocatedViews(
                         locatedViews,
                         locatedCount,
@@ -8916,6 +9186,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             }
             if (m_BlitPipeline != VK_NULL_HANDLE && m_Vk.vkDestroyPipeline)
                 m_Vk.vkDestroyPipeline(m_VkDevice, m_BlitPipeline, nullptr);
+            if (m_BlitPipelineFlipY != VK_NULL_HANDLE && m_Vk.vkDestroyPipeline)
+                m_Vk.vkDestroyPipeline(m_VkDevice, m_BlitPipelineFlipY, nullptr);
             if (m_BlitPipelineLayout != VK_NULL_HANDLE && m_Vk.vkDestroyPipelineLayout)
                 m_Vk.vkDestroyPipelineLayout(m_VkDevice, m_BlitPipelineLayout, nullptr);
             if (m_BlitRenderPass != VK_NULL_HANDLE && m_Vk.vkDestroyRenderPass)
@@ -8973,6 +9245,12 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         bool m_UseShaderBlit = false;
         int m_FlipSubmitYOption = -1;
         bool m_FlipSubmitY = false;
+        uint32_t m_FlipSubmitYFamily = L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
+        int m_SwapProjectionEyesOption = -1;
+        bool m_SwapProjectionEyes = false;
+        bool m_UseRuntimeProjectionFov = false;
+        bool m_HaveLocatedFov = false;
+        XrFovf m_LocatedFov[L4D2VR_OPENXR_EYE_COUNT]{};
         char m_RuntimeName[XR_MAX_RUNTIME_NAME_SIZE]{};
         VkSampler m_BlitSampler = VK_NULL_HANDLE;
         VkRenderPass m_BlitRenderPass = VK_NULL_HANDLE;
@@ -8980,6 +9258,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         VkDescriptorPool m_BlitDescriptorPool = VK_NULL_HANDLE;
         VkPipelineLayout m_BlitPipelineLayout = VK_NULL_HANDLE;
         VkPipeline m_BlitPipeline = VK_NULL_HANDLE;
+        VkPipeline m_BlitPipelineFlipY = VK_NULL_HANDLE;
         std::array<VkDescriptorSet, kBlitDescriptorSetCount> m_BlitDescriptorSets{};
         HANDLE m_ParentProcess = nullptr;
         std::vector<XrViewConfigurationView> m_ViewConfigs;
@@ -9008,7 +9287,7 @@ int wmain(int argc, wchar_t** argv)
 
     log.Print("L4D2VR OpenXR Helper64 starting");
     log.Print("Log path: %s", Narrow(options.logPath).c_str());
-    log.Print("OpenXR projection eye swap: %s", options.swapProjectionEyes ? "enabled" : "disabled");
+    log.Print("OpenXR projection eye swap option: %s", FlipSubmitYOptionName(options.swapProjectionEyes));
     log.Print("OpenXR projection view-order swap: %s", options.swapProjectionViewOrder ? "enabled" : "disabled");
     log.Print("OpenXR projection horizontal mirror: %s", options.mirrorProjectionHorizontal ? "enabled" : "disabled");
     log.Print("OpenXR projection layer: %s", options.disableProjectionLayer ? "disabled" : "enabled");

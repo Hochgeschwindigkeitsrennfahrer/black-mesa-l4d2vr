@@ -65,6 +65,11 @@ ControllerPitchTilt=-35.0
 ControllerPitchTiltTouch=0
 ControllerPitchTiltIndex=0
 ControllerPitchTiltVive=-45.0
+# Touch aim origin sits ahead of grip. Extra ox pulls the gun back along
+# -forward (same as numpad 7/9). If you already saved 5.5 extras in
+# VR/viewmodel_offsets.txt for crowbar/glock/grenade, reset those (numpad 0)
+# or they will double with this default.
+ViewmodelPosOffsetXTouch=5.5
 
 # 0.91 was BM/L4D2 scale; user 2026-08-25: ~25% smaller than that → 0.68.
 # Crowbar forced to 1.0 in DME. Hands use VrHandsModelScale separately.
@@ -83,10 +88,14 @@ OpenXRHelperWaitReadySeconds=45
 # Default OpenXR locate-at-submit on a late eye image jitters when you turn
 # your head. SteamVR Motion Smoothing does not apply on this helper path.
 OpenXRHelperUseGameRenderPoseForProjection=true
-# auto = Y-flip the helper's Vulkan eye blit for SteamVR OpenXR (and Virtual
-# Desktop when its OpenXR dropdown is SteamVR). VDXR/Oculus stay unflipped.
-# true/false override. This is the swapchain blit, not the 2D menu capture.
+# auto = Y-flip only SteamVR + Quest Touch, using a vertex NDC Y-flip (not a
+# negative viewport — that made yellow bands on G2/SteamVR; UV 0/1 swap and
+# transfer-blit Y-swap did not change the Quest image). WMR/VDXR/Oculus and
+# G2-through-SteamVR stay unflipped. true/false override.
 OpenXRHelperFlipSubmitY=auto
+# auto = do not swap L/R images. SteamVR Quest fused without a swap; Link
+# duplication is not an L/R swap. true/false override.
+OpenXRHelperSwapProjectionEyes=auto
 
 # Compositor timing: true = L4D2VR app PostPresentHandoff (WaitGetPoses off the
 # Vulkan queue; ~90fps). false = runtime handoff (waiter WaitGetPoses ~110ms / ~20fps).
@@ -118,6 +127,9 @@ AntiAliasing=0
 # Motion / comfort
 Haptics=true
 HideCrosshair=true
+# Crossbow zoom: render this fraction of the HMD FOV (submit FOV unchanged,
+# so the picture magnifies). 0.28 ≈ HL2's 20°/75°. Range 0.08–1.
+ScopeZoomFovScale=0.28
 # World-space VR reticle on the aim ray. Off by default; true to show it.
 VrCrosshair=false
 # MatchHmdHz no longer caps fps_max at the headset rate (that was 90 on G2).
@@ -135,6 +147,9 @@ HideViewmodelArms=true
 VrHandsGlovesEnabled=true
 VrHandsModelScale=0.85
 # SteamVR glove local Rx,Ry,Rz. Yaw 180 points fingers with the controller.
+# Touch hands use aim orientation at the grip origin so a straight controller
+# is a straight hand (grip -Z follows the handle and points up). Add a
+# negative Rx here if a given headset still cocks the fingers up.
 VrHandsPoseRotationOffset=0,180,0
 # Negative Y lowers both hands in view (separate from weapon oz). Negative
 # Z is along aim (controller basis Z is -forward). -0.10 m is ~60% of a

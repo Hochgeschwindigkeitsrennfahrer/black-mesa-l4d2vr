@@ -99,6 +99,9 @@ namespace bmvr
     extern float g_ViewmodelPosOffsetX;
     extern float g_ViewmodelPosOffsetY;
     extern float g_ViewmodelPosOffsetZ;
+    // Touch OpenXR aim origin sits ahead of grip. Extra ox pulls the gun
+    // back along -forward (same as numpad 7/9). G2/Index/Vive stay 0.
+    extern float g_ViewmodelPosOffsetXTouch;
     extern float g_ViewmodelAngOffsetX;
     extern float g_ViewmodelAngOffsetY;
     extern float g_ViewmodelAngOffsetZ;
@@ -136,7 +139,9 @@ namespace bmvr
     // SteamVR vr_glove_*.glb on each controller (plan §4.3.2). Default on for
     // BM hybrid; L4D2VR sample ships gloves off / native IK on.
     extern bool g_VrHandsGlovesEnabled;
-    // Temporary: right HEV glove off while diagnosing grip/pistol. Left stays on.
+    // Temporary: right HEV glove off while holding a gun. Left stays on.
+    // Both hands still draw when inventory is empty (intro tram, after HEV
+    // before the first weapon).
     extern bool g_VrHandsRightEnabled;
     extern float g_VrHandsModelScale;
     // Debug boxes at each controller. Drawn if gloves are off, or if GLB draw
@@ -156,6 +161,10 @@ namespace bmvr
     // While scoped (crossbow), aim from the headset instead of the controller so
     // bolts land in the middle of the scope picture.
     extern bool g_ScopeUsesHmdAim;
+    // Stereo world FOV as a fraction of the HMD FOV while the crossbow is
+    // zoomed. Compositor / OpenXR submit keep the real HMD FOV, so the
+    // narrower render is magnified in the lenses. 0.28 ≈ 3.5× (HL2 20/75).
+    extern float g_ScopeZoomFovScale;
     // SteamVR glove local Rx,Ry,Rz (degrees) inside BuildControllerWorld.
     // Default yaw 180: OpenVR glove +Z is opposite Source controller forward,
     // which made the mesh point backward and clip the near plane (mostly invisible).
@@ -184,6 +193,10 @@ namespace bmvr
     extern float g_VrHandsRightGripRotZ;
     // Prefer ripped HEV GLBs in VR/hands when present.
     extern bool g_VrHandsUseHevGloves;
+    // True for this process when launched with -game bshift (or a bs_* map).
+    // Calhoun never wears the HEV suit — use bare-hand GLBs the whole session.
+    extern bool g_IsBlueShift;
+    bool IsBlueShift();
     // false = runtime PostPresentHandoff. true = L4D2VR app handoff (default).
     extern bool g_CompositorPostPresentHandoff;
     // Old stereo vis workaround: r_portalsopenall + r_occlusion 0. Default

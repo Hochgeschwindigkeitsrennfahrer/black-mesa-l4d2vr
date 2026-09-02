@@ -1677,8 +1677,9 @@ namespace
         // is not 16:9-projected into a ~1.1 HMD buffer (tall grip, short slide).
         const float rtAspect = static_cast<float>(eyeWidth) / static_cast<float>(eyeHeight);
         view.m_flAspectRatio = rtAspect;
-        view.fov = vr->m_Fov;
-        view.fovViewmodel = vr->m_Fov;
+        const float eyeFov = vr->WorldRenderFov();
+        view.fov = eyeFov;
+        view.fovViewmodel = eyeFov;
         // L4D2VR: native Source viewmodels use a separate projection and a
         // compressed 0..0.1 depth range so they draw over the world. In VR the
         // gun is a world-space mesh; keep Z (and therefore size vs world
@@ -1730,7 +1731,9 @@ namespace
         if (AuxSceneRtBound() && !RtStackTopIsWorldScene()
             && !Hooks::m_VR->D3dRt0IsEyeSized())
             return false;
-        if (!Hooks::m_VR->StereoEyeBlitActive() && Hooks::m_VR->m_StereoEye == 0)
+        const bool stereo = Hooks::m_VR->StereoEyeBlitActive() || Hooks::m_VR->m_StereoEye != 0;
+        if (!stereo && !Hooks::m_VR->CachedRt0MatchesEyes()
+            && !Hooks::m_VR->D3dRt0IsEyeSized())
             return false;
         const int eyeW = static_cast<int>(Hooks::m_VR->m_RenderWidth);
         const int eyeH = static_cast<int>(Hooks::m_VR->m_RenderHeight);
@@ -1848,15 +1851,126 @@ namespace
             && std::abs(h - static_cast<int>(winH)) <= 32;
     }
 
-    bool StereoWorldOverlayActive()
+    bool StereoEyeWorldActive()
     {
         if (!Hooks::m_VR || !bmvr::OffscreenWorldMatchesEyes())
             return false;
         if (Hooks::m_VR->HudPaintActive() || Hooks::m_VR->m_CaptureReentry)
             return false;
-        if (!Hooks::m_VR->StereoEyeBlitActive() && Hooks::m_VR->m_StereoEye == 0)
+        return Hooks::m_VR->StereoEyeBlitActive() || Hooks::m_VR->m_StereoEye != 0;
+    }
+
+    bool OffscreenEyePassActive()
+    {
+        if (!Hooks::m_VR || !bmvr::OffscreenWorldMatchesEyes())
             return false;
-        return Hooks::m_VR->CachedRt0MatchesEyes();
+        if (Hooks::m_VR->HudPaintActive() || Hooks::m_VR->m_CaptureReentry)
+            return false;
+        return StereoEyeWorldActive() || Hooks::m_VR->IsGameplayEligible();
+    }
+
+    bool LooksLikeWindowExtent(int w, int h)
+    {
+        return w >= 640 && h >= 360 && MatchesWindowClientSize(w, h);
+    }
+
+    bool LooksLikeWindowUv(float x0, float y0, float x1, float y1)
+    {
+        const int uw = static_cast<int>(std::fabs(x1 - x0) + 0.5f);
+        const int uh = static_cast<int>(std::fabs(y1 - y0) + 0.5f);
+        return LooksLikeWindowExtent(uw, uh)
+            || LooksLikeWindowExtent(uw + 1, uh + 1);
+    }
+
+    bool HudScreenspaceMaterial(const char* name)
+    {
+        if (!name || !name[0])
+            return false;
+        return std::strstr(name, "hud") != nullptr
+            || std::strstr(name, "Hud") != nullptr
+            || std::strstr(name, "HUD") != nullptr;
+    }
+
+    bool DestLooksLikeRefractCopy(const char* name)
+    {
+        if (!name || !name[0])
+            return false;
+        return std::strstr(name, "poweroftwo") != nullptr
+            || std::strstr(name, "PowerOfTwo") != nullptr
+            || std::strstr(name, "SmallFB") != nullptr
+            || std::strstr(name, "smallfb") != nullptr
+            || std::strstr(name, "_rt_Power") != nullptr
+            || std::strstr(name, "_rt_Small") != nullptr;
+    }
+
+    bool SrcLooksLikePowerOfTwoFb(int srcW, int srcH, int eyeW, int eyeH)
+    {
+        if (srcW < 256 || srcH < 256 || srcW > 2048 || srcH > 2048)
+            return false;
+        if (srcW != srcH)
+            return false;
+        if (eyeW >= 640 && srcW + 32 >= eyeW)
+            return false;
+        return true;
+    }
+
+    // Stereo-eye bloom (engine_post + downsample/blur pyramid). Verified
+    // 2026-09-03: cafeteria fluorescent copies + table stamp. Dest=eye,
+    // Viewport rewrite, DoEnginePost eye w/h, and growing _rt_Small*FB* to
+    // eye/N all failed (ghosts stayed, or the whole image zoomed/warped with
+    // head movement). Keep the rest of post (bms_postprocess / xog / DOF /
+    // god rays).
+    bool StereoBloomMaterial(const char* name)
+    {
+        if (!name || !name[0])
+            return false;
+        if (std::strstr(name, "hud") || std::strstr(name, "Hud") || std::strstr(name, "HUD"))
+            return false;
+        return std::strstr(name, "engine_post") != nullptr
+            || std::strstr(name, "lumcompare") != nullptr
+            || std::strstr(name, "downsample") != nullptr
+            || std::strstr(name, "blurfilter") != nullptr
+            || std::strstr(name, "blur_combine") != nullptr;
+    }
+
+    bool QueryTextureSize(ITexture* texture, int& w, int& h)
+    {
+        w = 0;
+        h = 0;
+        if (!texture)
+            return false;
+        __try
+        {
+            w = texture->GetActualWidth();
+            h = texture->GetActualHeight();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            w = h = 0;
+        }
+        return w > 0 && h > 0;
+    }
+
+    bool QueryContextColorRtSize(void* ctx, int& w, int& h, const char** nameOut)
+    {
+        w = 0;
+        h = 0;
+        if (nameOut)
+            *nameOut = "";
+        if (!ctx || !Hooks::hkGetRenderTarget.fOriginal)
+            return false;
+        ITexture* rt = nullptr;
+        __try
+        {
+            rt = Hooks::hkGetRenderTarget.fOriginal(ctx);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            rt = nullptr;
+        }
+        if (nameOut)
+            *nameOut = SafeTextureName(rt);
+        return QueryTextureSize(rt, w, h);
     }
 
     void BindStereoPushToEye(ITexture*& pTexture, ITexture*& pDepthTexture, int& nViewX, int& nViewY, int& nViewW, int& nViewH, bool& redirected)
@@ -2179,6 +2293,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 setup.width, setup.height, setup.fov, setup.zNear);
             ++s_enterLog;
         }
+        m_VR->NoteEngineScopeFov(setup.fov);
         CViewSetup leftEyeView = setup;
         CViewSetup rightEyeView = setup;
         NormalizeViewSetupForVREye(leftEyeView, m_VR);
@@ -2232,6 +2347,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         g_Cost.eye = 1;
         m_VR->m_StereoEye = 1;
         m_VR->BeginStereoEyeBlit(m_VR->m_D9LeftEyeSurface);
+        m_VR->ClearStereoEyeSurfaces();
         {
             const int eyeDraw = whatToDraw & ~kRenderViewDrawHud;
             const long long t0 = QpcNow();
@@ -2262,6 +2378,13 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                         m_VR->m_D9LeftEyeSurface, true);
                 g_Cost.blitTicks += QpcNow() - t0;
             }
+            else
+            {
+                // keepNative skips StretchRect, so the blit-path flush never
+                // runs. Left still shares FullFrame with the coming right
+                // RenderView on DXVK async; wait before the right eye starts.
+                m_VR->FlushStereoBlitGpu();
+            }
             if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud
                 || m_VR->WeaponMenuOpen() || m_VR->AimCrosshairVisible())
             {
@@ -2280,6 +2403,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         g_Cost.eye = 2;
         m_VR->m_StereoEye = 2;
         m_VR->BeginStereoEyeBlit(m_VR->m_D9RightEyeSurface);
+        m_VR->ClearStereoEyeSurfaces();
         {
             const int eyeDraw = whatToDraw & ~kRenderViewDrawHud;
             const long long t0 = QpcNow();
@@ -2644,7 +2768,7 @@ float __fastcall Hooks::dGetViewModelFOV(void* ecx, void* edx)
 {
     (void)edx;
     if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible() && EngineInGame() && m_VR->m_Fov > 10.f)
-        return m_VR->m_Fov;
+        return m_VR->WorldRenderFov();
     if (hkGetViewModelFOV.fOriginal)
         return hkGetViewModelFOV.fOriginal(ecx);
     return 54.f;
@@ -3047,6 +3171,10 @@ void __fastcall Hooks::dPushRenderTargetAndViewport(void* ecx, void* edx, ITextu
     }
     if (hkPushRenderTargetAndViewport.fOriginal)
         hkPushRenderTargetAndViewport.fOriginal(ecx, pTexture, pDepthTexture, nViewX, nViewY, nViewW, nViewH);
+    if (m_VR && !m_VR->HudPaintActive() && nViewW > 0 && nViewH > 0
+        && static_cast<UINT>(nViewW) == m_VR->m_RenderWidth
+        && static_cast<UINT>(nViewH) == m_VR->m_RenderHeight)
+        m_VR->NoteCachedRt0Size(static_cast<UINT>(nViewW), static_cast<UINT>(nViewH));
 }
 
 void __fastcall Hooks::dPopRenderTargetAndViewport(void* ecx, void* edx)
@@ -3070,18 +3198,43 @@ void __fastcall Hooks::dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial
     const int origH = height;
     const int origSrcW = srcWidth;
     const int origSrcH = srcHeight;
-    int expanded = 0;
-    if (StereoWorldOverlayActive() && destX <= 16 && destY <= 16
-        && MatchesWindowClientSize(width, height))
+    int rtW = 0;
+    int rtH = 0;
+    QueryContextColorRtSize(ecx, rtW, rtH, nullptr);
+    const int eyeW = m_VR ? static_cast<int>(m_VR->m_RenderWidth) : 0;
+    const int eyeH = m_VR ? static_cast<int>(m_VR->m_RenderHeight) : 0;
+    const char* matName = SafeMaterialName(material);
+    const bool windowDest = destX <= 16 && destY <= 16 && LooksLikeWindowExtent(width, height);
+    const bool windowUv = LooksLikeWindowUv(srcX0, srcY0, srcX1, srcY1);
+    const bool potSrc = SrcLooksLikePowerOfTwoFb(srcWidth, srcHeight, eyeW, eyeH);
+    if (StereoEyeWorldActive() && StereoBloomMaterial(matName))
     {
-        const int eyeW = static_cast<int>(m_VR->m_RenderWidth);
-        const int eyeH = static_cast<int>(m_VR->m_RenderHeight);
+        static int s_skipBloom;
+        if (s_skipBloom < 12)
+        {
+            Game::logMsg("DSSR skip bloom %s dest=%dx%d src=%dx%d stereo=1",
+                matName, width, height, srcWidth, srcHeight);
+            ++s_skipBloom;
+        }
+        return;
+    }
+    int expanded = 0;
+    if (OffscreenEyePassActive() && (windowDest || windowUv)
+        && !HudScreenspaceMaterial(matName) && !potSrc && eyeW >= 640)
+    {
         destX = 0;
         destY = 0;
         width = eyeW;
         height = eyeH;
         expanded = 1;
-        if (MatchesWindowClientSize(srcWidth, srcHeight) && origSrcW > 0 && origSrcH > 0)
+        if (windowUv && origSrcW >= eyeW - 32 && origSrcH >= eyeH - 32)
+        {
+            srcX0 = 0.f;
+            srcY0 = 0.f;
+            srcX1 = static_cast<float>(origSrcW) - 1.f;
+            srcY1 = static_cast<float>(origSrcH) - 1.f;
+        }
+        else if (LooksLikeWindowExtent(origSrcW, origSrcH) && origSrcW > 0 && origSrcH > 0)
         {
             const float sx = static_cast<float>(eyeW) / static_cast<float>(origSrcW);
             const float sy = static_cast<float>(eyeH) / static_cast<float>(origSrcH);
@@ -3094,9 +3247,9 @@ void __fastcall Hooks::dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial
         }
     }
     static int s_dssrLog;
+    static int s_stereoDssrLog;
     static char s_seen[24][80];
     static int s_seenN;
-    const char* matName = SafeMaterialName(material);
     bool seen = false;
     for (int i = 0; i < s_seenN; ++i)
     {
@@ -3106,13 +3259,19 @@ void __fastcall Hooks::dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial
             break;
         }
     }
-    if ((!seen && s_seenN < 24) || s_dssrLog < 12)
+    const bool logDssr = (!seen && s_seenN < 24) || s_dssrLog < 12
+        || (StereoEyeWorldActive() && s_stereoDssrLog < 16)
+        || (OffscreenEyePassActive() && (windowDest || windowUv || expanded) && s_stereoDssrLog < 16);
+    if (logDssr)
     {
-        Game::logMsg("DSSR %s dest=%d,%d %dx%d src=%dx%d uv=(%.1f,%.1f)-(%.1f,%.1f) expand=%d rt0eye=%d",
+        Game::logMsg("DSSR %s dest=%d,%d %dx%d src=%dx%d uv=(%.1f,%.1f)-(%.1f,%.1f) expand=%d rt=%dx%d rt0eye=%d",
             matName, origX, origY, origW, origH, origSrcW, origSrcH,
-            srcX0, srcY0, srcX1, srcY1, expanded,
+            srcX0, srcY0, srcX1, srcY1, expanded, rtW, rtH,
             (m_VR && m_VR->CachedRt0MatchesEyes()) ? 1 : 0);
         ++s_dssrLog;
+        if (StereoEyeWorldActive()
+            || (OffscreenEyePassActive() && (windowDest || windowUv || expanded)))
+            ++s_stereoDssrLog;
         if (!seen && s_seenN < 24)
         {
             std::strncpy(s_seen[s_seenN], matName, 79);
@@ -3130,50 +3289,72 @@ void __fastcall Hooks::dCopyRenderTargetToTextureEx(void* ecx, void* edx, ITextu
 {
     (void)edx;
     SourceRect_t expanded{};
+    SourceRect_t expandedDst{};
     int destW = 0;
     int destH = 0;
-    if (texture)
-    {
-        __try
-        {
-            destW = texture->GetActualWidth();
-            destH = texture->GetActualHeight();
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            destW = destH = 0;
-        }
-    }
-    int grew = 0;
-    if (srcRect && StereoWorldOverlayActive()
+    QueryTextureSize(texture, destW, destH);
+    int srcW = 0;
+    int srcH = 0;
+    const char* srcName = "";
+    QueryContextColorRtSize(ecx, srcW, srcH, &srcName);
+    const int eyeW = m_VR ? static_cast<int>(m_VR->m_RenderWidth) : 0;
+    const int eyeH = m_VR ? static_cast<int>(m_VR->m_RenderHeight) : 0;
+    const bool destWindow = destW >= 640 && destH >= 360
+        && MatchesWindowClientSize(destW, destH);
+    const bool windowSrc = srcRect
         && srcRect->x <= 16 && srcRect->y <= 16
-        && MatchesWindowClientSize(srcRect->width, srcRect->height))
+        && MatchesWindowClientSize(srcRect->width, srcRect->height);
+    bool srcEye = eyeW >= 640 && srcW == eyeW && srcH == eyeH;
+    if (!srcEye && m_VR && m_VR->CachedRt0MatchesEyes())
+        srcEye = true;
+    if (!srcEye && OffscreenEyePassActive() && m_VR->D3dRt0IsEyeSized())
+        srcEye = true;
+    const bool destEye = eyeW >= 640 && destW == eyeW && destH == eyeH;
+    // GetRT is often null. A window srcRect into an eye-sized FullFrame is
+    // the 16:9 stamp (log: destTex=2656x2592 srcRect=2560x1440).
+    if (!srcEye && destEye && OffscreenEyePassActive())
+        srcEye = true;
+    int grew = 0;
+    if (srcRect && windowSrc && !destWindow && srcEye && OffscreenEyePassActive())
     {
-        const bool destWindow = destW >= 640 && destH >= 360
-            && MatchesWindowClientSize(destW, destH);
-        if (!destWindow)
-        {
-            expanded.x = 0;
-            expanded.y = 0;
-            expanded.width = static_cast<int>(m_VR->m_RenderWidth);
-            expanded.height = static_cast<int>(m_VR->m_RenderHeight);
-            srcRect = &expanded;
-            grew = 1;
-        }
+        expanded.x = 0;
+        expanded.y = 0;
+        expanded.width = eyeW;
+        expanded.height = eyeH;
+        srcRect = &expanded;
+        grew = 1;
+    }
+    if (dstRect && destEye && OffscreenEyePassActive()
+        && dstRect->x <= 16 && dstRect->y <= 16
+        && MatchesWindowClientSize(dstRect->width, dstRect->height))
+    {
+        expandedDst.x = 0;
+        expandedDst.y = 0;
+        expandedDst.width = eyeW;
+        expandedDst.height = eyeH;
+        dstRect = &expandedDst;
+        grew = 1;
     }
     static int s_copyLog;
-    if (s_copyLog < 16)
+    static int s_stereoCopyLog;
+    const bool logCopy = s_copyLog < 16
+        || (StereoEyeWorldActive() && s_stereoCopyLog < 12);
+    if (logCopy)
     {
-        Game::logMsg("CopyRTEx %s src=%s destTex=%dx%d grew=%d",
+        Game::logMsg("CopyRTEx %s src=%s srcTex=%s %dx%d destTex=%dx%d grew=%d stereo=%d refract=%d",
             SafeTextureName(texture),
             srcRect ? "rect" : "null",
-            destW, destH, grew);
+            srcName, srcW, srcH, destW, destH, grew,
+            StereoEyeWorldActive() ? 1 : 0,
+            DestLooksLikeRefractCopy(SafeTextureName(texture)) ? 1 : 0);
         if (srcRect)
         {
             Game::logMsg("CopyRTEx srcRect=%d,%d %dx%d",
                 srcRect->x, srcRect->y, srcRect->width, srcRect->height);
         }
         ++s_copyLog;
+        if (StereoEyeWorldActive())
+            ++s_stereoCopyLog;
     }
     if (hkCopyRenderTargetToTextureEx.fOriginal)
         hkCopyRenderTargetToTextureEx.fOriginal(ecx, texture, renderTargetId, srcRect, dstRect);
@@ -4023,8 +4204,18 @@ void __fastcall Hooks::dGetScreenSize(void* ecx, void* edx, int& width, int& hei
             return;
         }
     }
+    const int origW = width;
+    const int origH = height;
     if (OffscreenStereoSizeLie(width, height))
+    {
+        static int s_ssLie;
+        if (s_ssLie < 8 && (origW != width || origH != height))
+        {
+            Game::logMsg("GetScreenSize %dx%d -> %dx%d (eye RT)", origW, origH, width, height);
+            ++s_ssLie;
+        }
         return;
+    }
     if (bmvr::TryHmdFitFullFrame()
         && m_VR && !NestedRenderView() && !AuxSceneRtBound()
         && (m_VR->StereoEyeBlitActive() || m_VR->m_StereoEye != 0)

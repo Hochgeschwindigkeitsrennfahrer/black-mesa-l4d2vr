@@ -7,7 +7,8 @@
 struct OpenXrHelperLaunchConfig
 {
     bool enabled = false;
-    bool swapProjectionEyes = false;
+    // -1 auto (Oculus/Meta OpenXR), 0 off, 1 on.
+    int swapProjectionEyes = -1;
     bool swapProjectionViewOrder = false;
     bool mirrorProjectionHorizontal = false;
     bool swapGameEyeOrigins = false;

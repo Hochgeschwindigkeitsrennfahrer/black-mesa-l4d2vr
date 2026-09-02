@@ -36,6 +36,7 @@ namespace
     using tSetShaderConstantF = HRESULT(__stdcall*)(IDirect3DDevice9*, UINT, const float*, UINT);
     using tStretchRect = HRESULT(__stdcall*)(IDirect3DDevice9*, IDirect3DSurface9*, const RECT*,
         IDirect3DSurface9*, const RECT*, D3DTEXTUREFILTERTYPE);
+    using tClear = HRESULT(__stdcall*)(IDirect3DDevice9*, DWORD, const D3DRECT*, DWORD, D3DCOLOR, float, DWORD);
     tPresent g_OrigPresent = nullptr;
     tSetRenderTarget g_OrigSetRenderTarget = nullptr;
     tSetDepthStencil g_OrigSetDepthStencil = nullptr;
@@ -44,15 +45,17 @@ namespace
     tSetShaderConstantF g_OrigSetVertexShaderConstantF = nullptr;
     tSetShaderConstantF g_OrigSetPixelShaderConstantF = nullptr;
     tStretchRect g_OrigStretchRect = nullptr;
+    tClear g_OrigClear = nullptr;
     UINT g_Rt0W = 0;
     UINT g_Rt0H = 0;
     bool g_DeviceHooksEnabled = false;
     BmVrGloves g_VrGloves;
 
     constexpr UINT kIDirect3DDevice9_Present = 17;
+    constexpr UINT kIDirect3DDevice9_StretchRect = 34;
     constexpr UINT kIDirect3DDevice9_SetRenderTarget = 37;
     constexpr UINT kIDirect3DDevice9_SetDepthStencilSurface = 39;
-    constexpr UINT kIDirect3DDevice9_StretchRect = 34;
+    constexpr UINT kIDirect3DDevice9_Clear = 43;
     constexpr UINT kIDirect3DDevice9_SetViewport = 47;
     constexpr UINT kIDirect3DDevice9_SetScissorRect = 75;
     constexpr UINT kIDirect3DDevice9_SetVertexShaderConstantF = 94;
@@ -721,6 +724,66 @@ namespace
         if (!g_OrigSetScissorRect)
             return D3DERR_INVALIDCALL;
         return g_OrigSetScissorRect(device, use);
+    }
+
+    // Engine ClearBuffers uses the 16:9 CViewSetup viewport/rect even after we
+    // grow the RT to the square eye. NULL-rect Clear then only wipes that band,
+    // so leftover pixels trail with the HMD. Expand the viewport/rect; do not
+    // add TARGET — that would black-clear between sky and world.
+    HRESULT __stdcall HookedClear(IDirect3DDevice9* device, DWORD count, const D3DRECT* rects,
+        DWORD flags, D3DCOLOR color, float z, DWORD stencil)
+    {
+        VR* vr = (g_Game && g_Game->m_VR) ? g_Game->m_VR : nullptr;
+        D3DRECT full{};
+        const D3DRECT* useRects = rects;
+        DWORD useCount = count;
+        if (device && vr && ShouldExpandWindowVpOnWorldRt(device, vr))
+        {
+            D3DVIEWPORT9 vp{};
+            if (g_OrigSetViewport && SUCCEEDED(device->GetViewport(&vp))
+                && ViewportMatchesWindow(vp.Width, vp.Height))
+            {
+                D3DVIEWPORT9 eye = vp;
+                eye.X = 0;
+                eye.Y = 0;
+                eye.Width = vr->m_RenderWidth;
+                eye.Height = vr->m_RenderHeight;
+                g_OrigSetViewport(device, &eye);
+                static int s_clrVp;
+                if (s_clrVp < 8)
+                {
+                    Game::logMsg("D3D Clear expand viewport %ux%u -> %ux%u flags=0x%X",
+                        vp.Width, vp.Height, eye.Width, eye.Height, flags);
+                    ++s_clrVp;
+                }
+            }
+            if (rects && count >= 1)
+            {
+                const LONG w = rects[0].x2 - rects[0].x1;
+                const LONG h = rects[0].y2 - rects[0].y1;
+                if (rects[0].x1 <= 16 && rects[0].y1 <= 16
+                    && w > 0 && h > 0
+                    && ViewportMatchesWindow(static_cast<UINT>(w), static_cast<UINT>(h)))
+                {
+                    full.x1 = 0;
+                    full.y1 = 0;
+                    full.x2 = static_cast<LONG>(vr->m_RenderWidth);
+                    full.y2 = static_cast<LONG>(vr->m_RenderHeight);
+                    useRects = &full;
+                    useCount = 1;
+                    static int s_clrRect;
+                    if (s_clrRect < 8)
+                    {
+                        Game::logMsg("D3D Clear expand rect %ldx%ld -> %ux%u flags=0x%X",
+                            w, h, vr->m_RenderWidth, vr->m_RenderHeight, flags);
+                        ++s_clrRect;
+                    }
+                }
+            }
+        }
+        if (!g_OrigClear)
+            return D3DERR_INVALIDCALL;
+        return g_OrigClear(device, useCount, useRects, flags, color, z, stencil);
     }
 
     HRESULT __stdcall HookedStretchRect(IDirect3DDevice9* device, IDirect3DSurface9* pSource,
@@ -2442,29 +2505,34 @@ void VR::ProcessInput()
     m_HasHevSuit = !bmvr::g_HideHandsWithoutSuit || m_WearingHevSuit;
     const bool scopedWeapon = IsScopedWeaponModel(m_LastViewmodelModel.c_str());
     const bool rpgWeapon = IsRpgWeaponModel(m_LastViewmodelModel.c_str());
-    const bool secondaryHeld = !paused && PressedDigitalAction(m_ActionSecondaryAttack);
-    if (!paused && scopedWeapon && PressedDigitalAction(m_ActionSecondaryAttack, true))
-        m_CrossbowZoomLatched = !m_CrossbowZoomLatched;
     if (!scopedWeapon)
         m_CrossbowZoomLatched = false;
     if (!paused && rpgWeapon && PressedDigitalAction(m_ActionSecondaryAttack, true))
         m_RpgLaserLatched = !m_RpgLaserLatched;
     if (!rpgWeapon)
         m_RpgLaserLatched = false;
-    // Netvar is the toggle source. Secondary-held covers hold-to-zoom. The
-    // press-edge latch covers a failed m_bZooming scan on HL2-style toggle zoom.
+    // One source of truth. OR-ing netvar, a software latch, and "secondary
+    // held" desynced from the engine's own toggle: once any one stayed 1,
+    // WorldRenderFov never dropped. Hold-to-zoom is wrong for HL2-style tap
+    // zoom (the unscope press would keep FOV narrow while the button is down).
+    const int zoomFlag = scopedWeapon ? m_Game->LocalPlayerZoomFlag() : 0;
+    if (!paused && scopedWeapon && zoomFlag < 0
+        && PressedDigitalAction(m_ActionSecondaryAttack, true))
+        m_CrossbowZoomLatched = !m_CrossbowZoomLatched;
+    if (zoomFlag >= 0)
+        m_CrossbowZoomLatched = (zoomFlag == 1);
     m_ScopeZoomActive = bmvr::g_ScopeUsesHmdAim && scopedWeapon
-        && (m_Game->LocalPlayerZooming() || m_CrossbowZoomLatched || secondaryHeld);
+        && (zoomFlag == 1 || (zoomFlag < 0 && m_CrossbowZoomLatched));
     {
         static int s_zoomLog;
         static bool s_lastZoom = false;
-        if (m_ScopeZoomActive != s_lastZoom && s_zoomLog < 12)
+        if (m_ScopeZoomActive != s_lastZoom && s_zoomLog < 16)
         {
-            Game::logMsg("Crossbow zoom %s netvar=%d latch=%d held=%d",
+            Game::logMsg("Crossbow zoom %s netvar=%d latch=%d fov=%.1f->%.1f",
                 m_ScopeZoomActive ? "on" : "off",
-                m_Game->LocalPlayerZooming() ? 1 : 0,
+                zoomFlag,
                 m_CrossbowZoomLatched ? 1 : 0,
-                secondaryHeld ? 1 : 0);
+                m_Fov, WorldRenderFov());
             s_lastZoom = m_ScopeZoomActive;
             ++s_zoomLog;
         }
@@ -2577,6 +2645,7 @@ void VR::ProcessInput()
         m_EmptyHands = false;
         Game::logMsg("PrevItem queued on CreateMove (weaponselect, not invprev)");
     }
+    RefreshHeldWeaponState();
     if (pauseHeld && !s_pause)
     {
         Game::logMsg("Pause action edge paused=%d handle=%llu",
@@ -3472,6 +3541,7 @@ void VR::UpdateCrowbarMelee()
     {
         m_PerformingMelee = false;
         m_MeleeBladeAnglesValid = false;
+        m_PrevMeleeSampleMs = 0;
         return;
     }
 
@@ -3495,6 +3565,7 @@ void VR::UpdateCrowbarMelee()
         m_PrevControllerPosAbs = curPos;
         m_PerformingMelee = false;
         m_MeleeBladeAnglesValid = false;
+        m_PrevMeleeSampleMs = 0;
         return;
     }
 
@@ -3511,10 +3582,10 @@ void VR::UpdateCrowbarMelee()
     // (the 0.35 m lever turns a small flick into >1 m/s). The return stroke
     // toward the face also used to fire — that one accidentally pointed the
     // engine trace nearer the target, which is why a back-flick "worked".
-    constexpr float kSwingOnMs = 2.4f;
-    constexpr float kSwingOffMs = 1.2f;
-    constexpr DWORD kSwingCooldownMs = 450;
-    constexpr DWORD kAttackPulseMs = 120;
+    constexpr float kSwingOnMs = 1.5f;
+    constexpr float kSwingOffMs = 0.8f;
+    constexpr DWORD kSwingCooldownMs = 400;
+    constexpr DWORD kAttackPulseMs = 180;
 
     Vector body = m_SetupOrigin;
     if (body.LengthSqr() <= 1.f && m_HasStereoBodyOrigin)
@@ -3527,24 +3598,38 @@ void VR::UpdateCrowbarMelee()
     if (VectorNormalize(awayFromHead) <= 0.01f)
         awayFromHead = motion;
     // Forward/outward strike only. A recovery flick toward the headset has a
-    // negative dot and must not count.
-    const bool isStrike = motionHu > 0.08f && motion.Dot(awayFromHead) > 0.25f;
+    // negative dot and must not count. Require "not toward the face", not a
+    // strongly radial shove — a baseball slash is mostly tangential.
+    const bool isStrike = motionHu > 0.08f && motion.Dot(awayFromHead) > 0.f;
 
     const bool heldSwing = !m_MeleeNewSwing || attackWindow;
     const float onMs = heldSwing ? kSwingOffMs : kSwingOnMs;
-    const bool swinging = speedMs > onMs && isStrike;
+    DWORD nowMs = GetTickCount();
+    float derivedMs = 0.f;
+    if (m_PrevMeleeSampleMs != 0 && nowMs > m_PrevMeleeSampleMs && m_VRScale > 1.f)
+    {
+        float dt = static_cast<float>(nowMs - m_PrevMeleeSampleMs) * 0.001f;
+        if (dt < 0.004f)
+            dt = 0.004f;
+        if (dt > 0.08f)
+            dt = 0.08f;
+        derivedMs = (motionHu / m_VRScale) / dt;
+    }
+    m_PrevMeleeSampleMs = nowMs;
+    const float speed = (std::max)(speedMs, derivedMs);
+    const bool swinging = speed > onMs && isStrike;
 
     {
         static float s_peakLinear = 0.f;
         static DWORD s_peakLogMs = 0;
         const DWORD nowMs = GetTickCount();
-        s_peakLinear = (std::max)(s_peakLinear, speedMs);
+        s_peakLinear = (std::max)(s_peakLinear, speed);
         if (s_peakLogMs == 0)
             s_peakLogMs = nowMs;
         else if (nowMs - s_peakLogMs >= 5000)
         {
-            Game::logMsg("Crowbar swing peak linear=%.2f m/s over 5s (on=%.2f off=%.2f)",
-                s_peakLinear, kSwingOnMs, kSwingOffMs);
+            Game::logMsg("Crowbar swing peak linear=%.2f m/s (pose=%.2f derived=%.2f) over 5s (on=%.2f off=%.2f)",
+                s_peakLinear, speedMs, derivedMs, kSwingOnMs, kSwingOffMs);
             s_peakLinear = 0.f;
             s_peakLogMs = nowMs;
         }
@@ -3607,8 +3692,8 @@ void VR::UpdateCrowbarMelee()
         static int s_meleeLog;
         if (s_meleeLog < 12)
         {
-            Game::logMsg("Crowbar strike IN_ATTACK speed=%.2f origin=(%.1f,%.1f,%.1f) pitch=%.1f dir=(%.2f,%.2f,%.2f)",
-                speedMs, m_MeleeTraceOrigin.x, m_MeleeTraceOrigin.y, m_MeleeTraceOrigin.z,
+            Game::logMsg("Crowbar strike IN_ATTACK speed=%.2f pose=%.2f derived=%.2f origin=(%.1f,%.1f,%.1f) pitch=%.1f dir=(%.2f,%.2f,%.2f)",
+                speed, speedMs, derivedMs, m_MeleeTraceOrigin.x, m_MeleeTraceOrigin.y, m_MeleeTraceOrigin.z,
                 m_MeleeBladeAngles.x, dir.x, dir.y, dir.z);
             ++s_meleeLog;
         }
@@ -3854,6 +3939,14 @@ void VR::UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose)
     auto sampleRole = [&](vr::ETrackedControllerRole role, Sample& out) {
         sampleIndex(m_System->GetTrackedDeviceIndexForControllerRole(role), out);
     };
+    auto copyOrientation = [](const Sample& src, Sample& dst) {
+        if (!src.valid || !dst.valid)
+            return;
+        dst.ang = src.ang;
+        dst.fwd = src.fwd;
+        dst.right = src.right;
+        dst.up = src.up;
+    };
 
     Sample physLeft{};
     Sample physRight{};
@@ -3881,10 +3974,19 @@ void VR::UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose)
         weaponRight = physRight;
         if (L4D2VR_ControllerFamilyPrefersAimPose(family))
         {
+            // Touch grip -Z follows the handle, which points up relative to a
+            // straight controller. Keep the palm on the grip origin and point
+            // the mesh with the aim pose so hands match the controller body.
             if (aimLeft.valid)
+            {
                 weaponLeft = aimLeft;
+                copyOrientation(aimLeft, physLeft);
+            }
             if (aimRight.valid)
+            {
                 weaponRight = aimRight;
+                copyOrientation(aimRight, physRight);
+            }
         }
     }
     else
@@ -3933,6 +4035,31 @@ void VR::UpdateControllerTracking(const vr::TrackedDevicePose_t& hmdPose)
         }
         weaponLeft = physLeft;
         weaponRight = physRight;
+    }
+    // OpenXR samples are rebuilt from position/orientation only. Linear
+    // velocity was already differenced onto m_WaitedPoses[1]/[2]; without
+    // copying it here m_RightControllerSpeedMs stays 0 and crowbar melee
+    // never crosses the swing threshold.
+    if (m_OpenXrHelperBridgeActive)
+    {
+        vr::TrackedDevicePose_t waitedLeft{};
+        vr::TrackedDevicePose_t waitedRight{};
+        {
+            std::lock_guard<std::mutex> lock(m_PoseMutex);
+            waitedLeft = m_WaitedPoses[1];
+            waitedRight = m_WaitedPoses[2];
+        }
+        auto stampVel = [&](Sample& s) {
+            if (!s.valid || (s.idx != 1 && s.idx != 2))
+                return;
+            const vr::TrackedDevicePose_t& src = (s.idx == 1) ? waitedLeft : waitedRight;
+            s.pose.vVelocity = src.vVelocity;
+            s.pose.vAngularVelocity = src.vAngularVelocity;
+        };
+        stampVel(physLeft);
+        stampVel(physRight);
+        stampVel(weaponLeft);
+        stampVel(weaponRight);
     }
     m_ControllerFamily = family;
     const Sample& aim = (AimControllerRole() == vr::TrackedControllerRole_LeftHand) ? weaponLeft : weaponRight;
@@ -4857,6 +4984,19 @@ void VR::RefreshActiveWeaponModel()
         NoteViewmodelModel(name);
 }
 
+void VR::RefreshHeldWeaponState()
+{
+    bool held = false;
+    if (!m_EmptyHands && m_Game)
+    {
+        Game::InventoryWeapon first{};
+        held = m_Game->CollectInventoryWeapons(&first, 1) > 0;
+    }
+    if (held != m_HasHeldWeapon)
+        Game::logMsg("VR held weapon %s", held ? "yes" : "no");
+    m_HasHeldWeapon = held;
+}
+
 void VR::ApplyViewmodelBasisOffsets()
 {
     float ox = 0.f, oy = 0.f, oz = 0.f, ax = 0.f, ay = 0.f, az = 0.f;
@@ -4941,7 +5081,7 @@ void VR::ApplyTwoHandShotgunAim()
 void VR::GetRightGlovePalmOffsetMeters(Vector& meters) const
 {
     meters = Vector(0.f, 0.f, 0.f);
-    if (m_EmptyHands)
+    if (m_EmptyHands || !m_HasHeldWeapon)
         return;
     std::string model;
     {
@@ -4977,12 +5117,15 @@ void VR::GetRightGlovePalmOffsetMeters(Vector& meters) const
 
 bool VR::WantsRightGloveVisible() const
 {
-    return bmvr::g_VrHandsRightEnabled || m_EmptyHands;
+    // Right HEV glove stays off while a gun is out unless the flag is on.
+    // Intro tram, post-suit with no inventory yet, and weapon-menu empty
+    // hands all keep the right mesh up.
+    return bmvr::g_VrHandsRightEnabled || !m_HasHeldWeapon;
 }
 
 bool VR::WantsRightGloveWeaponGripCurl() const
 {
-    if (m_EmptyHands)
+    if (m_EmptyHands || !m_HasHeldWeapon)
         return false;
     std::string model;
     {
@@ -5261,9 +5404,11 @@ void VR::ResolveWeaponViewmodelPose(float& ox, float& oy, float& oz, float& ax, 
     ay = 0.f;
     az = 0.f;
     std::string model;
+    uint32_t family = L4D2VR_OPENXR_CONTROLLER_FAMILY_UNKNOWN;
     {
         std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
         model = m_LastViewmodelModel;
+        family = m_ControllerFamily;
     }
     if (!model.empty())
     {
@@ -5328,6 +5473,18 @@ void VR::ResolveWeaponViewmodelPose(float& ox, float& oy, float& oz, float& ax, 
     ox += bmvr::g_ViewmodelPosOffsetX;
     oy += bmvr::g_ViewmodelPosOffsetY;
     oz += bmvr::g_ViewmodelPosOffsetZ;
+    if (family == L4D2VR_OPENXR_CONTROLLER_FAMILY_TOUCH)
+    {
+        ox += bmvr::g_ViewmodelPosOffsetXTouch;
+        static bool s_loggedTouchOx;
+        if (!s_loggedTouchOx)
+        {
+            Game::logMsg(
+                "Touch viewmodel extra ox=%.1f (OpenXR aim origin is ahead of grip)",
+                bmvr::g_ViewmodelPosOffsetXTouch);
+            s_loggedTouchOx = true;
+        }
+    }
     ax += bmvr::g_ViewmodelAngOffsetX;
     ay += bmvr::g_ViewmodelAngOffsetY;
     az += bmvr::g_ViewmodelAngOffsetZ;
@@ -5410,13 +5567,15 @@ void VR::ApplyVrQualityOfLifeCvars()
         seti("r_visocclusion", 0);
         seti("r_portalsopenall", 0);
     }
-    // BM new-renderer CSM logged 8192x8192 (_rt_gbshadowmaprt) inside each
-    // stereo RenderView. Lowest quality + 2048 res + one shadow pass.
     // Do not touch r_flashlightdepthtexture — that broke deferred flashlight.
-    // Verified worse on bm_c2a5a (2026-08-28): cl_csm_enabled 0, nr_shadow_active
-    // 0, nr_dev_gb_debug_type 1 (GBuffer_Fast), r_lod 2. Best session so far was
-    // this block only (QoL 27 ok, csmQ=0). Undo the poisoned values so ARCHIVE
-    // / leftover bmvr.cfg writes do not stick.
+    // Do not write video-quality ARCHIVE cvars (cl_csm_qualitymode,
+    // nr_shadow_*, nr_lights_quality, r_shadowrendertotexture). The Surface
+    // Tension potato set (quality 0 / 2048 / one pass) was a perf experiment
+    // and it saved into config.cfg, so the video menu reset to Low every
+    // launch. Leave those to the user's video options.
+    // Verified unplayable on bm_c2a5a (2026-08-28): cl_csm_enabled 0,
+    // nr_shadow_active 0, nr_dev_gb_debug_type 1, r_lod 2. Keep those off
+    // so leftover ARCHIVE from that test cannot come back.
     seti("cl_csm_enabled", 1);
     seti("cl_csm_cascade_dynamic_ignore", 0);
     seti("nr_shadow_active", 1);
@@ -5439,14 +5598,6 @@ void VR::ApplyVrQualityOfLifeCvars()
     seti("nr_allow_hammer_nerfs_4ways", 0);
     seti("nr_gbuffer_for_refraction_enabled", 0);
     seti("r_WaterDrawRefraction", 0);
-    seti("cl_csm_qualitymode", 0);
-    seti("nr_shadow_quality", 0);
-    seti("nr_shadow_filter_quality", 0);
-    seti("nr_shadow_max_passes_per_frame", 1);
-    seti("nr_shadow_res", 2048);
-    seti("nr_lights_quality", 0);
-    seti("r_shadowrendertotexture", 0);
-    seti("r_shadowlod", 2);
     // Planar water used the HMD camera inside ViewDrawScene (not a nested
     // RenderView). Aux GetScreenSize skip was not enough. Cheap water instead
     // of a view-locked ghost world. BM new-renderer planar glass uses
@@ -5458,7 +5609,11 @@ void VR::ApplyVrQualityOfLifeCvars()
     seti("r_waterforcereflectentities", 0);
     seti("r_waterforceexpensive", 0);
     seti("nr_gbuffer_for_reflection_enabled", 0);
-    Game::logMsg("VR QoL cvars applied (%d ok) icvar=%p hideCrosshair=%d bobOff=%d forceOpenVis=%d blitFlush=%d csmQ=0 nrShadowRes=2048 waterrefl0",
+    // Undo the ghosting A/B that forced these to 0 (may have archived).
+    seti("np_gr_quality", 1);
+    setf("np_gr_weight", 1.f);
+    setf("np_gr_exposure", 1.f);
+    Game::logMsg("VR QoL cvars applied (%d ok) icvar=%p hideCrosshair=%d bobOff=%d forceOpenVis=%d blitFlush=%d waterrefl0 noVideoQualityOverride",
         n, m_Game->m_Cvar, bmvr::g_HideCrosshair ? 1 : 0, bmvr::g_DisableViewBob ? 1 : 0,
         bmvr::g_ForceOpenVis ? 1 : 0, bmvr::g_StereoBlitGpuFlush ? 1 : 0);
 }
@@ -5645,11 +5800,53 @@ void VR::TickCompositorFocus()
         ReclaimCompositorFocus("HMD active without scene focus");
 }
 
+void VR::NoteEngineScopeFov(float engineFov)
+{
+    m_EngineViewFov = engineFov;
+    if (!IsScopedWeaponModel(m_LastViewmodelModel.c_str()) || !bmvr::g_ScopeUsesHmdAim)
+        return;
+    // Black Mesa writes the 2D zoom FOV (~20) into CViewSetup. Once we have
+    // seen that, trust it to turn VR magnification off as well — a stuck
+    // m_bZooming / latch cannot keep the HMD zoomed after unscope.
+    if (engineFov > 10.f && engineFov < 45.f)
+    {
+        if (!m_SawEngineZoomFov)
+            Game::logMsg("Engine scope FOV %.1f — VR zoom will follow CViewSetup", engineFov);
+        m_SawEngineZoomFov = true;
+        m_ScopeZoomActive = true;
+        m_CrossbowZoomLatched = true;
+        return;
+    }
+    if (m_SawEngineZoomFov && engineFov >= 55.f)
+    {
+        if (m_ScopeZoomActive)
+            Game::logMsg("Engine unscoped FOV %.1f — dropping VR zoom", engineFov);
+        m_ScopeZoomActive = false;
+        m_CrossbowZoomLatched = false;
+    }
+}
+
+float VR::WorldRenderFov() const
+{
+    if (!m_ScopeZoomActive)
+        return m_Fov;
+    float scale = bmvr::g_ScopeZoomFovScale;
+    if (!(scale > 0.05f) || scale > 1.f)
+        scale = 0.28f;
+    float fov = m_Fov * scale;
+    if (fov < 15.f)
+        fov = 15.f;
+    if (fov > m_Fov)
+        fov = m_Fov;
+    return fov;
+}
+
 float VR::HorizontalFovForAspect(float targetAspect) const
 {
-    if (!(m_Fov > 10.f) || !(m_Aspect > 0.1f) || !(targetAspect > 0.1f))
-        return m_Fov;
-    const float halfRad = m_Fov * 0.5f * (3.14159265358979323846f / 180.0f);
+    const float srcFov = WorldRenderFov();
+    if (!(srcFov > 10.f) || !(m_Aspect > 0.1f) || !(targetAspect > 0.1f))
+        return srcFov;
+    const float halfRad = srcFov * 0.5f * (3.14159265358979323846f / 180.0f);
     const float tanHalfY = tanf(halfRad) / m_Aspect;
     return 2.0f * atanf(tanHalfY * targetAspect) * (180.0f / 3.14159265358979323846f);
 }
@@ -5921,6 +6118,12 @@ bool VR::CachedRt0MatchesEyes() const
         && g_Rt0W == m_RenderWidth && g_Rt0H == m_RenderHeight;
 }
 
+void VR::NoteCachedRt0Size(UINT w, UINT h)
+{
+    g_Rt0W = w;
+    g_Rt0H = h;
+}
+
 void VR::NoteMsaaEyeScene(IDirect3DSurface9* dst, bool copied)
 {
     if (!copied || !dst)
@@ -6065,6 +6268,11 @@ void VR::InstallDeviceHooks(IDirect3DDevice9* device)
         MH_EnableHook(vtbl[kIDirect3DDevice9_SetViewport]);
     if (g_OrigSetScissorRect)
         MH_EnableHook(vtbl[kIDirect3DDevice9_SetScissorRect]);
+    if (MH_CreateHook(vtbl[kIDirect3DDevice9_Clear], reinterpret_cast<LPVOID>(&HookedClear),
+            reinterpret_cast<LPVOID*>(&g_OrigClear)) == MH_OK)
+        MH_EnableHook(vtbl[kIDirect3DDevice9_Clear]);
+    else
+        g_OrigClear = nullptr;
     if (MH_CreateHook(vtbl[kIDirect3DDevice9_StretchRect],
             reinterpret_cast<LPVOID>(&HookedStretchRect),
             reinterpret_cast<LPVOID*>(&g_OrigStretchRect)) == MH_OK)
@@ -6086,7 +6294,7 @@ void VR::InstallDeviceHooks(IDirect3DDevice9* device)
 
     m_D3DHooksInstalled = true;
     g_DeviceHooksEnabled = true;
-    Game::logMsg("D3D9 Present + SetRenderTarget + SetDepthStencil + SetViewport + SetScissorRect + StretchRect + shaderConst hooks installed");
+    Game::logMsg("D3D9 Present + SetRenderTarget + SetDepthStencil + SetViewport + SetScissorRect + Clear + StretchRect + shaderConst hooks installed");
 }
 
 bool VR::EnsureFrameCopySurface(IDirect3DDevice9* device, uint32_t width, uint32_t height)
@@ -6792,6 +7000,102 @@ void VR::BeginStereoEyeBlit(IDirect3DSurface9* dst)
         m_RightEyeMsaaHasScene = false;
     m_StereoRedirectedToEye = false;
     m_StereoEyeBlitRank = 0;
+}
+
+void VR::ClearStereoEyeSurfaces()
+{
+    // Engine nClearFlags on stereo eyes is DEPTH|STENCIL only, and that clear
+    // still uses a 16:9 viewport/rect. Color in the extra square-eye pixels
+    // then stacks previous frusta as the HMD moves. Wipe the actual D3D eye
+    // surfaces at full HMD size before RenderView. Do not guess matsys vtable
+    // ClearBuffers (that produced hall-of-mirrors trails).
+    if (!g_D3DVR9 || !m_StereoEyeBlitDest || m_RenderWidth < 640 || m_RenderHeight < 360)
+        return;
+    IDirect3DDevice9* device = nullptr;
+    if (FAILED(g_D3DVR9->GetD3DDevice(&device)) || !device)
+        return;
+
+    IDirect3DSurface9* color = m_StereoEyeBlitDest;
+    IDirect3DSurface9* depth = nullptr;
+    if (color == m_D9LeftEyeSurface)
+        depth = m_D9LeftEyeDepthSurface;
+    else if (color == m_D9RightEyeSurface)
+        depth = m_D9RightEyeDepthSurface;
+
+    IDirect3DSurface9* oldRt = nullptr;
+    IDirect3DSurface9* oldDs = nullptr;
+    D3DVIEWPORT9 oldVp{};
+    device->GetRenderTarget(0, &oldRt);
+    device->GetDepthStencilSurface(&oldDs);
+    device->GetViewport(&oldVp);
+
+    const bool prevReentry = m_CaptureReentry;
+    m_CaptureReentry = true;
+    if (g_OrigSetRenderTarget)
+        g_OrigSetRenderTarget(device, 0, color);
+    else
+        device->SetRenderTarget(0, color);
+    if (depth)
+    {
+        if (g_OrigSetDepthStencil)
+            g_OrigSetDepthStencil(device, depth);
+        else
+            device->SetDepthStencilSurface(depth);
+    }
+
+    D3DVIEWPORT9 eyeVp{};
+    eyeVp.X = 0;
+    eyeVp.Y = 0;
+    eyeVp.Width = m_RenderWidth;
+    eyeVp.Height = m_RenderHeight;
+    eyeVp.MinZ = 0.f;
+    eyeVp.MaxZ = 1.f;
+    if (g_OrigSetViewport)
+        g_OrigSetViewport(device, &eyeVp);
+    else
+        device->SetViewport(&eyeVp);
+
+    DWORD flags = D3DCLEAR_TARGET;
+    if (depth)
+        flags |= D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL;
+    HRESULT hr = E_FAIL;
+    if (g_OrigClear)
+        hr = g_OrigClear(device, 0, nullptr, flags, D3DCOLOR_ARGB(0, 0, 0, 0), 1.f, 0);
+    else
+        hr = device->Clear(0, nullptr, flags, D3DCOLOR_ARGB(0, 0, 0, 0), 1.f, 0);
+
+    if (oldRt)
+    {
+        if (g_OrigSetRenderTarget)
+            g_OrigSetRenderTarget(device, 0, oldRt);
+        else
+            device->SetRenderTarget(0, oldRt);
+    }
+    if (oldDs)
+    {
+        if (g_OrigSetDepthStencil)
+            g_OrigSetDepthStencil(device, oldDs);
+        else
+            device->SetDepthStencilSurface(oldDs);
+    }
+    if (g_OrigSetViewport)
+        g_OrigSetViewport(device, &oldVp);
+    else
+        device->SetViewport(&oldVp);
+    m_CaptureReentry = prevReentry;
+    if (oldRt)
+        oldRt->Release();
+    if (oldDs)
+        oldDs->Release();
+
+    static int s_clr;
+    if (s_clr < 4)
+    {
+        Game::logMsg("D3D Clear stereo eye %ux%u depth=%d hr=0x%08X",
+            m_RenderWidth, m_RenderHeight, depth ? 1 : 0, (unsigned)hr);
+        ++s_clr;
+    }
+    device->Release();
 }
 
 bool VR::EndStereoEyeBlit()

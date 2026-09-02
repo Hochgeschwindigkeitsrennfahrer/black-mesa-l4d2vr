@@ -1,51 +1,23 @@
-Black Mesa VR — test drop-in (Quest 3 / Meta Link stereo)
-=========================================================
+Black Mesa VR — drop-in (2026-09-03)
+====================================
 
-Close Black Mesa first. Copy everything in this zip into the folder that
-already contains bms.exe. Merge / replace when Windows asks.
+Close Black Mesa first. Copy this folder into Steam\steamapps\common\Black Mesa
+so d3d9.dll lands in ALL three:
 
-KEEP your existing VR\config.txt if you already tuned it. Skip that one
-file when copying. You do not need StereoBlitGpuFlush or other config
-changes for this test.
+  Black Mesa\d3d9.dll
+  Black Mesa\bin\d3d9.dll
+  Black Mesa\bin\thirdparty\dxvk-windows-x86\d3d9.dll
 
-Quest 3 through Meta Link + SteamVR (this is the intended path):
-  1. Start Meta Link so the Quest is a PC headset.
-  2. In SteamVR: Settings → OpenXR → set SteamVR as the OpenXR runtime.
-     His last log had Oculus as ActiveRuntime. With SteamVR running on
-     top of that, SteamVR is a waiting-room display and the game talks
-     to Oculus instead. One runtime, then SteamVR, then the game.
-  3. Start SteamVR, then launch Black Mesa from Steam (-oldgameui required).
-  4. Load a real map. Menu-only is the same picture in both eyes by design.
+Keep a tuned VR\config.txt if you already have one.
 
-Confirm in bmvr_log.txt that ActiveRuntime points at SteamVR
-(steamxr_win32.json / steamxr_win64.json), not oculus_openxr_*.json.
-
-What this test is for:
-  Same image in both eyes / two separate displays while hands and headset
-  still track. This zip always GPU-waits the left-eye backbuffer copy, and
-  OpenXR menu/pause no longer applies IPD on a duplicated frame.
-
-Success: fused 3D in the headset after a map load.
-Not success: tracking only, or a picture that looks the same in both eyes.
-
-Each launch replaces bmvr_log.txt (it is not a history of old runs).
-After you quit, send the whole Black Mesa\bmvr_log.txt file. Attach the
-file; do not paste the first page into Discord.
-
-Also send VR\openxr_helper64\openxr_helper64_from_game.log if it exists.
-
-Quest 3 + Virtual Desktop:
-  Upside-down world with Streamer OpenXR Runtime = SteamVR is the helper
-  blit Y convention. This zip auto-flips that SteamVR submit (not VDXR).
-  Look for "OpenXR submit Y-flip: on" in the helper log. If it stays off
-  while the world is inverted, set OpenXRHelperFlipSubmitY=true in
-  VR\config.txt. Do not Y-flip the 2D menu capture.
-
-  Hands/weapons sitting below the controllers: G2 uses ControllerPitchTilt
-  -35 on grip. Touch now uses tilt 0 and the OpenXR aim pose for the gun
-  (gloves stay on grip). Log: "Controller tracking ... tilt=0.0 family=touch"
-  and "OpenXR controller family=touch". Extra glove tweak:
-  QuestHandsPoseOffsetMeters=0,0,0 in VR\config.txt.
-
-You must start a new game or load a save. The main menu is supposed to
-look the same in both eyes. Fusion is only after you are in a map.
+This build
+----------
+- Bare hands until you pick up the HEV suit. Blue Shift stays bare-handed
+  the whole campaign (Calhoun never wears HEV).
+- Crossbow zoom magnifies the stereo view; while scoped, aim is from the
+  headset so the bolt matches the picture.
+- Hands sit on the controller grip and point along the aim ray.
+- Crowbar melee uses OpenXR hand velocity again (swings were stuck at 0 m/s).
+- Floating bloom ghosts on stereo eyes are skipped.
+- Quest 3: Meta Link OpenXR runtime, or Virtual Desktop with VDXR.
+  Do not pick SteamVR as Virtual Desktop's OpenXR runtime (upside-down).

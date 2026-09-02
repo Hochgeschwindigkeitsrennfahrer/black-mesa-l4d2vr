@@ -669,8 +669,13 @@ bool Game::LocalPlayerHasSuit()
 
 bool Game::LocalPlayerZooming()
 {
+    return LocalPlayerZoomFlag() == 1;
+}
+
+int Game::LocalPlayerZoomFlag()
+{
     ScanWristHudNetVars();
-    return ReadPlayerFlagByte(g_nvZooming) == 1;
+    return ReadPlayerFlagByte(g_nvZooming);
 }
 
 int Game::RpgLaserOnOffset() const
@@ -1392,6 +1397,25 @@ bool Game::SetConVarFloat(const char* name, float value) const
     if (!cvar)
         return false;
     return ConVarSetFloat(cvar, value);
+}
+
+bool Game::GetConVarInt(const char* name, int& value) const
+{
+    value = 0;
+    void* cvar = FindConVarProbe(m_Cvar, name);
+    if (!cvar)
+        return false;
+    uint32_t stored = 0;
+    __try
+    {
+        stored = *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(cvar) + 0x30);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+    value = static_cast<int>(stored ^ reinterpret_cast<uint32_t>(cvar));
+    return true;
 }
 
 void Game::logMsg(const char* fmt, ...)

@@ -517,7 +517,9 @@ bool BmVrGloves::DrawForEye(
     Impl::Hand* pair = nullptr;
     int gpuBase = 0;
     const char* source = "hev";
-    if (!wearingSuit && m_Impl->bareLoaded)
+    // Blue Shift is Calhoun in a security uniform — never HEV gloves.
+    const bool forceBare = bmvr::IsBlueShift();
+    if (m_Impl->bareLoaded && (forceBare || !wearingSuit))
     {
         pair = m_Impl->bare;
         gpuBase = 2;

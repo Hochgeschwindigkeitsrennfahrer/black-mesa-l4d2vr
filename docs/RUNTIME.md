@@ -317,6 +317,22 @@ Overnight port of the L4D2VR `main2` multicore **subset** plus remaining safe Qo
 
 User-reported: Quest 3 via Virtual Desktop, world **upside-down** when Streamer Options → OpenXR Runtime = **SteamVR**. Same machine upright when that dropdown is **VDXR**. Windows ActiveRuntime can still be `virtualdesktop-openxr.json` in both cases; the helper's `xrGetInstanceProperties` runtime name plus VD Settings.json/registry decide the blit.
 
-Do **not** Y-flip the 2D/menu capture path (`AGENTS.md`). Flip is the helper Vulkan **eye swapchain blit** only (`OpenXRHelperFlipSubmitY=auto`). SteamVR OpenXR (and VD forwarding to SteamVR) flips; VDXR/Oculus do not. Force with `true`/`false` if auto misses a VD setting file.
+Do **not** Y-flip the 2D/menu capture path (`AGENTS.md`).
 
-Quest / Touch hands sitting **below** the controllers: `ControllerPitchTilt=-35` is a G2/WMR grip correction. Touch OpenXR **aim** already points; extra −35° pitches the gun and gloves down. Per-family table: Touch tilt 0 + aim pose for weapons / grip for gloves; G2 keeps −35 and grip. Log line: `Controller tracking ... tilt=0.0 family=touch`. Extra glove meters: `QuestHandsPoseOffsetMeters`.
+**Verified fail (2026-09-01, G2):** SteamVR OpenXR + a **negative viewport** produced yellow/white bands. WMR OpenXR (no flip) was fine.
+
+**Quest logs 2026-09-01 (`bm_c1a0a`, unique L/R origins):** SteamVR fused but inverted. Link/Oculus duplicated. Auto image-swap did not fix Link. Transfer-blit dstOffsets Y-swap did not change pixels (NVIDIA min/max). Shader UV vMin/vMax swap (`path=shader flipY=1`) also left SteamVR inverted. Next attempt: second blit VS that **negates NDC Y** only for SteamVR+Touch (not G2, not negative viewport). Oculus crops the blit to L4D2VR hidden-area UVs, fills the swapchain, and still submits runtime FOV. Do not crop SteamVR (it fused with full 0–1 + game FOV).
+
+Quest / Touch hands sitting **below** the controllers: `ControllerPitchTilt=-35` is a G2/WMR grip correction. Touch OpenXR **aim** already points; extra −35° pitches the gun and gloves down. Per-family table: Touch tilt 0 + aim pose for weapons / grip for gloves; G2 keeps −35 and grip. Log line: `Controller tracking ... tilt=0.0 family=touch`. Touch weapons get extra `ViewmodelPosOffsetXTouch=5.5` (aim origin is ahead of grip). Extra glove meters: `QuestHandsPoseOffsetMeters`.
+
+## Verified: stereo bloom skip (2026-09-03)
+
+Anomalous Materials cafeteria (`bm_c1a0a`): fluorescent-tube copies on the dark ceiling and a table/NPC stamp on the olive wall. Same leftover-pixel class as the old 16:9 fires (square HMD eye, window 2560×1440).
+
+A/B: god rays on, `bms_postprocess` / xog / DOF on, **bloom off** → ghosts gone. Bloom chain only (`engine_post` / `lumcompare` / `downsample` / `blurfilter` / `blur_combine`) → ghosts back.
+
+Failed fix (user 2026-09-03): run bloom, draw `engine_post_nxtgen` at eye dest (2656×2592) from the 664×648 buffer, and write that size into the material context `Viewport` so Source’s internal `GetViewport` FLerp matches. Ghosts unchanged.
+
+Keep skipping that bloom chain on stereo eyes. Do not disable the rest of post. Do not retry dest/UV/viewport rescale of `engine_post` without a new integration point (shader constants / bloom RT contents, not dest size).
+
+**Verified fail 2026-09-03 (user):** grow `_rt_Small*FB*` to eye/N — ghosts gone but the **entire picture zoomed and warped with head movement**. Same after reverting the `DoEnginePostProcessing` eye w/h override. Do not grow bloom scratch RTs. Skip bloom on stereo eyes.

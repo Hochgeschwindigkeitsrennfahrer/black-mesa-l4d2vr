@@ -17,8 +17,10 @@ namespace
 {
     constexpr int kMaxMenuSlots = 16;
     constexpr DWORD kMenuHoldMs = 180;
-    constexpr float kMenuHandForwardHu = 11.f;
-    constexpr float kMenuHandUpHu = 5.f;
+    // Sit on the grip, not 11 HU down the barrel (that looked like a face/aim
+    // spawn when the controller was pitched).
+    constexpr float kMenuHandForwardHu = 4.f;
+    constexpr float kMenuHandUpHu = 2.5f;
 
     void YawAroundZ(Vector& v, float yawDeg)
     {
@@ -57,11 +59,10 @@ namespace
         up = CrossProduct(fwd, right);
         VectorNormalize(up);
     }
-    // Hex draw radius also drives hover hit-testing (both are screen space), so
-    // shrinking this scales the wheel and its targets together.
-    constexpr float kHexRadiusPxAt1440 = 60.f;
+    // World-HU hex size. Packing > 1 leaves a gutter. Draw and hover both use
+    // this plane (not screen-pixel honeycomb around a projected origin).
     constexpr float kHexPackScale = 1.20f;
-    constexpr float kHexWorldHu = 2.80f;
+    constexpr float kHexWorldHu = 2.55f;
     constexpr float kSqrt3 = 1.73205078f;
 
     int ReadMuzzleFlashParity(void* vm)
@@ -249,8 +250,7 @@ namespace
         return false;
     }
 
-    // Screen position of each layout cell, in hex radii, with +y up (see
-    // HexToOffset / HexScreenCenter):
+    // Plane offset of each layout cell, in hex radii, with +y along menu up:
     //
     //   inner ring   {0,-1} lower-left   {1,-1} lower-right  {1,0} right
     //                {0,1}  upper-right  {-1,1} upper-left   {-1,0} left
@@ -290,35 +290,13 @@ namespace
         y = radius * (1.5f * static_cast<float>(r));
     }
 
-    float HexDrawRadiusPx(UINT h)
+    Vector HexPlanePoint(const Vector& center, const Vector& planeRight, const Vector& planeUp,
+        float radiusHu, float angleDeg)
     {
-        const float hh = (h > 8) ? static_cast<float>(h) : 1440.f;
-        return kHexRadiusPxAt1440 * (hh / 1440.f);
-    }
-
-    void HexScreenCenter(float ocx, float ocy, int q, int r, float packR, float& cx, float& cy)
-    {
-        float ox = 0.f, oy = 0.f;
-        HexToOffset(q, r, packR, ox, oy);
-        cx = ocx + ox;
-        cy = ocy - oy;
-    }
-
-    bool ProjectWorldToScreen(const Vector& world, const Vector& eye, const Vector& fwd,
-        const Vector& right, const Vector& up, float tanHalf, float aspect, UINT w, UINT h,
-        float& sx, float& sy)
-    {
-        const Vector delta = world - eye;
-        const float z = delta.Dot(fwd);
-        if (z < 3.f)
-            return false;
-        const float x = delta.Dot(right);
-        const float y = delta.Dot(up);
-        const float ndcX = (x / z) / tanHalf;
-        const float ndcY = ((y / z) * aspect) / tanHalf;
-        sx = (ndcX * 0.5f + 0.5f) * static_cast<float>(w);
-        sy = (-ndcY * 0.5f + 0.5f) * static_cast<float>(h);
-        return true;
+        const float a = angleDeg * (3.14159265f / 180.f);
+        // Match the old screen hex (angle -90 = visually up): screen Y is down,
+        // so -sin in the plane-up axis.
+        return center + planeRight * (cosf(a) * radiusHu) + planeUp * (-sinf(a) * radiusHu);
     }
 
     bool PointInHex(float x, float y, float radius)
@@ -363,31 +341,24 @@ namespace
         device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, v, sizeof(MenuVert));
     }
 
-    void DrawHexFill(IDirect3DDevice9* device, float cx, float cy, float r, D3DCOLOR color)
+    void DrawHexFillPts(IDirect3DDevice9* device, float cx, float cy,
+        const float* xs, const float* ys, D3DCOLOR color)
     {
         MenuVert v[8]{};
         v[0] = { cx, cy, 0.f, 1.f, color };
         for (int i = 0; i < 7; ++i)
-        {
-            const float a = (static_cast<float>(i) * 60.f - 90.f) * 3.14159265f / 180.f;
-            v[i + 1] = { cx + cosf(a) * r, cy + sinf(a) * r, 0.f, 1.f, color };
-        }
+            v[i + 1] = { xs[i], ys[i], 0.f, 1.f, color };
         device->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 6, v, sizeof(MenuVert));
     }
 
-    // Continuous hex ring (triangle strip), not six separate quads that gap at vertices.
-    void DrawHexRing(IDirect3DDevice9* device, float cx, float cy, float rOuter, float rInner, D3DCOLOR color)
+    void DrawHexRingPts(IDirect3DDevice9* device, const float* xo, const float* yo,
+        const float* xi, const float* yi, D3DCOLOR color)
     {
-        if (!(rOuter > rInner + 0.5f))
-            return;
         MenuVert v[14]{};
         for (int i = 0; i <= 6; ++i)
         {
-            const float a = (static_cast<float>(i) * 60.f - 90.f) * 3.14159265f / 180.f;
-            const float c = cosf(a);
-            const float s = sinf(a);
-            v[i * 2] = { cx + c * rOuter, cy + s * rOuter, 0.f, 1.f, color };
-            v[i * 2 + 1] = { cx + c * rInner, cy + s * rInner, 0.f, 1.f, color };
+            v[i * 2] = { xo[i], yo[i], 0.f, 1.f, color };
+            v[i * 2 + 1] = { xi[i], yi[i], 0.f, 1.f, color };
         }
         device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 12, v, sizeof(MenuVert));
     }
@@ -1175,20 +1146,25 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
                 GetViewBasis(&fwd, &right, &up);
                 Vector hand{};
                 Vector aim{};
+                Vector ctrlUp{};
                 {
                     std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
-                    hand = ControllerTrackingToWorld(body, m_PhysicalRightPosAbs);
-                    QAngle::AngleVectors(m_PhysicalRightAngAbs, &aim, nullptr, nullptr);
+                    // Same tracking body as the visible gloves so the origin
+                    // matches the grip, not a leftover 16:9 setup.origin.
+                    Vector trackingBody = m_HasStereoBodyOrigin ? m_StereoBodyOrigin : body;
+                    if (trackingBody.LengthSqr() <= 1.f)
+                        trackingBody = body;
+                    hand = ControllerTrackingToWorld(trackingBody, m_PhysicalRightPosAbs);
+                    QAngle::AngleVectors(m_PhysicalRightAngAbs, &aim, nullptr, &ctrlUp);
                 }
-                // Anchor the wheel on the controller's own aim ray rather than
-                // in front of the face. The hover test casts that same ray at
-                // this plane, so putting the origin on it means the wheel opens
-                // with the centre cell under the cursor every time, whatever
-                // way the hand happens to be pointing.
                 if (VectorNormalize(aim) <= 0.01f)
                     aim = fwd;
+                if (VectorNormalize(ctrlUp) <= 0.01f)
+                    ctrlUp = up;
+                // Small offset in front of / above the grip so the hover ray
+                // has a positive t and the hexes are not inside the glove.
                 m_WeaponMenuLatchBody = body;
-                m_WeaponMenuLatchWorld = hand + aim * kMenuHandForwardHu;
+                m_WeaponMenuLatchWorld = hand + aim * kMenuHandForwardHu + ctrlUp * kMenuHandUpHu;
                 m_WeaponMenuLatchDelta = m_WeaponMenuLatchWorld - body;
                 m_WeaponMenuLatchFwd = fwd;
                 m_WeaponMenuLatchRight = right;
@@ -1326,31 +1302,32 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             QAngle::AngleVectors(m_PhysicalRightAngAbs, &rayDir, nullptr, nullptr);
         }
         const int prevHover = m_WeaponMenuHover;
-        // Hover in the wheel plane. Screen projection used the cyclops eye while
-        // the hexes are drawn per stereo eye, so the centre cell looked selected
-        // without the ray actually registering until you left and re-entered.
+        // Hover in the latched world plane against the same HU slot centers
+        // DrawWeaponMenu projects. Screen packing around a projected origin
+        // made the honeycomb follow head tilt.
         const Vector planeN = m_WeaponMenuFwd;
         const float planeDenom = rayDir.Dot(planeN);
         int hover = 0;
+        const float packR = kHexWorldHu * kHexPackScale;
         if (fabsf(planeDenom) > 0.12f)
         {
             const float hitT = (m_WeaponMenuOrigin - rayOrig).Dot(planeN) / planeDenom;
             if (hitT > 0.02f && hitT < 80.f)
             {
                 const Vector planeHit = rayOrig + rayDir * hitT;
+                const Vector rel = planeHit - m_WeaponMenuOrigin;
+                const float hx = rel.Dot(m_WeaponMenuRight);
+                const float hy = rel.Dot(m_WeaponMenuUp);
                 float bestD = 1.0e9f;
                 int best = -1;
                 for (int i = 0; i < m_WeaponMenuCount; ++i)
                 {
                     float ox = 0.f, oy = 0.f;
                     HexToOffset(m_WeaponMenuSlots[i].axialQ, m_WeaponMenuSlots[i].axialR,
-                        kHexWorldHu * kHexPackScale, ox, oy);
-                    const Vector slot = m_WeaponMenuOrigin
-                        + m_WeaponMenuRight * ox + m_WeaponMenuUp * oy;
-                    const Vector d = planeHit - slot;
-                    const float lx = d.Dot(m_WeaponMenuRight);
-                    const float ly = d.Dot(m_WeaponMenuUp);
-                    if (!PointInHex(lx, ly, kHexWorldHu * kHexPackScale * 1.12f))
+                        packR, ox, oy);
+                    const float lx = hx - ox;
+                    const float ly = hy - oy;
+                    if (!PointInHex(lx, ly, packR * 1.12f))
                         continue;
                     const float dist = lx * lx + ly * ly;
                     if (dist < bestD)
@@ -1443,35 +1420,34 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
     device->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
 
-    // No pointer beam: the wheel opens centred on the hand's own ray, so the
-    // hovered cell's highlight plus the hover click already say where the hand
-    // is. Drawing a ray from the controller across the wheel only cluttered it.
-    float ocx = 0.f, ocy = 0.f;
-    const bool haveOrigin = project(m_WeaponMenuOrigin, ocx, ocy);
-    const float drawR = HexDrawRadiusPx(h);
-    const float packR = drawR * kHexPackScale;
+    // World-locked honeycomb: each hex lives in the latched plane. Projecting
+    // vertices (not a screen-pixel ring around one origin) keeps the wheel
+    // still when the head moves. Snap-turn still yaws the latched basis.
+    auto projectRing = [&](const Vector& center, float rHu, float* xs, float* ys) -> bool {
+        for (int k = 0; k <= 6; ++k)
+        {
+            const float ang = static_cast<float>(k) * 60.f - 90.f;
+            if (!project(HexPlanePoint(center, m_WeaponMenuRight, m_WeaponMenuUp, rHu, ang),
+                xs[k], ys[k]))
+                return false;
+        }
+        return true;
+    };
 
-    if (!haveOrigin)
-    {
-        device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-        return;
-    }
+    const float radiusHu = kHexWorldHu;
+    const float edgeHu = radiusHu * 0.08f;
 
     for (int i = 0; i < m_WeaponMenuCount; ++i)
     {
         const WeaponMenuSlot& slot = m_WeaponMenuSlots[i];
         const bool hover = (i == m_WeaponMenuHover);
         float cx = 0.f, cy = 0.f;
-        float ox = 0.f, oy = 0.f;
-        HexToOffset(slot.axialQ, slot.axialR, kHexWorldHu * kHexPackScale, ox, oy);
-        const Vector slotWorld = m_WeaponMenuOrigin
-            + m_WeaponMenuRight * ox + m_WeaponMenuUp * oy;
-        if (!project(slotWorld, cx, cy))
-            HexScreenCenter(ocx, ocy, slot.axialQ, slot.axialR, packR, cx, cy);
-        // ~8% of hex width (pointy-top width = R√3). Ring stays inside R so
-        // packing ×1.20 leaves a visible gap.
-        const float radius = drawR;
-        const float edge = radius * 0.08f;
+        if (!project(slot.center, cx, cy))
+            continue;
+        float xo[7]{}, yo[7]{}, xi[7]{}, yi[7]{};
+        if (!projectRing(slot.center, radiusHu, xo, yo)
+            || !projectRing(slot.center, radiusHu - edgeHu, xi, yi))
+            continue;
         const bool dry = slot.dry && !slot.emptyHand;
         const D3DCOLOR fill = dry
             ? (hover ? D3DCOLOR_ARGB(220, 72, 16, 12) : D3DCOLOR_ARGB(190, 42, 10, 8))
@@ -1480,14 +1456,19 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
             ? (hover ? D3DCOLOR_XRGB(255, 120, 90) : D3DCOLOR_XRGB(255, 56, 40))
             : (hover ? D3DCOLOR_XRGB(255, 240, 140)
                 : (slot.equipped ? D3DCOLOR_XRGB(255, 176, 0) : D3DCOLOR_ARGB(220, 200, 140, 30)));
-        DrawHexFill(device, cx, cy, radius - edge, fill);
-        DrawHexRing(device, cx, cy, radius, radius - edge, frame);
+        DrawHexFillPts(device, cx, cy, xi, yi, fill);
+        DrawHexRingPts(device, xo, yo, xi, yi, frame);
         if (hover)
         {
-            const D3DCOLOR glow = dry
-                ? D3DCOLOR_ARGB(170, 255, 90, 70)
-                : D3DCOLOR_ARGB(160, 255, 255, 200);
-            DrawHexRing(device, cx, cy, radius + 1.5f, radius - edge * 0.35f, glow);
+            float xg[7]{}, yg[7]{}, xgi[7]{}, ygi[7]{};
+            if (projectRing(slot.center, radiusHu * 1.04f, xg, yg)
+                && projectRing(slot.center, radiusHu - edgeHu * 0.35f, xgi, ygi))
+            {
+                const D3DCOLOR glow = dry
+                    ? D3DCOLOR_ARGB(170, 255, 90, 70)
+                    : D3DCOLOR_ARGB(160, 255, 255, 200);
+                DrawHexRingPts(device, xg, yg, xgi, ygi, glow);
+            }
         }
 
         if (slot.emptyHand)
@@ -1497,10 +1478,16 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
         IDirect3DTexture9* icon = (kind > 0 && kind < KindCount) ? g_WeaponIconTex[kind] : nullptr;
         if (icon)
         {
-            const float iw = radius * 1.05f;
-            const float ih = radius * 0.66f;
-            const float x0 = cx - iw * 0.5f;
-            const float y0 = cy - ih * 0.5f;
+            const float iw = radiusHu * 1.05f;
+            const float ih = radiusHu * 0.66f;
+            const Vector tl = slot.center - m_WeaponMenuRight * (iw * 0.5f) + m_WeaponMenuUp * (ih * 0.5f);
+            const Vector tr = slot.center + m_WeaponMenuRight * (iw * 0.5f) + m_WeaponMenuUp * (ih * 0.5f);
+            const Vector bl = slot.center - m_WeaponMenuRight * (iw * 0.5f) - m_WeaponMenuUp * (ih * 0.5f);
+            const Vector br = slot.center + m_WeaponMenuRight * (iw * 0.5f) - m_WeaponMenuUp * (ih * 0.5f);
+            float x0 = 0.f, y0 = 0.f, x1 = 0.f, y1 = 0.f, x2 = 0.f, y2 = 0.f, x3 = 0.f, y3 = 0.f;
+            if (!project(tl, x0, y0) || !project(tr, x1, y1)
+                || !project(bl, x2, y2) || !project(br, x3, y3))
+                continue;
             const D3DCOLOR tint = dry
                 ? (hover ? D3DCOLOR_XRGB(255, 170, 150) : D3DCOLOR_XRGB(255, 72, 56))
                 : (hover ? D3DCOLOR_XRGB(255, 255, 255) : D3DCOLOR_XRGB(255, 230, 180));
@@ -1514,9 +1501,9 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
             device->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE | D3DFVF_TEX1);
             MenuVertTex tv[4] = {
                 { x0, y0, 0.f, 1.f, tint, 0.f, 0.f },
-                { x0 + iw, y0, 0.f, 1.f, tint, 1.f, 0.f },
-                { x0, y0 + ih, 0.f, 1.f, tint, 0.f, 1.f },
-                { x0 + iw, y0 + ih, 0.f, 1.f, tint, 1.f, 1.f }
+                { x1, y1, 0.f, 1.f, tint, 1.f, 0.f },
+                { x2, y2, 0.f, 1.f, tint, 0.f, 1.f },
+                { x3, y3, 0.f, 1.f, tint, 1.f, 1.f }
             };
             device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, tv, sizeof(MenuVertTex));
             device->SetTexture(0, nullptr);
@@ -1528,7 +1515,8 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
         }
         else
         {
-            DrawKindIcon(device, cx, cy, radius * 0.28f,
+            const float glyph = sqrtf((xo[0] - cx) * (xo[0] - cx) + (yo[0] - cy) * (yo[0] - cy)) * 0.28f;
+            DrawKindIcon(device, cx, cy, glyph,
                 static_cast<WeaponKind>(slot.kind),
                 dry
                     ? (hover ? D3DCOLOR_XRGB(255, 160, 140) : D3DCOLOR_XRGB(255, 72, 56))

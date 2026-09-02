@@ -267,7 +267,7 @@ OpenXrHelperLaunchConfig L4D2VR_ReadOpenXrHelperLaunchConfig()
     if (const std::string value = get("OpenXRHelper"); !value.empty())
         config.enabled = ParseBool(value, config.enabled);
     if (const std::string value = get("OpenXRHelperSwapProjectionEyes"); !value.empty())
-        config.swapProjectionEyes = ParseBool(value, config.swapProjectionEyes);
+        config.swapProjectionEyes = ParseFlipSubmitY(value, config.swapProjectionEyes);
     if (const std::string value = get("OpenXRHelperSwapProjectionViewOrder"); !value.empty())
         config.swapProjectionViewOrder = ParseBool(value, config.swapProjectionViewOrder);
     if (const std::string value = get("OpenXRHelperMirrorProjectionHorizontal"); !value.empty())
@@ -401,7 +401,7 @@ bool L4D2VR_StartOpenXrHelper(const OpenXrHelperLaunchConfig& config)
         << L" --parent " << GetCurrentProcessId()
         << L" --frames " << config.submitTestFrames
         << L" --wait-ready-sec " << config.waitReadySeconds
-        << L" --swap-projection-eyes " << (config.swapProjectionEyes ? 1 : 0)
+        << L" --swap-projection-eyes " << config.swapProjectionEyes
         << L" --swap-projection-view-order " << (config.swapProjectionViewOrder ? 1 : 0)
         << L" --mirror-projection-horizontal " << (config.mirrorProjectionHorizontal ? 1 : 0)
         << L" --disable-projection-layer " << (config.disableProjectionLayer ? 1 : 0)
@@ -447,11 +447,12 @@ bool L4D2VR_StartOpenXrHelper(const OpenXrHelperLaunchConfig& config)
 
     state->helperPid = pi.dwProcessId;
     Game::logMsg(
-        "[VR][OpenXRHelper] launched pid=%lu frames=%u waitReadySeconds=%u swapProjectionEyes=%d swapProjectionViewOrder=%d mirrorProjectionHorizontal=%d disableProjectionLayer=%d useSymmetricProjectionFov=%d useGameRenderPoseForProjection=%d forceMonoProjectionEye=%s(%d) forceMonoProjectionView=%s(%d) flipSubmitY=%s(%d) disableQuadOverlays=%d exe=%ls",
+        "[VR][OpenXRHelper] launched pid=%lu frames=%u waitReadySeconds=%u swapProjectionEyes=%s(%d) swapProjectionViewOrder=%d mirrorProjectionHorizontal=%d disableProjectionLayer=%d useSymmetricProjectionFov=%d useGameRenderPoseForProjection=%d forceMonoProjectionEye=%s(%d) forceMonoProjectionView=%s(%d) flipSubmitY=%s(%d) disableQuadOverlays=%d exe=%ls",
         static_cast<unsigned long>(pi.dwProcessId),
         config.submitTestFrames,
         config.waitReadySeconds,
-        config.swapProjectionEyes ? 1 : 0,
+        FlipSubmitYName(config.swapProjectionEyes),
+        config.swapProjectionEyes,
         config.swapProjectionViewOrder ? 1 : 0,
         config.mirrorProjectionHorizontal ? 1 : 0,
         config.disableProjectionLayer ? 1 : 0,

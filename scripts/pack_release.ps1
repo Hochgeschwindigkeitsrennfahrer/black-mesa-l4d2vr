@@ -18,7 +18,7 @@ if (-not (Test-Path $ReadmeSrc)) { throw "Missing $ReadmeSrc" }
 $Dist = Join-Path $Root "dist"
 $Stage = Join-Path $Dist "drop-into-Black-Mesa-folder"
 $TestNotes = Join-Path $Root "packaging\TEST_RELEASE.txt"
-$ZipName = if (Test-Path $TestNotes) { "Black-Mesa-VR-test-drop-in.zip" } else { "Black-Mesa-VR-drop-in.zip" }
+$ZipName = "Black-Mesa-VR-drop-in.zip"
 $Zip = Join-Path $Dist $ZipName
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 if (Test-Path $Stage) { Remove-Item -Recurse -Force $Stage }

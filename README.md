@@ -18,22 +18,22 @@ https://github.com/keyou91/l4d2vr
 * True stereo rendering — Done
 * 6DOF motion controls — Done
 * VR weapon wheel — Half-Life 2 VR style — Done
-* Crowbar melee — Work in progress
+* Crowbar melee — Done
 * OpenXR implementation — Done
 * Wrist HUD with game icons — Done
+* Bare hands until HEV (and throughout Blue Shift) — Done
+* Crossbow zoom (headset aim while scoped) — Done
 
 ## Known Issues
 
 The VR experience is fully playable, but several features are still a work in progress:
 
-* **Virtual Desktop (Quest):** in Virtual Desktop Streamer on the PC, Options → **OpenXR Runtime** must be **VDXR**. SteamVR in that dropdown renders the game upside-down in the headset. VDXR is the supported setting.
-* **SteamVR OpenXR runtime:** in SteamVR, Settings → OpenXR → set **SteamVR as OpenXR runtime**. If Meta Link / Oculus stays the Windows ActiveRuntime while SteamVR is also running, you get a waiting room plus a second compositor. One runtime, then SteamVR, then the game.
-* Crowbar swinging can be unreliable.
+* **Quest 3:** Meta Link uses the Link / Oculus OpenXR runtime. Virtual Desktop must use Streamer Options → **OpenXR Runtime = VDXR**. SteamVR in that dropdown inverts the world; this build rasterizes a Y-flip only for SteamVR + Touch (not G2 — negative viewport made yellow bands).
+* **SteamVR OpenXR runtime:** G2 through SteamVR OpenXR must not use a negative-viewport Y-flip. WMR OpenXR on the same headset is fine. If Meta Link / Oculus stays the Windows ActiveRuntime while SteamVR is also running, you get a waiting room plus a second compositor. One runtime, then SteamVR, then the game.
+* **Quest weapons:** Touch uses the OpenXR aim pose. Hands sit on the grip and point along that aim ray. If you already saved `ox=5.5` extras in `VR/viewmodel_offsets.txt`, reset those weapons (numpad 0) so they do not double with the built-in Touch pull-back.
 * Performance can be poor in open and complex scenes.
 * Controls are still a work in progress. Bindings can be configured through the SteamVR controller settings.
 * TAU cannon effects can emit from the player's eyes and may glitch out.
-* Crossbow scope aiming does not currently work.
-* The left hand is visible even during the intro sequence, before the HEV suit is acquired.
 * There are currently no HUD elements indicating Long Jump Module usage.
 * Two-handed weapons are planned for a later update.
 * Manual reloading is not currently implemented and is planned for a future update.
@@ -48,7 +48,9 @@ After installing Blue Shift, launch the game with:
 -game bshift
 ```
 
-The same VR setup can then be used with the Blue Shift campaign.
+The same VR setup can then be used with the Blue Shift campaign. Calhoun never
+wears the HEV suit, so this build keeps the bare-hand models for the whole
+Blue Shift session.
 
 ## VR Features
 
@@ -66,7 +68,7 @@ A Half-Life 2 VR-style weapon wheel provides quick weapon selection using the VR
 
 ### Crowbar Melee
 
-Motion-controlled crowbar melee is implemented and currently being refined.
+Motion-controlled crowbar melee. Swings that move the controller through space pulse `IN_ATTACK`.
 
 ### OpenXR
 

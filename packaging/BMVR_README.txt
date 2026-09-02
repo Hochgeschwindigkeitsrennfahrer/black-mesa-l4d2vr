@@ -130,12 +130,19 @@ If the gun sits too far forward/back, edit VR\config.txt:
   ViewmodelPosOffsetZ=-2.0
   ControllerPitchTilt=-35.0
   ControllerPitchTiltTouch=0
+  ViewmodelPosOffsetXTouch=5.5
   OpenXRHelperFlipSubmitY=auto
+  OpenXRHelperSwapProjectionEyes=auto
 
 Quest / Touch: the G2 -35° grip tilt is not applied. Weapons use the OpenXR
-aim pose; gloves stay on grip. Virtual Desktop users must set Streamer
-Options → OpenXR Runtime to VDXR (SteamVR in that dropdown inverts the
-world). Meta Link users must set SteamVR as the OpenXR runtime.
+aim pose plus a 5.5 unit pull-back (aim origin is ahead of grip). Hands sit
+on the grip and point along the aim ray. If you already saved 5.5 extras in
+VR/viewmodel_offsets.txt, reset those weapons (numpad 0) so they do not
+double. Virtual Desktop users should set Streamer Options → OpenXR Runtime
+to VDXR. Meta Link / Quest 3 uses the Link OpenXR runtime. SteamVR + Touch
+uses a shader NDC Y-flip (not a negative viewport — that made yellow bands
+on G2). Oculus/Link does not Y-flip; it crops the 108° eye image to the
+runtime frustum and submits runtime FOV.
 
 Those take effect on the next launch (config is read at DLL load).
 

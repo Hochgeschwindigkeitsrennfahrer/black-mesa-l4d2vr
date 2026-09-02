@@ -81,6 +81,8 @@ public:
     bool LocalPlayerHasSuit();
     // True only when m_bZooming resolved and reads 1 (crossbow scope).
     bool LocalPlayerZooming();
+    // -1 if the netvar is missing/retired, otherwise 0 or 1.
+    int LocalPlayerZoomFlag();
     int RpgLaserOnOffset() const;
     int RpgLaserDotOffset() const;
     C_BaseEntity* FindEntityByNetworkNameContains(const char* token);
@@ -111,6 +113,7 @@ public:
     void ExecuteQueuedMaterials() const;
     bool SetConVarInt(const char* name, int value) const;
     bool SetConVarFloat(const char* name, float value) const;
+    bool GetConVarInt(const char* name, int& value) const;
     bool MaterialVTableMatchesDump() const;
 
     static void logMsg(const char* fmt, ...);

@@ -128,6 +128,7 @@ if (-not (Test-Path $CfgDst)) {
   if ($cfgText -notmatch '(?m)^VrHandsDebugBoxes=') { $cfgText += "`r`nVrHandsDebugBoxes=false`r`n" }
   if ($cfgText -notmatch '(?m)^VrHandHud=') { $cfgText += "`r`nVrHandHud=true`r`n" }
   if ($cfgText -notmatch '(?m)^VrCrosshair=') { $cfgText += "`r`nVrCrosshair=false`r`n" }
+  if ($cfgText -notmatch '(?m)^ScopeZoomFovScale=') { $cfgText += "`r`nScopeZoomFovScale=0.28`r`n" }
   if ($cfgText -notmatch '(?m)^DesktopLeftoverRender=') { $cfgText += "`r`nDesktopLeftoverRender=false`r`n" }
   if ($cfgText -notmatch '(?m)^ForceOpenVis=') { $cfgText += "`r`nForceOpenVis=false`r`n" }
   if ($cfgText -notmatch '(?m)^StereoBlitGpuFlush=') { $cfgText += "`r`nStereoBlitGpuFlush=false`r`n" }
@@ -153,7 +154,7 @@ if (-not (Test-Path $CfgGame)) { throw "Missing $CfgGame" }
 $BmvrCfgSrc = Join-Path $VrSrc "bmvr.cfg"
 $BmvrCfgDst = Join-Path $CfgGame "bmvr.cfg"
 Copy-Item -Force $BmvrCfgSrc $BmvrCfgDst
-Write-Host "Installed $BmvrCfgDst (PVS on, r_visocclusion 0, CSM quality 0)"
+Write-Host "Installed $BmvrCfgDst (PVS on, r_visocclusion 0, no video-quality override)"
 $Autoexec = Join-Path $CfgGame "autoexec.cfg"
 if (Test-Path $Autoexec) {
   $autoText = Get-Content -LiteralPath $Autoexec -Raw

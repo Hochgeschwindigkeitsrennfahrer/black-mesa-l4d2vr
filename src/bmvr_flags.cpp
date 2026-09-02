@@ -26,6 +26,7 @@ namespace bmvr
     float g_ViewmodelPosOffsetX = 0.f;
     float g_ViewmodelPosOffsetY = 0.f;
     float g_ViewmodelPosOffsetZ = 0.f;
+    float g_ViewmodelPosOffsetXTouch = 5.5f;
     float g_ViewmodelAngOffsetX = 0.f;
     float g_ViewmodelAngOffsetY = 0.f;
     float g_ViewmodelAngOffsetZ = 0.f;
@@ -56,6 +57,7 @@ namespace bmvr
     float g_VrCrosshairScale = 1.f;
     bool g_HideHandsWithoutSuit = true;
     bool g_ScopeUsesHmdAim = true;
+    float g_ScopeZoomFovScale = 0.28f;
     float g_VrHandsPoseRotX = 0.f;
     float g_VrHandsPoseRotY = 180.f;
     float g_VrHandsPoseRotZ = 0.f;
@@ -86,6 +88,7 @@ namespace bmvr
     float g_VrHandsRightGripRotY = 0.f;
     float g_VrHandsRightGripRotZ = -180.f;
     bool g_VrHandsUseHevGloves = true;
+    bool g_IsBlueShift = false;
     uint32_t g_FullFrameActualWidth = 0;
     uint32_t g_FullFrameActualHeight = 0;
     uint32_t g_GbActualWidth = 0;
@@ -301,6 +304,8 @@ namespace bmvr
                 g_ViewmodelPosOffsetY = static_cast<float>(atof(val));
             else if (std::strcmp(n, "ViewmodelPosOffsetZ") == 0)
                 g_ViewmodelPosOffsetZ = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "ViewmodelPosOffsetXTouch") == 0)
+                g_ViewmodelPosOffsetXTouch = static_cast<float>(atof(val));
             else if (std::strcmp(n, "ViewmodelAngOffsetX") == 0)
                 g_ViewmodelAngOffsetX = static_cast<float>(atof(val));
             else if (std::strcmp(n, "ViewmodelAngOffsetY") == 0)
@@ -373,6 +378,8 @@ namespace bmvr
                 g_HideHandsWithoutSuit = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "VrScopeUsesHmdAim") == 0)
                 g_ScopeUsesHmdAim = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
+            else if (std::strcmp(n, "ScopeZoomFovScale") == 0)
+                g_ScopeZoomFovScale = static_cast<float>(atof(val));
             else if (std::strcmp(n, "VrHandsPoseRotationOffset") == 0)
             {
                 float x = 0.f, y = 180.f, z = 0.f;
@@ -472,9 +479,10 @@ namespace bmvr
             }
         }
         fclose(f);
-        Log("VR config %ls RenderScale=%.2f TurnSpeed=%.2f snap=%d vm=(%.1f,%.1f,%.1f) tilt=%.1f ipd=%.2f autoQueue=%d aa=%u worldEyeSize=%d",
+        Log("VR config %ls RenderScale=%.2f TurnSpeed=%.2f snap=%d vm=(%.1f,%.1f,%.1f) touchOx=%.1f tilt=%.1f ipd=%.2f autoQueue=%d aa=%u worldEyeSize=%d",
             path.c_str(), g_RenderScale, g_TurnSpeed, g_SnapTurning ? 1 : 0,
             g_ViewmodelPosOffsetX, g_ViewmodelPosOffsetY, g_ViewmodelPosOffsetZ,
+            g_ViewmodelPosOffsetXTouch,
             g_ControllerPitchTilt, g_IPDScale, g_AutoMatQueueMode ? 1 : 0, g_AntiAliasing,
             g_WorldEyeSizeOptIn ? 1 : 0);
     }
@@ -871,12 +879,75 @@ namespace bmvr
         }
     }
 
+    bool IsBlueShift()
+    {
+        return g_IsBlueShift;
+    }
+
+    static bool PathLeafIsBshift(const wchar_t* tok)
+    {
+        if (!tok || !tok[0])
+            return false;
+        const wchar_t* leaf = tok;
+        for (const wchar_t* p = tok; *p; ++p)
+        {
+            if (*p == L'/' || *p == L'\\')
+                leaf = p + 1;
+        }
+        return _wcsicmp(leaf, L"bshift") == 0;
+    }
+
+    static void DetectBlueShiftSession()
+    {
+        g_IsBlueShift = false;
+        const wchar_t* p = GetCommandLineW();
+        if (!p)
+            return;
+        wchar_t tok[MAX_PATH]{};
+        auto nextTok = [&]() -> bool {
+            while (*p == L' ' || *p == L'\t')
+                ++p;
+            if (!*p)
+                return false;
+            size_t n = 0;
+            if (*p == L'"')
+            {
+                ++p;
+                while (*p && *p != L'"' && n + 1 < MAX_PATH)
+                    tok[n++] = *p++;
+                if (*p == L'"')
+                    ++p;
+            }
+            else
+            {
+                while (*p && *p != L' ' && *p != L'\t' && n + 1 < MAX_PATH)
+                    tok[n++] = *p++;
+            }
+            tok[n] = 0;
+            return true;
+        };
+        if (!nextTok())
+            return;
+        while (nextTok())
+        {
+            if (_wcsicmp(tok, L"-game") != 0)
+                continue;
+            if (nextTok() && PathLeafIsBshift(tok))
+            {
+                g_IsBlueShift = true;
+                Log("Blue Shift session (-game bshift)");
+                return;
+            }
+        }
+    }
+
     void InitFromDisk()
     {
         if (g_Inited)
             return;
         g_Inited = true;
         StartWatchdog();
+        DetectBlueShiftSession();
         ReadUserConfig(ExeDir() + L"\\VR\\config.txt");
         ReadSkipFile(SkipPath());
         ReadSkipFile(ModuleDir() + L"\\bmvr_skip.txt");
@@ -1027,6 +1098,21 @@ namespace bmvr
         g_EngineMapIsBackground = !gameplay;
         Log("World RT map=%s gameplay=%d backgroundBlock=%d",
             map, gameplay ? 1 : 0, g_EngineMapIsBackground ? 1 : 0);
+        if (!g_IsBlueShift)
+        {
+            const char* slash = strrchr(map, '/');
+            const char* bslash = strrchr(map, '\\');
+            if (bslash && (!slash || bslash > slash))
+                slash = bslash;
+            const char* base = slash ? slash + 1 : map;
+            if ((base[0] == 'b' || base[0] == 'B')
+                && (base[1] == 's' || base[1] == 'S')
+                && base[2] == '_')
+            {
+                g_IsBlueShift = true;
+                Log("Blue Shift session (map %s)", map);
+            }
+        }
     }
 
     void SetGameplayWorldRts(bool gameplayMap)
