@@ -84,6 +84,7 @@ A VR wrist HUD displays useful game information and game icons while keeping the
 
 The core VR experience is functional from launch through normal gameplay. Development is continuing on features, controls, performance, and general polish, with physical crowbar melee currently marked as work in progress.
 
-## Repository
-
-https://github.com/Hochgeschwindigkeitsrennfahrer/black-mesa-vr/tree/main
+## Huge thanks to my testers for their patience and help:
+TheRealBubble
+SilentVortiguant
+yakupagagaming
