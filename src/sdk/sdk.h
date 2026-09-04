@@ -80,6 +80,17 @@ public:
 	virtual bool IsThirdPersonCamera() = 0;
 };
 
+// VEngineVGui001. IsGameUIVisible is vtable +0x08 (engine.dll FUN_102388d0):
+// GameUI panel IsVisible, not IVEngineClient::IsPaused. After a save load the
+// engine can stay "paused" with GameUI already hidden.
+class IEngineVGui
+{
+public:
+	virtual ~IEngineVGui() {}
+	virtual void* GetPanel(int type) = 0;
+	virtual bool IsGameUIVisible() = 0;
+};
+
 // VEngineClient015 on Black Mesa. Early slots match L4D2 VEngineClient013
 // (ClientCmd 7, IsInGame, GetLevelName, IsPaused). ClientCmd_Unrestricted is
 // slot 108 (vtable +0x1B0), not 107 — confirmed by client.dll FUN_101f0550.
@@ -87,6 +98,9 @@ class IEngineClient
 {
 public:
 	virtual void* fn0() = 0;
+	// Slot 1 is IVEngineClient::GetLightForPoint (Source SDK; slot 5 is
+	// GetScreenSize, slot 7 is ClientCmd — those match BM VEngineClient015).
+	// Call via Game::TryGetLightForPoint; do not invoke this dummy.
 	virtual void* fn1() = 0;
 	virtual void* fn2() = 0;
 	virtual void* fn3() = 0;

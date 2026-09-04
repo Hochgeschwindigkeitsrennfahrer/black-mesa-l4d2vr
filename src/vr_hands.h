@@ -40,7 +40,9 @@ public:
         const QAngle& leftAngles,
         bool rightOk,
         const Vector& rightWorld,
-        const QAngle& rightAngles);
+        const QAngle& rightAngles,
+        float zNear,
+        float zFar);
 
     bool AssetsReady() const;
     bool HasBareHands() const;

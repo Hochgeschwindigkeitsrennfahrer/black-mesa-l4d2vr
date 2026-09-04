@@ -20,7 +20,7 @@ namespace
     // Sit on the grip, not 11 HU down the barrel (that looked like a face/aim
     // spawn when the controller was pitched).
     constexpr float kMenuHandForwardHu = 4.f;
-    constexpr float kMenuHandUpHu = 2.5f;
+    constexpr float kMenuHandUpHu = 0.f;
 
     void YawAroundZ(Vector& v, float yawDeg)
     {
@@ -789,6 +789,96 @@ namespace
     IDirect3DTexture9* g_WeaponIconTex[KindCount]{};
     IDirect3DDevice9* g_WeaponIconDevice = nullptr;
     bool g_WeaponIconTried = false;
+    bool g_WeaponIconBlueShift = false;
+
+    // HEV HUD silhouettes are orange. Blue Shift's Calhoun HUD is blue
+    // (same RGB as the pause-menu cursor). R↔B swap maps (255,176,0) to
+    // (0,176,255), next to Calhoun (64,168,255). Skip if the atlas is
+    // already blue-dominant so a native bshift VTF is left alone.
+    void RemapHevAmberToCalhoun(std::vector<unsigned char>& bgra)
+    {
+        unsigned long long sumR = 0, sumB = 0, n = 0;
+        for (size_t i = 0; i + 3 < bgra.size(); i += 4)
+        {
+            if (bgra[i + 3] < 16)
+                continue;
+            sumB += bgra[i];
+            sumR += bgra[i + 2];
+            ++n;
+        }
+        if (n == 0 || sumB >= sumR)
+            return;
+        for (size_t i = 0; i + 3 < bgra.size(); i += 4)
+            std::swap(bgra[i], bgra[i + 2]);
+    }
+
+    struct WheelPalette
+    {
+        D3DCOLOR fillHover;
+        D3DCOLOR fillIdle;
+        D3DCOLOR fillDryHover;
+        D3DCOLOR fillDryIdle;
+        D3DCOLOR frameHover;
+        D3DCOLOR frameEquipped;
+        D3DCOLOR frameIdle;
+        D3DCOLOR frameDryHover;
+        D3DCOLOR frameDryIdle;
+        D3DCOLOR glow;
+        D3DCOLOR glowDry;
+        D3DCOLOR tintHover;
+        D3DCOLOR tintIdle;
+        D3DCOLOR tintDryHover;
+        D3DCOLOR tintDryIdle;
+        D3DCOLOR glyphHover;
+        D3DCOLOR glyphIdle;
+        D3DCOLOR glyphDryHover;
+        D3DCOLOR glyphDryIdle;
+    };
+
+    WheelPalette MakeWheelPalette()
+    {
+        WheelPalette p{};
+        // Empty-clip warning stays red in both campaigns.
+        p.fillDryHover = D3DCOLOR_ARGB(220, 72, 16, 12);
+        p.fillDryIdle = D3DCOLOR_ARGB(190, 42, 10, 8);
+        p.frameDryHover = D3DCOLOR_XRGB(255, 120, 90);
+        p.frameDryIdle = D3DCOLOR_XRGB(255, 56, 40);
+        p.glowDry = D3DCOLOR_ARGB(170, 255, 90, 70);
+        p.tintDryHover = D3DCOLOR_XRGB(255, 170, 150);
+        p.tintDryIdle = D3DCOLOR_XRGB(255, 72, 56);
+        p.glyphDryHover = D3DCOLOR_XRGB(255, 160, 140);
+        p.glyphDryIdle = D3DCOLOR_XRGB(255, 72, 56);
+        if (bmvr::IsBlueShift())
+        {
+            p.fillHover = D3DCOLOR_ARGB(210, 10, 28, 52);
+            p.fillIdle = D3DCOLOR_ARGB(170, 6, 14, 28);
+            p.frameHover = D3DCOLOR_XRGB(160, 220, 255);
+            p.frameEquipped = D3DCOLOR_XRGB(64, 168, 255);
+            p.frameIdle = D3DCOLOR_ARGB(220, 40, 110, 200);
+            p.glow = D3DCOLOR_ARGB(160, 180, 230, 255);
+            p.tintHover = D3DCOLOR_XRGB(255, 255, 255);
+            p.tintIdle = D3DCOLOR_XRGB(180, 220, 255);
+            // Icons are already Calhoun-blue; a red multiply would go purple.
+            p.tintDryHover = D3DCOLOR_XRGB(210, 180, 190);
+            p.tintDryIdle = D3DCOLOR_XRGB(140, 110, 130);
+            p.glyphHover = D3DCOLOR_XRGB(200, 230, 255);
+            p.glyphIdle = D3DCOLOR_XRGB(64, 168, 255);
+        }
+        else
+        {
+            p.fillHover = D3DCOLOR_ARGB(210, 48, 36, 10);
+            p.fillIdle = D3DCOLOR_ARGB(170, 14, 12, 8);
+            p.frameHover = D3DCOLOR_XRGB(255, 240, 140);
+            p.frameEquipped = D3DCOLOR_XRGB(255, 176, 0);
+            p.frameIdle = D3DCOLOR_ARGB(220, 200, 140, 30);
+            p.glow = D3DCOLOR_ARGB(160, 255, 255, 200);
+            p.tintHover = D3DCOLOR_XRGB(255, 255, 255);
+            p.tintIdle = D3DCOLOR_XRGB(255, 230, 180);
+            p.glyphHover = D3DCOLOR_XRGB(255, 255, 200);
+            p.glyphIdle = D3DCOLOR_XRGB(255, 176, 0);
+        }
+        return p;
+    }
 
     void ReleaseHudIconCache();
 
@@ -804,6 +894,7 @@ namespace
         }
         g_WeaponIconDevice = nullptr;
         g_WeaponIconTried = false;
+        g_WeaponIconBlueShift = false;
         ReleaseHudIconCache();
     }
 
@@ -866,12 +957,16 @@ namespace
     {
         if (!device)
             return;
+        const bool wantBlue = bmvr::IsBlueShift();
         if (g_WeaponIconDevice && g_WeaponIconDevice != device)
+            ReleaseWeaponIcons();
+        if (g_WeaponIconTried && g_WeaponIconBlueShift != wantBlue)
             ReleaseWeaponIcons();
         if (g_WeaponIconTried)
             return;
         g_WeaponIconTried = true;
         g_WeaponIconDevice = device;
+        g_WeaponIconBlueShift = wantBlue;
         const auto vpks = HudVpkPaths();
         if (vpks.empty())
         {
@@ -898,6 +993,8 @@ namespace
                 continue;
             }
             CropBgraToAlpha(w, h, bgra);
+            if (wantBlue)
+                RemapHevAmberToCalhoun(bgra);
             IDirect3DTexture9* tex = nullptr;
             if (!UploadBgraTexture(device, w, h, bgra, &tex) || !tex)
             {
@@ -922,6 +1019,7 @@ namespace
     HudIconEntry g_HudIconCache[kHudIconCacheMax]{};
     int g_HudIconCount = 0;
     IDirect3DDevice9* g_HudIconDevice = nullptr;
+    bool g_HudIconBlueShift = false;
 
     void ReleaseHudIconCache()
     {
@@ -933,6 +1031,7 @@ namespace
         }
         g_HudIconCount = 0;
         g_HudIconDevice = nullptr;
+        g_HudIconBlueShift = false;
     }
 
     void DrawKindIcon(IDirect3DDevice9* device, float x, float y, float s, WeaponKind kind, D3DCOLOR color)
@@ -1018,9 +1117,13 @@ IDirect3DTexture9* bmvr::AcquireHudIcon(IDirect3DDevice9* device, const char* vt
 {
     if (!device || !vtfName || !*vtfName)
         return nullptr;
+    const bool wantBlue = IsBlueShift();
     if (g_HudIconDevice && g_HudIconDevice != device)
         ReleaseHudIconCache();
+    if (g_HudIconCount > 0 && g_HudIconBlueShift != wantBlue)
+        ReleaseHudIconCache();
     g_HudIconDevice = device;
+    g_HudIconBlueShift = wantBlue;
     for (int i = 0; i < g_HudIconCount; ++i)
     {
         if (_stricmp(g_HudIconCache[i].name, vtfName) == 0)
@@ -1049,6 +1152,8 @@ IDirect3DTexture9* bmvr::AcquireHudIcon(IDirect3DDevice9* device, const char* vt
         return nullptr;
     }
     CropBgraToAlpha(iw, ih, bgra);
+    if (wantBlue)
+        RemapHevAmberToCalhoun(bgra);
     IDirect3DTexture9* tex = nullptr;
     if (!UploadBgraTexture(device, iw, ih, bgra, &tex) || !tex)
     {
@@ -1118,7 +1223,8 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
     {
         m_WeaponMenuClickStartMs = now;
         m_WeaponMenuOpenedThisHold = false;
-        m_WeaponMenuHover = 0;
+        // Do not snap to the empty-hand cell. Hover is resolved after slots
+        // are built from the currently equipped weapon.
     }
 
     if (stickClickHeld)
@@ -1129,7 +1235,6 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             m_WeaponMenuOpen = true;
             m_WeaponMenuOpenedThisHold = true;
             m_WeaponMenuLatched = false;
-            m_WeaponMenuHover = 0;
             PulseHandHaptic(vr::TrackedControllerRole_RightHand, 900, 0.35f);
             Game::logMsg("Weapon menu opened (right stick hold)");
         }
@@ -1182,12 +1287,14 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
                 m_WeaponMenuLatchBillboardUp = m_WeaponMenuUp;
             }
 
+            // Wheel origin follows the latched body-relative delta, not the
+            // live hand pose each frame. That avoids jitter from player
+            // movement (body position changes, tracking is latched).
             const float yawDelta = m_RotationOffsetY.load(std::memory_order_acquire)
                 - m_WeaponMenuLatchYaw;
             Vector delta = m_WeaponMenuLatchDelta;
             YawAroundZ(delta, yawDelta);
             m_WeaponMenuOrigin = body + delta;
-            // Only snap turning re-orients the wheel; head movement does not.
             m_WeaponMenuFwd = m_WeaponMenuLatchBillboardFwd;
             m_WeaponMenuRight = m_WeaponMenuLatchBillboardRight;
             m_WeaponMenuUp = m_WeaponMenuLatchBillboardUp;
@@ -1302,12 +1409,24 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
             QAngle::AngleVectors(m_PhysicalRightAngAbs, &rayDir, nullptr, nullptr);
         }
         const int prevHover = m_WeaponMenuHover;
-        // Hover in the latched world plane against the same HU slot centers
-        // DrawWeaponMenu projects. Screen packing around a projected origin
-        // made the honeycomb follow head tilt.
         const Vector planeN = m_WeaponMenuFwd;
         const float planeDenom = rayDir.Dot(planeN);
-        int hover = 0;
+        int hover = prevHover;
+        if (hover < 0 || hover >= m_WeaponMenuCount)
+        {
+            hover = 0;
+            if (!m_EmptyHands)
+            {
+                for (int i = 1; i < m_WeaponMenuCount; ++i)
+                {
+                    if (m_WeaponMenuSlots[i].equipped)
+                    {
+                        hover = i;
+                        break;
+                    }
+                }
+            }
+        }
         const float packR = kHexWorldHu * kHexPackScale;
         if (fabsf(planeDenom) > 0.12f)
         {
@@ -1336,11 +1455,12 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
                         best = i;
                     }
                 }
-                hover = (best >= 0) ? best : 0;
+                if (best >= 0)
+                    hover = best;
             }
         }
         m_WeaponMenuHover = hover;
-        if (m_WeaponMenuHover >= 0 && m_WeaponMenuHover != prevHover)
+        if (prevHover >= 0 && m_WeaponMenuHover != prevHover)
             QueueWeaponMenuSound(kWeaponSoundHover);
     }
 
@@ -1348,10 +1468,8 @@ void VR::UpdateWeaponMenu(bool stickClickHeld, float deltaMs)
     {
         if (m_WeaponMenuOpenedThisHold)
         {
-            // Centre is the default selection (empty hands). Releasing there
-            // holsters; the player has to aim at another cell to pick a gun.
-            if (m_WeaponMenuHover < 0 || m_WeaponMenuHover >= m_WeaponMenuCount)
-                m_WeaponMenuHover = 0;
+            // Keep the last hovered cell. Missing the honeycomb no longer
+            // snaps to the centre empty-hand slot.
             if (m_WeaponMenuHover >= 0 && m_WeaponMenuHover < m_WeaponMenuCount)
             {
                 const WeaponMenuSlot& slot = m_WeaponMenuSlots[m_WeaponMenuHover];
@@ -1436,6 +1554,7 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
 
     const float radiusHu = kHexWorldHu;
     const float edgeHu = radiusHu * 0.08f;
+    const WheelPalette pal = MakeWheelPalette();
 
     for (int i = 0; i < m_WeaponMenuCount; ++i)
     {
@@ -1450,12 +1569,12 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
             continue;
         const bool dry = slot.dry && !slot.emptyHand;
         const D3DCOLOR fill = dry
-            ? (hover ? D3DCOLOR_ARGB(220, 72, 16, 12) : D3DCOLOR_ARGB(190, 42, 10, 8))
-            : (hover ? D3DCOLOR_ARGB(210, 48, 36, 10) : D3DCOLOR_ARGB(170, 14, 12, 8));
+            ? (hover ? pal.fillDryHover : pal.fillDryIdle)
+            : (hover ? pal.fillHover : pal.fillIdle);
         const D3DCOLOR frame = dry
-            ? (hover ? D3DCOLOR_XRGB(255, 120, 90) : D3DCOLOR_XRGB(255, 56, 40))
-            : (hover ? D3DCOLOR_XRGB(255, 240, 140)
-                : (slot.equipped ? D3DCOLOR_XRGB(255, 176, 0) : D3DCOLOR_ARGB(220, 200, 140, 30)));
+            ? (hover ? pal.frameDryHover : pal.frameDryIdle)
+            : (hover ? pal.frameHover
+                : (slot.equipped ? pal.frameEquipped : pal.frameIdle));
         DrawHexFillPts(device, cx, cy, xi, yi, fill);
         DrawHexRingPts(device, xo, yo, xi, yi, frame);
         if (hover)
@@ -1464,10 +1583,7 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
             if (projectRing(slot.center, radiusHu * 1.04f, xg, yg)
                 && projectRing(slot.center, radiusHu - edgeHu * 0.35f, xgi, ygi))
             {
-                const D3DCOLOR glow = dry
-                    ? D3DCOLOR_ARGB(170, 255, 90, 70)
-                    : D3DCOLOR_ARGB(160, 255, 255, 200);
-                DrawHexRingPts(device, xg, yg, xgi, ygi, glow);
+                DrawHexRingPts(device, xg, yg, xgi, ygi, dry ? pal.glowDry : pal.glow);
             }
         }
 
@@ -1489,8 +1605,8 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
                 || !project(bl, x2, y2) || !project(br, x3, y3))
                 continue;
             const D3DCOLOR tint = dry
-                ? (hover ? D3DCOLOR_XRGB(255, 170, 150) : D3DCOLOR_XRGB(255, 72, 56))
-                : (hover ? D3DCOLOR_XRGB(255, 255, 255) : D3DCOLOR_XRGB(255, 230, 180));
+                ? (hover ? pal.tintDryHover : pal.tintDryIdle)
+                : (hover ? pal.tintHover : pal.tintIdle);
             device->SetTexture(0, icon);
             device->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
             device->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
@@ -1519,8 +1635,8 @@ void VR::DrawWeaponMenu(IDirect3DDevice9* device, UINT w, UINT h,
             DrawKindIcon(device, cx, cy, glyph,
                 static_cast<WeaponKind>(slot.kind),
                 dry
-                    ? (hover ? D3DCOLOR_XRGB(255, 160, 140) : D3DCOLOR_XRGB(255, 72, 56))
-                    : (hover ? D3DCOLOR_XRGB(255, 255, 200) : D3DCOLOR_XRGB(255, 176, 0)));
+                    ? (hover ? pal.glyphDryHover : pal.glyphDryIdle)
+                    : (hover ? pal.glyphHover : pal.glyphIdle));
         }
     }
 

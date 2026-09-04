@@ -1,12 +1,14 @@
 #pragma once
 
 #include "vr_hand_types.h"
+#include "vector.h"
 
 #include <array>
 #include <string>
 #include <vector>
 
 struct IDirect3DDevice9;
+struct IDirect3DBaseTexture9;
 struct IDirect3DVertexDeclaration9;
 struct IDirect3DVertexShader9;
 struct IDirect3DPixelShader9;
@@ -43,7 +45,10 @@ public:
         const VrHandMatrix4& world,
         const VrHandMatrix4& worldViewProjection,
         VrHandDrawPass drawPass,
-        float sceneLightScale,
+        const Vector& sceneLightRgb,
+        const Vector& eyeOrigin,
+        float envExposure,
+        IDirect3DBaseTexture9* envCubemap,
         std::string& outError);
 
     // Upload VB/IB/texture before the eye RT is bound. D3D9Ex rejects

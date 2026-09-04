@@ -58,6 +58,7 @@ namespace bmvr
     bool g_HideHandsWithoutSuit = true;
     bool g_ScopeUsesHmdAim = true;
     float g_ScopeZoomFovScale = 0.28f;
+    float g_ScopeZoomSmoothSec = 0.16f;
     float g_VrHandsPoseRotX = 0.f;
     float g_VrHandsPoseRotY = 180.f;
     float g_VrHandsPoseRotZ = 0.f;
@@ -110,6 +111,8 @@ namespace bmvr
     // rectangle when VGUI never painted. Smaller / closer keeps HUD central.
     float g_HudDistance = 1.05f;
     float g_HudSize = 0.70f;
+    float g_MenuPanelScale = 0.70f;
+    float g_MenuCursorSmoothSec = 0.18f;
 
     static HMODULE g_Module = nullptr;
     static std::mutex g_LogMutex;
@@ -380,6 +383,8 @@ namespace bmvr
                 g_ScopeUsesHmdAim = (std::strcmp(val, "true") == 0 || std::strcmp(val, "1") == 0);
             else if (std::strcmp(n, "ScopeZoomFovScale") == 0)
                 g_ScopeZoomFovScale = static_cast<float>(atof(val));
+            else if (std::strcmp(n, "ScopeZoomSmoothSec") == 0)
+                g_ScopeZoomSmoothSec = static_cast<float>(atof(val));
             else if (std::strcmp(n, "VrHandsPoseRotationOffset") == 0)
             {
                 float x = 0.f, y = 180.f, z = 0.f;
@@ -458,6 +463,18 @@ namespace bmvr
                 if (s >= 0.4f && s <= 4.f)
                     g_HudSize = s;
             }
+            else if (std::strcmp(n, "MenuPanelScale") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= 0.2f && s <= 1.f)
+                    g_MenuPanelScale = s;
+            }
+            else if (std::strcmp(n, "MenuCursorSmoothSec") == 0)
+            {
+                const float s = static_cast<float>(atof(val));
+                if (s >= 0.02f && s <= 0.6f)
+                    g_MenuCursorSmoothSec = s;
+            }
             else if (std::strcmp(n, "HudMaxFov") == 0)
             {
                 const float s = static_cast<float>(atof(val));
@@ -506,7 +523,11 @@ namespace bmvr
         else if (name == "abs_view")
             g_TryAbsView = false;
         else if (name == "menu_vr")
-            g_TryMenuCompositor = false;
+        {
+            Log("Ignoring menu_vr skip (%s): empty-map GameUI Submit must stay on",
+                via ? via : "skip file");
+            return;
+        }
         else if (name == "rel_look")
             g_TryRelativeHmdLook = false;
         else if (name == "stereo_copy")
@@ -627,6 +648,11 @@ namespace bmvr
             if (std::strcmp(n, "mat_queue") == 0)
             {
                 Log("Ignoring mat_queue skip-file entry (other-build policy; own crash-sticky still honored)");
+                continue;
+            }
+            if (std::strcmp(n, "menu_vr") == 0)
+            {
+                Log("Ignoring menu_vr skip-file entry (retry 2D capture Submit on background*)");
                 continue;
             }
             if (std::strcmp(n, "fl_gbmatch") == 0)
@@ -961,7 +987,14 @@ namespace bmvr
         ConsumeIfStuck(L"named_rt", g_TryNamedRT, "named_rt", "MaterialSystem named eye RTs");
         ConsumeIfStuck(L"wait_idle", g_TryWaitIdle, "wait_idle", "WaitDeviceIdle");
         ConsumeIfStuck(L"abs_view", g_TryAbsView, "abs_view", "absolute HMD CViewSetup");
-        ConsumeIfStuck(L"menu_vr", g_TryMenuCompositor, "menu_vr", "menu/background compositor Submit");
+        // 2026-08-16 hang persist-skipped this. Skip-file is already ignored.
+        // 2026-09-03: BeginRisky stayed armed until LevelInit, so quitting (or
+        // an install killing bms.exe) from GameUI left bmvr_in_menu_vr.flag.
+        // Next launch then set menuVR=0, createdRT=0, helper submitted=0,
+        // HMD black. Do not ConsumeIfStuck — retry 2D capture every launch.
+        for (const auto& dir : FlagDirs())
+            DeleteFileW((dir + L"\\bmvr_in_menu_vr.flag").c_str());
+        Log("Ignoring menu_vr crash-sticky (empty-map GameUI Submit must stay on)");
         // First gameplay RenderView BeginRisky(rel_look) then DME/FindMaterial
         // died (2026-08-19). That is not the look copy. Same as skip-file ignore.
         for (const auto& dir : FlagDirs())

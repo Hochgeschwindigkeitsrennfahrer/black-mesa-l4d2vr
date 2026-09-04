@@ -509,14 +509,32 @@ namespace
             L4D2VR_TextContainsI(runtimeName, "Meta");
     }
 
+    bool RuntimeNameLooksLikeSteamVrMetaCompatibility(const char* runtimeName)
+    {
+        // Steam Link on Quest: xrGetInstanceProperties reports
+        // "SteamVR/OpenXR in Meta compatibility mode". That compositor uses
+        // Meta's image Y, not the inverted SteamVR+Touch path.
+        return RuntimeNameLooksLikeSteamVR(runtimeName) &&
+            runtimeName &&
+            L4D2VR_TextContainsI(runtimeName, "Meta compatibility");
+    }
+
     bool ShouldAutoFlipSubmitY(const char* runtimeName, uint32_t controllerFamily, std::string& reason)
     {
         // SteamVR OpenXR on Quest (Touch) is inverted; VDXR/WMR/Oculus are not.
-        // A negative viewport Y-flip on G2/SteamVR made yellow/white bands
-        // (2026-09-01). Transfer-blit dstOffsets Y-swap is a no-op on NVIDIA.
-        // Auto-flip only SteamVR+Touch, via a second blit VS that negates
-        // NDC Y. UV 0/1 swap did not change the Quest SteamVR image
-        // (2026-09-01). Transfer dstOffsets swap is a no-op on NVIDIA.
+        // Steam Link reports as SteamVR in Meta compatibility mode and must
+        // not get the SteamVR+Touch Y-flip (2026-09-03, Quest 3, flip on =
+        // upside-down). A negative viewport Y-flip on G2/SteamVR made
+        // yellow/white bands (2026-09-01). Transfer-blit dstOffsets Y-swap
+        // is a no-op on NVIDIA. Auto-flip only SteamVR+Touch, via a second
+        // blit VS that negates NDC Y. UV 0/1 swap did not change the Quest
+        // SteamVR image (2026-09-01).
+        if (RuntimeNameLooksLikeSteamVrMetaCompatibility(runtimeName))
+        {
+            reason = "SteamVR/OpenXR Meta compatibility (Steam Link); no submit Y-flip";
+            return false;
+        }
+
         const bool steamVrConvention = RuntimeNameLooksLikeSteamVR(runtimeName);
         bool vdForwardsSteamVr = false;
         if (RuntimeNameLooksLikeVirtualDesktop(runtimeName))
@@ -858,6 +876,37 @@ namespace
             rect.x = 0;
         if (rect.y < 0)
             rect.y = 0;
+        return rect;
+    }
+
+    // Largest centered sub-rect of `width`×`height` with aspect aspectW:aspectH.
+    // Used to crop a 16:9 menu out of a portrait HMD swapchain.
+    XrRect2Di AspectFitImageRect(uint32_t width, uint32_t height, uint32_t aspectW, uint32_t aspectH)
+    {
+        XrRect2Di rect{};
+        rect.extent.width = 1;
+        rect.extent.height = 1;
+        if (width == 0 || height == 0 || aspectW == 0 || aspectH == 0)
+            return rect;
+        const int32_t w = static_cast<int32_t>(width);
+        const int32_t h = static_cast<int32_t>(height);
+        if (static_cast<int64_t>(w) * static_cast<int64_t>(aspectH) <=
+            static_cast<int64_t>(h) * static_cast<int64_t>(aspectW))
+        {
+            rect.extent.width = w;
+            rect.extent.height = std::max(1, static_cast<int32_t>(
+                (static_cast<int64_t>(w) * static_cast<int64_t>(aspectH)) / static_cast<int64_t>(aspectW)));
+            rect.offset.x = 0;
+            rect.offset.y = (h - rect.extent.height) / 2;
+        }
+        else
+        {
+            rect.extent.height = h;
+            rect.extent.width = std::max(1, static_cast<int32_t>(
+                (static_cast<int64_t>(h) * static_cast<int64_t>(aspectW)) / static_cast<int64_t>(aspectH)));
+            rect.offset.y = 0;
+            rect.offset.x = (w - rect.extent.width) / 2;
+        }
         return rect;
     }
 
@@ -8517,6 +8566,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 RefreshFlipSubmitY();
 
                 bool layerReady = false;
+                bool poseMono2d = false;
+                bool addedMono2dQuad = false;
                 uint32_t overlayLayerCount = 0;
                 std::array<XrCompositionLayerProjectionView, 2> projectionViews{};
                 std::array<XrCompositionLayerQuad, kMaxOpenXrOverlayLayers> overlayLayers{};
@@ -8821,6 +8872,12 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                                     }
                                 }
                             }
+                            // 2D GameUI is the same letterboxed HWND in both eyes.
+                            // Matching pose+FOV on a stereo projection layer still
+                            // diploped on Oculus 1.207 (Horizon Link, 2026-09-03).
+                            // Submit that frame as one both-eyes quad instead.
+                            poseMono2d = haveGameRenderPose &&
+                                (projectionRenderPose.reserved1 & L4D2VR_OPENXR_POSE_FLAG_MONO) != 0;
                             if (options.swapProjectionViewOrder)
                             {
                                 std::swap(projectionViews[0], projectionViews[1]);
@@ -9048,6 +9105,83 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                                 }
                             }
                         }
+                        // HUD overlays stay hidden during 2D (game-side). The
+                        // menu picture itself must not be a stereo projection.
+                        if (poseMono2d &&
+                            overlayLayerCount < overlayLayers.size() &&
+                            !m_Eyes.empty() &&
+                            m_Eyes[0].handle != XR_NULL_HANDLE)
+                        {
+                            // Pause-HUD 1.15m × 1.35m plus a 16:9 crop of the
+                            // portrait swapchain left the 0.70 letterbox at
+                            // ~43° and 1.15m (too far vs the old projection).
+                            // Crop to that letterbox and sit it ~arm's length
+                            // at ~78° so it reads like MenuPanelScale=0.70.
+                            constexpr float kMenuQuadDistanceM = 0.65f;
+                            constexpr float kMenuQuadWidthM = 1.05f;
+                            constexpr float kMenuQuadContentScale = 0.70f;
+                            L4D2VROpenXrOverlayDesc menu{};
+                            menu.distanceMeters = kMenuQuadDistanceM;
+                            menu.widthMeters = kMenuQuadWidthM;
+                            menu.heightMeters = menu.widthMeters * 9.0f / 16.0f;
+                            menu.offsetMeters[1] = -0.02f;
+
+                            XrPosef menuCenter{};
+                            menuCenter.orientation = XrQuaternionf{ 0.0f, 0.0f, 0.0f, 1.0f };
+                            const bool haveMenuCenter = lastGameRenderPose.valid != 0;
+                            if (haveMenuCenter)
+                            {
+                                menuCenter.orientation = NormalizeOpenXrQuaternion(lastGameRenderPose.orientation);
+                                menuCenter.position = XrVector3f{
+                                    lastGameRenderPose.position[0],
+                                    lastGameRenderPose.position[1],
+                                    lastGameRenderPose.position[2]
+                                };
+                            }
+
+                            XrRect2Di crop = AspectFitImageRect(m_Eyes[0].width, m_Eyes[0].height, 16u, 9u);
+                            {
+                                const int32_t cw = std::max(1, static_cast<int32_t>(
+                                    static_cast<float>(crop.extent.width) * kMenuQuadContentScale + 0.5f));
+                                const int32_t ch = std::max(1, static_cast<int32_t>(
+                                    static_cast<float>(crop.extent.height) * kMenuQuadContentScale + 0.5f));
+                                crop.offset.x += (crop.extent.width - cw) / 2;
+                                crop.offset.y += (crop.extent.height - ch) / 2;
+                                crop.extent.width = cw;
+                                crop.extent.height = ch;
+                            }
+                            XrCompositionLayerQuad& quad = overlayLayers[overlayLayerCount++];
+                            quad.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+                            quad.next = nullptr;
+                            quad.layerFlags = 0;
+                            quad.space = m_AppSpace;
+                            quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+                            quad.subImage.swapchain = m_Eyes[0].handle;
+                            quad.subImage.imageArrayIndex = 0;
+                            quad.subImage.imageRect = crop;
+                            quad.pose = BuildOverlayPose(
+                                menu,
+                                locatedViews,
+                                locatedCount,
+                                haveMenuCenter ? &menuCenter : nullptr);
+                            quad.size.width = menu.widthMeters;
+                            quad.size.height = menu.heightMeters;
+                            addedMono2dQuad = true;
+                            static bool s_loggedMono2dQuad = false;
+                            if (!s_loggedMono2dQuad)
+                            {
+                                s_loggedMono2dQuad = true;
+                                m_Log.Print(
+                                    "OpenXR 2D menu/pause: quad layer both-eyes crop=%d,%d %dx%d size=%.2fx%.2fm dist=%.2fm; stereo projection skipped",
+                                    crop.offset.x,
+                                    crop.offset.y,
+                                    crop.extent.width,
+                                    crop.extent.height,
+                                    menu.widthMeters,
+                                    menu.heightMeters,
+                                    menu.distanceMeters);
+                            }
+                        }
                         if (blittedAnyOverlayFrame)
                             lastSubmittedOverlayFrameGeneration = overlayFrameGeneration;
                     }
@@ -9059,7 +9193,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 layer.views = projectionViews.data();
                 std::array<const XrCompositionLayerBaseHeader*, 1 + kMaxOpenXrOverlayLayers> layers{};
                 uint32_t layerCount = 0;
-                const bool submitProjectionLayer = layerReady && !options.disableProjectionLayer;
+                const bool submitProjectionLayer =
+                    layerReady && !options.disableProjectionLayer && !addedMono2dQuad;
                 if (layerReady && options.disableProjectionLayer)
                 {
                     static ULONGLONG s_lastProjectionLayerDisabledLogMs = 0;
@@ -9089,11 +9224,12 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                         const XrRect2Di& leftRect = projectionViews[0].subImage.imageRect;
                         const XrRect2Di& rightRect = projectionViews[1].subImage.imageRect;
                         m_Log.Print(
-                            "[OpenXR][EndFrameSubmit] layerCount=%u projection=%u projectionReady=%u overlays=%u displayTime=%lld envBlend=%u disableProjectionLayer=%u swapProjectionEyes=%u swapProjectionViewOrder=%u mirrorProjectionHorizontal=%u useSymmetricProjectionFov=%u useGameRenderPoseForProjection=%u forceMonoProjectionEye=%s(%d) forceMonoProjectionView=%s(%d) slot0Swapchain=0x%llX slot0Rect=(%d,%d %dx%d) slot1Swapchain=0x%llX slot1Rect=(%d,%d %dx%d) note=after_this_xrEndFrame_hands_layers_to_runtime_compositor_no_app_readback_image_available",
+                            "[OpenXR][EndFrameSubmit] layerCount=%u projection=%u projectionReady=%u overlays=%u mono2dQuad=%u displayTime=%lld envBlend=%u disableProjectionLayer=%u swapProjectionEyes=%u swapProjectionViewOrder=%u mirrorProjectionHorizontal=%u useSymmetricProjectionFov=%u useGameRenderPoseForProjection=%u forceMonoProjectionEye=%s(%d) forceMonoProjectionView=%s(%d) slot0Swapchain=0x%llX slot0Rect=(%d,%d %dx%d) slot1Swapchain=0x%llX slot1Rect=(%d,%d %dx%d) note=after_this_xrEndFrame_hands_layers_to_runtime_compositor_no_app_readback_image_available",
                             layerCount,
                             submitProjectionLayer ? 1u : 0u,
                             layerReady ? 1u : 0u,
                             overlayLayerCount,
+                            addedMono2dQuad ? 1u : 0u,
                             static_cast<long long>(endInfo.displayTime),
                             static_cast<unsigned int>(endInfo.environmentBlendMode),
                             options.disableProjectionLayer ? 1u : 0u,
@@ -9128,10 +9264,13 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     m_Bridge.Update(L4D2VROpenXrBridgeStatus::SubmittedFrame, 0, submittedFrames,
                         submitProjectionLayer
                         ? (overlayLayerCount ? "OpenXR Vulkan projection/quad frame submitted" : "OpenXR Vulkan projection frame submitted")
-                        : "OpenXR Vulkan frame submitted without projection layer");
+                        : (addedMono2dQuad
+                            ? "OpenXR Vulkan 2D menu quad submitted"
+                            : "OpenXR Vulkan frame submitted without projection layer"));
                     if (submittedFrames == 1 || (submittedFrames % 60) == 0)
-                        m_Log.Print("Submitted OpenXR Vulkan frame %u layers=%u projection=%u overlays=%u",
-                            submittedFrames, layerCount, submitProjectionLayer ? 1u : 0u, overlayLayerCount);
+                        m_Log.Print("Submitted OpenXR Vulkan frame %u layers=%u projection=%u overlays=%u mono2dQuad=%u",
+                            submittedFrames, layerCount, submitProjectionLayer ? 1u : 0u, overlayLayerCount,
+                            addedMono2dQuad ? 1u : 0u);
                 }
                 if (options.targetFrames > 0 && submittedFrames >= options.targetFrames)
                     break;

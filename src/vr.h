@@ -21,6 +21,7 @@ class Game;
 class ITexture;
 class IMatRenderContext;
 class CViewSetup;
+class CUserCmd;
 
 struct IDirect3DDevice9;
 struct IDirect3DTexture9;
@@ -169,6 +170,13 @@ public:
     HANDLE m_PoseWaiterThread = nullptr;
     Vector m_SetupOrigin{};
     Vector m_SetupOriginToHMD{};
+    float m_StereoZNear = 7.f;
+    float m_StereoZFar = 28377.f;
+    Vector m_FlashlightOrigin{};
+    Vector m_FlashlightForward{};
+    bool m_FlashlightLive = false;
+    bool m_VrGlovesDrawnIntoScene = false;
+    IDirect3DBaseTexture9* m_SceneCubemap = nullptr;
 
     bool m_ReShadeVRCompat = false;
     vr::VRTextureBounds_t m_TextureBounds[2]{};
@@ -385,6 +393,11 @@ public:
     vr::VRActionHandle_t m_ActionPause = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionSprint = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionMenuSelect = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionMenuBack = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionMenuUp = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionMenuDown = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionMenuLeft = vr::k_ulInvalidActionHandle;
+    vr::VRActionHandle_t m_ActionMenuRight = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionWeaponMenu = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionInventoryQuickSwitch = vr::k_ulInvalidActionHandle;
     vr::VRActionHandle_t m_ActionSkeletonLeft = vr::k_ulInvalidActionHandle;
@@ -409,6 +422,8 @@ public:
     std::atomic<uint32_t> m_PendingFireHaptic{ 0 };
     std::atomic<int> m_PendingGameUi{ 0 };
     bool m_GameUiVisible = false;
+    DWORD m_GameUiActivateMs = 0;
+    void* m_EngineVGuiFromPaint = nullptr;
     bool m_PressedTurn = false;
     bool m_StereoEyesDrawnThisFrame = false;
     // 0 = mono, 1 = left, 2 = right. Matches Source StereoEye_t.
@@ -473,6 +488,7 @@ public:
     bool EnsureOpenXrPublishTextures(IDirect3DDevice9* device, UINT w, UINT h);
     void ReleaseOpenXrPublishTextures();
     Vector GetViewAngle() const;
+    void UpdateScopeZoomSmooth();
     Vector GetViewOrigin(const Vector& setupOrigin) const;
     void GetViewBasis(Vector* forward, Vector* right, Vector* up) const;
     Vector GetViewOriginLeft(const Vector& setupOrigin) const;
@@ -495,6 +511,10 @@ public:
     // off when the engine is clearly unscoped, so a stuck latch cannot keep
     // the picture magnified.
     void NoteEngineScopeFov(float engineFov);
+    void NoteStereoClipPlanes(float zNear, float zFar);
+    void NoteFlashlightState(const Vector& origin, const Vector& forward);
+    bool CopyFlashlightState(Vector& origin, Vector& forward) const;
+    bool VrGlovesDrawnIntoScene() const { return m_VrGlovesDrawnIntoScene; }
     void CaptureFrameBeforePresent();
     bool BlitCurrentGameColorTo(IDirect3DSurface9* dst, bool flushGpu = false);
     bool BlitHmdViewFromBackbuffer(IDirect3DSurface9* dst, bool flushGpu = false);
@@ -564,13 +584,21 @@ public:
     void ClearUnusedDesktopBackbuffer();
     void ProcessInput();
     void ApplyMenuCursor();
+    void DrawMenuCursorOnSurface(IDirect3DDevice9* device, IDirect3DSurface9* surf);
+    void ApplyMenuNavigation();
     void QueueEscapeKey();
+    void QueueVirtualKey(int vk);
     void QueueGameUiToggle(bool currentlyPaused);
     void FlushPendingGameUi();
+    void NoteEngineVGui(void* engineVgui);
     bool GameUiVisible() const { return m_GameUiVisible; }
     // True when the pause/GameUI overlay should exist. Extra VGui_Paint of
     // PAINT_UIPANELS during gameplay is GameUI glass, not HEV HUD.
     bool PauseUiActive() const;
+    bool EngineGameUiVisible() const;
+    void SyncGameUiFromEngine();
+    bool Want2dMenuPanel() const;
+    void LatchMenuPanelIfNeeded();
     void NoteHudPainted() { m_HudPaintedThisFrame.store(true, std::memory_order_release); }
     bool HudPaintedThisFrame() const { return m_HudPaintedThisFrame.load(std::memory_order_acquire); }
     void UpdateCrowbarMelee();
@@ -580,6 +608,7 @@ public:
     void UpdateAimCrosshair();
     // Cleared by UpdateAimCrosshair when the reticle is off or the ray missed.
     bool AimCrosshairVisible() const { return m_AimCrosshairValid; }
+    bool TryGetAimCrosshairWorld(Vector& out) const;
     // Gordon has no gloves before the HEV suit (intro tram). Sampled on the
     // game thread; defaults true so a failed netvar scan cannot hide the hands.
     // Combined with VrHideHandsWithoutSuit — false hides HEV gloves and the
@@ -592,7 +621,14 @@ public:
     bool ScopeZoomActive() const { return m_ScopeZoomActive; }
     static bool IsScopedWeaponModel(const char* model);
     static bool IsRpgWeaponModel(const char* model);
+    static bool IsGluonWeaponModel(const char* model);
     bool RpgLaserLatched() const { return m_RpgLaserLatched; }
+    void SetRpgLaserActive(bool on) { m_RpgLaserActive = on; }
+    bool RpgLaserActive() const { return m_RpgLaserActive || m_RpgLaserLatched; }
+    void UpdateRpgLaserPoint();
+    void NoteRpgLaserWorld(const Vector& world);
+    bool TryGetRpgLaserWorld(Vector& out) const;
+    bool RpgLaserVisible() const { return m_RpgLaserPointValid; }
     bool WeaponMenuOpen() const { return m_WeaponMenuOpen; }
     bool WeaponMenuClickHeld() const { return m_WeaponMenuClickHeld; }
     bool WeaponMenuStickHeld() const;
@@ -605,7 +641,12 @@ public:
     bool TryGetVrMuzzleWorld(Vector& origin) const;
     bool TryGetVrShootOrigin(Vector& origin) const;
     // Visual beam/laser segment: muzzle start, aim-ray impact end.
-    bool TryGetVrBeamSegment(Vector& start, Vector& end) const;
+    // Cached per frame so tau/gluon hooks get the same result.
+    bool TryGetVrBeamSegment(Vector& start, Vector& end, Vector* outNormal = nullptr) const;
+    mutable Vector m_CachedBeamStart{};
+    mutable Vector m_CachedBeamEnd{};
+    mutable Vector m_CachedBeamNormal{};
+    mutable int m_CachedBeamFrame = -1;
     bool ScaleViewmodelRenderableAttachment(void* renderable, Vector& origin) const;
     void FlushPendingWeaponSounds();
     void QueueWeaponMenuSound(uint32_t bit, int kind = 0, int entityIndex = 0);
@@ -615,8 +656,8 @@ public:
     bool IsPerformingMelee() const { return m_PerformingMelee; }
     bool TryGetMeleeBladeViewAngles(QAngle& out) const;
     bool TryGetMeleeTraceOrigin(Vector& origin) const;
-    // Grip position and axis of the crowbar model while a VR swing is live, so
-    // the engine's melee trace runs along the blade the player can see.
+    // Visible crowbar strike point and blade axis while a VR swing is live, so
+    // the engine's melee trace runs along the bar the player can see.
     bool TryGetMeleeAim(Vector& origin, QAngle& angles) const;
     // True while VR should keep fire/reload/equip sequences running.
     bool WantsWeaponActionAnim() const;
@@ -636,8 +677,12 @@ public:
     void NoteViewmodelModel(const char* modelName);
     void NoteViewmodelWeaponBake(const char* modelName, const char* boneName, float restX, float restY, float restZ);
     vr::ETrackedControllerRole AimControllerRole() const;
-    void DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye);
+    bool DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye, bool drawOverlays = true, bool drawGloves = true);
+    bool DrawVrGlovesIntoBlitSource(int stereoEye);
     void DrawIndependentHandsOnDesktop();
+    // Last cubemap the engine bound (weapon $envmap). Gloves sample this.
+    void NoteSceneCubemap(IDirect3DBaseTexture9* texture);
+    IDirect3DBaseTexture9* SceneCubemap() const { return m_SceneCubemap; }
     bool GetFingerCurls(vr::VRActionHandle_t skeletonAction, float outCurls[5]) const;
     void TryCompositorPostPresentHandoff(DWORD nowMs, DWORD poseAgeMs);
 
@@ -733,9 +778,17 @@ private:
     bool m_WearingHevSuit = true;
     bool m_ScopeZoomActive = false;
     bool m_CrossbowZoomLatched = false;
+    float m_ZoomSmoothPitch = 0.f;
+    float m_ZoomSmoothYaw = 0.f;
+    float m_ZoomSmoothRoll = 0.f;
+    bool m_ZoomSmoothValid = false;
+    double m_ZoomSmoothMs = 0.0;
     float m_EngineViewFov = 0.f;
     bool m_SawEngineZoomFov = false;
     bool m_RpgLaserLatched = false;
+    bool m_RpgLaserActive = false;
+    Vector m_RpgLaserWorld{};
+    bool m_RpgLaserPointValid = false;
     QAngle m_LastFireAim{};
     bool m_HasLastFireAim = false;
     void DrawAimCrosshair(IDirect3DDevice9* device, float sx, float sy, UINT h) const;
@@ -746,6 +799,21 @@ private:
     bool m_HudOverlayCreateAttempted = false;
     std::atomic<bool> m_HudPaintedThisFrame{ false };
     bool m_MenuTriggerWasDown = false;
+    bool m_MenuCursorValid = false;
+    bool m_MenuCursorSmoothValid = false;
+    float m_MenuCursorSmoothX = 0.f;
+    float m_MenuCursorSmoothY = 0.f;
+    int m_MenuCursorX = 0;
+    int m_MenuCursorY = 0;
+    double m_MenuCursorSmoothMs = 0.0;
+    bool m_MenuPanelPoseValid = false;
+    L4D2VROpenXrPoseDesc m_MenuPanelPose{};
+    Vector m_MenuPanelFwd{};
+    Vector m_MenuPanelRight{};
+    Vector m_MenuPanelUp{};
+    DWORD m_MenuClickMs = 0;
+    int m_MenuClickX = 0;
+    int m_MenuClickY = 0;
     bool m_WeaponMenuOpen = false;
     bool m_WeaponMenuClickHeld = false;
     bool m_WeaponMenuOpenedThisHold = false;

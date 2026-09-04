@@ -60,9 +60,11 @@ Virtual Desktop (Quest 2/3):
   Virtual Desktop Streamer → Options → OpenXR Runtime = VDXR
   SteamVR in that dropdown is a known issue: the game renders upside-down.
 
-SteamVR / Meta Link:
+SteamVR / Meta Link / Steam Link:
   SteamVR → Settings → OpenXR → Set SteamVR as OpenXR runtime
   Do not leave Oculus/Meta as the Windows ActiveRuntime while SteamVR runs.
+  Steam Link on Quest reports SteamVR OpenXR in Meta compatibility mode.
+  That path must not use the SteamVR+Touch submit Y-flip (upside-down).
 
 Then:
 1. Start SteamVR (Link) or Virtual Desktop with VDXR as above.
@@ -139,10 +141,12 @@ aim pose plus a 5.5 unit pull-back (aim origin is ahead of grip). Hands sit
 on the grip and point along the aim ray. If you already saved 5.5 extras in
 VR/viewmodel_offsets.txt, reset those weapons (numpad 0) so they do not
 double. Virtual Desktop users should set Streamer Options → OpenXR Runtime
-to VDXR. Meta Link / Quest 3 uses the Link OpenXR runtime. SteamVR + Touch
-uses a shader NDC Y-flip (not a negative viewport — that made yellow bands
-on G2). Oculus/Link does not Y-flip; it crops the 108° eye image to the
-runtime frustum and submits runtime FOV.
+to VDXR. Meta Link / Quest 3 uses the Link OpenXR runtime. Steam Link uses
+SteamVR OpenXR in Meta compatibility mode and does not Y-flip. SteamVR +
+Touch (not that Meta-compat string) uses a shader NDC Y-flip (not a
+negative viewport — that made yellow bands on G2). Oculus/Link does not
+Y-flip; it crops the 108° eye image to the runtime frustum and submits
+runtime FOV.
 
 Those take effect on the next launch (config is read at DLL load).
 

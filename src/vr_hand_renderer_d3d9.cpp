@@ -28,8 +28,7 @@ namespace
 
     const char* kVertexShaderSource = R"HLSL(
 float4 gWorldViewProjectionRows[4] : register(c0);
-float4 gLightDirectionAmbient : register(c4);
-float4 gWorldNormalRows[3] : register(c5);
+float4 gWorldRows[3] : register(c5);
 float4 gBoneRows[192] : register(c8);
 
 struct VS_INPUT
@@ -45,7 +44,8 @@ struct VS_OUTPUT
 {
     float4 position : POSITION0;
     float2 uv : TEXCOORD0;
-    float light : TEXCOORD1;
+    float3 worldNormal : TEXCOORD1;
+    float3 worldPos : TEXCOORD2;
 };
 
 float3 TransformBonePosition(float3 position, int joint)
@@ -75,34 +75,85 @@ VS_OUTPUT main(VS_INPUT input)
         TransformBoneNormal(input.normal, joints.y) * input.weights.y +
         TransformBoneNormal(input.normal, joints.z) * input.weights.z +
         TransformBoneNormal(input.normal, joints.w) * input.weights.w);
-    float3 worldNormal = normalize(float3(
-        dot(skinnedNormal, gWorldNormalRows[0].xyz),
-        dot(skinnedNormal, gWorldNormalRows[1].xyz),
-        dot(skinnedNormal, gWorldNormalRows[2].xyz)));
-    float4 p = float4(skinnedPosition, 1.0);
+    float4 sp = float4(skinnedPosition, 1.0);
+    output.worldPos = float3(
+        dot(sp, gWorldRows[0]),
+        dot(sp, gWorldRows[1]),
+        dot(sp, gWorldRows[2]));
+    output.worldNormal = normalize(float3(
+        dot(skinnedNormal, gWorldRows[0].xyz),
+        dot(skinnedNormal, gWorldRows[1].xyz),
+        dot(skinnedNormal, gWorldRows[2].xyz)));
     output.position = float4(
-        dot(p, gWorldViewProjectionRows[0]),
-        dot(p, gWorldViewProjectionRows[1]),
-        dot(p, gWorldViewProjectionRows[2]),
-        dot(p, gWorldViewProjectionRows[3]));
+        dot(sp, gWorldViewProjectionRows[0]),
+        dot(sp, gWorldViewProjectionRows[1]),
+        dot(sp, gWorldViewProjectionRows[2]),
+        dot(sp, gWorldViewProjectionRows[3]));
     output.uv = input.uv;
-    float rawLight = (gLightDirectionAmbient.w +
-        max(dot(worldNormal, -gLightDirectionAmbient.xyz), 0.0) * 0.62) * gWorldNormalRows[2].w;
-    float visibleLight = saturate(rawLight);
-    float sceneScale = saturate(gWorldNormalRows[2].w);
-    float rescue = 0.16 * sqrt(sceneScale) * saturate((0.18 - visibleLight) / 0.18);
-    output.light = saturate(visibleLight + rescue);
     return output;
 }
 )HLSL";
 
     const char* kPixelShaderSource = R"HLSL(
 sampler2D gTexture : register(s0);
+samplerCUBE gEnv : register(s1);
+float4 gSceneLightRgb : register(c0);
+float4 gEyePosition : register(c1);
+float4 gLightDirectionAmbient : register(c2);
+float4 gEnvAmount : register(c3);
 
-float4 main(float2 uv : TEXCOORD0, float light : TEXCOORD1) : COLOR0
+struct PS_INPUT
 {
-    float4 color = tex2D(gTexture, uv);
-    return float4(color.rgb * light, 1.0);
+    float2 uv : TEXCOORD0;
+    float3 worldNormal : TEXCOORD1;
+    float3 worldPos : TEXCOORD2;
+};
+
+float4 main(PS_INPUT input) : COLOR0
+{
+    float4 color = tex2D(gTexture, input.uv);
+    float3 N = normalize(input.worldNormal);
+    float3 V = normalize(gEyePosition.xyz - input.worldPos);
+    float3 L = normalize(-gLightDirectionAmbient.xyz);
+    float3 scene = gSceneLightRgb.xyz;
+    float exposure = saturate(gSceneLightRgb.w);
+
+    float wrap = saturate(dot(N, L) * 0.5 + 0.5);
+    float diffuse = 0.35 + wrap * 0.65;
+    float3 lit = color.rgb * diffuse * scene;
+
+    float chroma = max(color.r, max(color.g, color.b)) - min(color.r, min(color.g, color.b));
+    float orange = saturate((color.r - color.g) * 5.0 + 0.15)
+        * saturate((color.r - color.b) * 2.8)
+        * saturate((chroma - 0.045) * 12.0)
+        * saturate((color.r - 0.08) * 6.0);
+    float metal = orange * saturate(gLightDirectionAmbient.w);
+
+    float ndotv = saturate(dot(N, V));
+    float f = 1.0 - ndotv;
+    float3 H = normalize(L + V);
+
+    float rubberFresnel = lerp(0.03, 0.16, saturate(f * 1.2));
+    float rubberPhong = pow(saturate(dot(N, H)), 18.0) * 0.20 * rubberFresnel;
+    float3 spec = color.rgb * rubberPhong * scene * (1.0 - metal);
+
+    float metalFresnel = lerp(0.35, 1.15, saturate(f * 1.1)) + f * f * 1.2;
+    float metalPhong = pow(saturate(dot(N, H)), 36.0) * 2.4 * saturate(metalFresnel);
+    float3 metalSpecColor = lerp(color.rgb, float3(1.0, 0.72, 0.28), 0.40);
+    spec += metalSpecColor * metalPhong * scene * metal;
+
+    float3 R = reflect(-V, N);
+    float sky = saturate(R.z * 0.55 + 0.45);
+    float3 fake = lerp(scene * 0.20, scene * 1.15 + float3(0.18, 0.10, 0.04), sky) * color.rgb;
+    float3 cubeDir = float3(R.x, R.z, R.y);
+    float3 cubeSample = texCUBE(gEnv, cubeDir).rgb * lerp(color.rgb, float3(1.0, 1.0, 1.0), 0.22);
+    float cubeLuma = dot(cubeSample, float3(0.30, 0.59, 0.11));
+    float useCube = saturate(gEnvAmount.x) * saturate(cubeLuma * 3.5);
+    float3 envCol = lerp(fake, cubeSample, useCube);
+    float envDim = lerp(0.55, 1.0, saturate(exposure * 1.8));
+    spec += envCol * saturate(metalFresnel) * (0.85 * metal) * envDim;
+
+    return float4(saturate(lit + spec), 1.0);
 }
 )HLSL";
 
@@ -609,7 +660,10 @@ bool VrHandRendererD3D9::Draw(
     const VrHandMatrix4& world,
     const VrHandMatrix4& worldViewProjection,
     VrHandDrawPass drawPass,
-    float sceneLightScale,
+    const Vector& sceneLightRgb,
+    const Vector& eyeOrigin,
+    float envExposure,
+    IDirect3DBaseTexture9* envCubemap,
     std::string& outError)
 {
     outError.clear();
@@ -632,7 +686,7 @@ bool VrHandRendererD3D9::Draw(
 
     const MeshResources& mesh = m_Meshes[static_cast<size_t>(handIndex)];
     const std::array<float, 16> wvpRows = VrHandMath::ToRows4x4(worldViewProjection);
-    VrHandMatrixRows3x4 worldNormalRows = VrHandMath::ToRows3x4(world);
+    const VrHandMatrixRows3x4 worldRows = VrHandMath::ToRows3x4(world);
 
     const bool maskPass = drawPass == VrHandDrawPass::WorldVisibilityMask;
     const bool compositePass = drawPass == VrHandDrawPass::ViewmodelComposite;
@@ -648,18 +702,16 @@ bool VrHandRendererD3D9::Draw(
     const bool opaqueStandaloneDebugBox = standaloneGeneratedBox;
     const bool opaqueStandaloneMesh = opaqueStandaloneMagazine || opaqueStandaloneDebugBox;
 
-    // VR gloves use a lightweight directional-light approximation. Reusing that
-    // approximation for a replacement magazine made the same exported texture
-    // visibly darker than Blender and the Source viewmodel material. Keep the
-    // standalone magazine opaque and sample its base-color texture at full
-    // intensity. Exact Source-material parity still depends on exporting the same
-    // skin texture used by the active weapon replacement.
-    worldNormalRows.v[11] = opaqueStandaloneMesh
-        ? 1.0f
-        : std::clamp(sceneLightScale, 0.06f, 1.25f);
-    const float gloveLight[4] = { 0.35f, -0.45f, -0.82f, 0.14f };
-    const float magazineUnlit[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
-    const float* light = opaqueStandaloneMesh ? magazineUnlit : gloveLight;
+    const float sceneConst[4] = {
+        opaqueStandaloneMesh ? 1.0f : sceneLightRgb.x,
+        opaqueStandaloneMesh ? 1.0f : sceneLightRgb.y,
+        opaqueStandaloneMesh ? 1.0f : sceneLightRgb.z,
+        opaqueStandaloneMesh ? 1.0f : std::clamp(envExposure, 0.03f, 1.5f) };
+    const float eyeConst[4] = { eyeOrigin.x, eyeOrigin.y, eyeOrigin.z, 1.0f };
+    const float hevOrangeMetal =
+        asset.sourcePath.find("hev_glove") != std::string::npos ? 1.0f : 0.0f;
+    const float lightConst[4] = { 0.35f, -0.45f, -0.82f, hevOrangeMetal };
+    const float envAmt[4] = { (envCubemap && hevOrangeMetal > 0.5f) ? 1.0f : 0.0f, 0.0f, 0.0f, 0.0f };
     device->SetRenderState(D3DRS_ZENABLE, overlayNoDepth ? FALSE : TRUE);
     // The final color pass must write depth as well. Otherwise every triangle of the
     // same glove blends through the others, so folded fingers remain visible through
@@ -730,17 +782,29 @@ bool VrHandRendererD3D9::Draw(
     device->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
     device->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_WRAP);
     device->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_WRAP);
+    device->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(1, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
+    device->SetSamplerState(1, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(1, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    device->SetSamplerState(1, D3DSAMP_ADDRESSW, D3DTADDRESS_CLAMP);
     device->SetFVF(0);
     device->SetVertexDeclaration(m_VertexDeclaration);
     device->SetVertexShader(m_VertexShader);
     device->SetPixelShader(m_PixelShader);
+    device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+    device->SetRenderState(D3DRS_FOGENABLE, FALSE);
     device->SetTexture(0, mesh.texture);
+    device->SetTexture(1, envCubemap);
     device->SetStreamSource(0, mesh.vertexBuffer, 0, sizeof(VrHandVertex));
     device->SetIndices(mesh.indexBuffer);
     device->SetVertexShaderConstantF(0, wvpRows.data(), 4);
-    device->SetVertexShaderConstantF(4, light, 1);
-    device->SetVertexShaderConstantF(5, worldNormalRows.v.data(), 3);
+    device->SetVertexShaderConstantF(5, worldRows.v.data(), 3);
     device->SetVertexShaderConstantF(kBoneConstantStart, palette.front().v.data(), static_cast<UINT>(palette.size() * 3u));
+    device->SetPixelShaderConstantF(0, sceneConst, 1);
+    device->SetPixelShaderConstantF(1, eyeConst, 1);
+    device->SetPixelShaderConstantF(2, lightConst, 1);
+    device->SetPixelShaderConstantF(3, envAmt, 1);
 
     D3DVIEWPORT9 oldViewport{};
     const bool haveOldViewport = SUCCEEDED(device->GetViewport(&oldViewport));

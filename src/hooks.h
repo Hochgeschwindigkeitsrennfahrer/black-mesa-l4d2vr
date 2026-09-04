@@ -74,6 +74,7 @@ typedef void(__thiscall* tCopyRenderTargetToTextureEx)(void* thisptr, ITexture* 
 typedef void(__thiscall* tVgui_Paint)(void* thisptr, int mode);
 typedef void(__thiscall* tGetBackBufferDimensions)(void* thisptr, int& width, int& height);
 typedef void(__thiscall* tGetScreenSize)(void* thisptr, int& width, int& height);
+typedef float(__thiscall* tGetScreenAspectRatio)(void* thisptr);
 typedef ITexture*(__thiscall* tCreateNamedRTEx)(void* thisptr, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags);
 typedef float(__thiscall* tGetViewModelFOV)(void* thisptr);
 typedef void(__thiscall* tEndFrame)(void* thisptr);
@@ -85,8 +86,26 @@ typedef void(__thiscall* tGetShootAngles)(void* thisptr, QAngle* out);
 typedef int(__thiscall* tGetAttachmentVec)(void* thisptr, int number, Vector* origin, QAngle* angles);
 typedef int(__thiscall* tGetAttachmentMatrix)(void* thisptr, int number, float* matrix);
 typedef void(__thiscall* tTauBeamView)(void* thisptr, Vector* startEnd, void* a2, float a3, int a4, int a5);
-typedef void(__thiscall* tTauBeamWorld)(void* thisptr, Vector* start, Vector* end, float width);
+typedef void(__thiscall* tTauBeamWorld)(void* thisptr, Vector* impact, Vector* normal, float width);
+typedef void(__thiscall* tTauBeamFireTrace)(void* thisptr);
+typedef void(__thiscall* tGluonImpactTrace)(void* thisptr, void* player, CGameTrace* trace);
+typedef void(__thiscall* tGluonBeamUpdate)(void* thisptr);
+typedef void(__thiscall* tGluonBeamFxSet)(void* thisptr, void* viewmodel, Vector* start, Vector* mid, Vector* end);
+typedef int(__thiscall* tGluonBeamFxDraw)(void* thisptr, unsigned flags);
+typedef void(__thiscall* tParticleSetControlPoint)(void* thisptr, int index, Vector* origin);
+typedef void(__thiscall* tParticleMgrAddEffect)(void* thisptr, void* effect);
 typedef void(__thiscall* tRpgUpdateLaser)(void* thisptr);
+typedef void(__thiscall* tHudCrosshairPaint)(void* thisptr);
+typedef int(__thiscall* tSpriteRendererDraw)(void* thisptr, void* entity, void* model,
+    float* origin, float* angles, float scale, void* attach, int a7, int a8, int a9,
+    unsigned a10, unsigned a11, unsigned a12, unsigned a13, float frame, int a15);
+typedef void(__thiscall* tViewRenderBeamsDraw)(void* thisptr, void* beam);
+// client.dll FUN_102dcbf0 — second DrawSprite path (stdcall, ret 0x20).
+// IClientRenderable* on the stack; origin comes from vtable+4.
+typedef int(__stdcall* tSpriteRenderableDraw)(void* renderable, float scale, float frame,
+    int rendermode, int renderfx, unsigned char* color, float hdr, unsigned* unk);
+typedef int(__thiscall* tEnvLaserDotDraw)(void* thisptr, unsigned flags);
+typedef void(__cdecl* tSpriteQuad)(float* origin, float width, float height, unsigned color);
 
 class Hooks
 {
@@ -111,6 +130,7 @@ public:
     static inline Hook<tVgui_Paint> hkVgui_Paint;
     static inline Hook<tGetBackBufferDimensions> hkGetBackBufferDimensions;
     static inline Hook<tGetScreenSize> hkGetScreenSize;
+    static inline Hook<tGetScreenAspectRatio> hkGetScreenAspectRatio;
     static inline Hook<tCreateNamedRTEx> hkCreateNamedRTEx;
     static inline Hook<tGetViewModelFOV> hkGetViewModelFOV;
     static inline Hook<tEndFrame> hkEndFrame;
@@ -125,7 +145,20 @@ public:
     static inline Hook<tGetAttachmentMatrix> hkGetAttachmentMatrix;
     static inline Hook<tTauBeamView> hkTauBeamView;
     static inline Hook<tTauBeamWorld> hkTauBeamWorld;
+    static inline Hook<tTauBeamFireTrace> hkTauBeamFireTrace;
+    static inline Hook<tGluonImpactTrace> hkGluonImpactTrace;
+    static inline Hook<tGluonBeamUpdate> hkGluonBeamUpdate;
+    static inline Hook<tGluonBeamFxSet> hkGluonBeamFxSet;
+    static inline Hook<tGluonBeamFxDraw> hkGluonBeamFxDraw;
+    static inline Hook<tParticleSetControlPoint> hkParticleSetControlPoint;
+    static inline Hook<tParticleMgrAddEffect> hkParticleMgrAddEffect;
     static inline Hook<tRpgUpdateLaser> hkRpgUpdateLaser;
+    static inline Hook<tHudCrosshairPaint> hkHudCrosshairPaint;
+    static inline Hook<tSpriteRendererDraw> hkSpriteRendererDraw;
+    static inline Hook<tViewRenderBeamsDraw> hkViewRenderBeamsDraw;
+    static inline Hook<tSpriteRenderableDraw> hkSpriteRenderableDraw;
+    static inline Hook<tEnvLaserDotDraw> hkEnvLaserDotDraw;
+    static inline Hook<tSpriteQuad> hkSpriteQuad;
 
     Hooks() = default;
     explicit Hooks(Game* game);
@@ -154,6 +187,7 @@ public:
     static void __fastcall dVGui_Paint(void* ecx, void* edx, int mode);
     static void __fastcall dGetBackBufferDimensions(void* ecx, void* edx, int& width, int& height);
     static void __fastcall dGetScreenSize(void* ecx, void* edx, int& width, int& height);
+    static float __fastcall dGetScreenAspectRatio(void* ecx, void* edx);
     static ITexture* __fastcall dCreateNamedRTEx(void* ecx, void* edx, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags);
     static float __fastcall dGetViewModelFOV(void* ecx, void* edx);
     static void __fastcall dEndFrame(void* ecx, void* edx);
@@ -167,8 +201,24 @@ public:
     static int __fastcall dGetAttachmentVec(void* ecx, void* edx, int number, Vector* origin, QAngle* angles);
     static int __fastcall dGetAttachmentMatrix(void* ecx, void* edx, int number, float* matrix);
     static void __fastcall dTauBeamView(void* ecx, void* edx, Vector* startEnd, void* a2, float a3, int a4, int a5);
-    static void __fastcall dTauBeamWorld(void* ecx, void* edx, Vector* start, Vector* end, float width);
+    static void __fastcall dTauBeamWorld(void* ecx, void* edx, Vector* impact, Vector* normal, float width);
+    static void __fastcall dTauBeamFireTrace(void* ecx, void* edx);
+    static void __fastcall dGluonImpactTrace(void* ecx, void* edx, void* player, CGameTrace* trace);
+    static void __fastcall dGluonBeamUpdate(void* ecx, void* edx);
+    static void __fastcall dGluonBeamFxSet(void* ecx, void* edx, void* viewmodel, Vector* start, Vector* mid, Vector* end);
+    static int __fastcall dGluonBeamFxDraw(void* ecx, void* edx, unsigned flags);
+    static void __fastcall dParticleSetControlPoint(void* ecx, void* edx, int index, Vector* origin);
+    static void __fastcall dParticleMgrAddEffect(void* ecx, void* edx, void* effect);
     static void __fastcall dRpgUpdateLaser(void* ecx, void* edx);
+    static void __fastcall dHudCrosshairPaint(void* ecx, void* edx);
+    static int __fastcall dSpriteRendererDraw(void* ecx, void* edx, void* entity, void* model,
+        float* origin, float* angles, float scale, void* attach, int a7, int a8, int a9,
+        unsigned a10, unsigned a11, unsigned a12, unsigned a13, float frame, int a15);
+    static void __fastcall dViewRenderBeamsDraw(void* ecx, void* edx, void* beam);
+    static int __stdcall dSpriteRenderableDraw(void* renderable, float scale, float frame,
+        int rendermode, int renderfx, unsigned char* color, float hdr, unsigned* unk);
+    static int __fastcall dEnvLaserDotDraw(void* ecx, void* edx, unsigned flags);
+    static void __cdecl dSpriteQuad(float* origin, float width, float height, unsigned color);
     static void EnsureServerFlashlightHook();
     static void EnsureClientFlashlightHook();
     static void EnsureWeaponShootOriginHooks();

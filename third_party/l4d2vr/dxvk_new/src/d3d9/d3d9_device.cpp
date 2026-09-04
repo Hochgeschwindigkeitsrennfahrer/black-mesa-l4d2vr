@@ -3434,6 +3434,21 @@ namespace dxvk {
         effectiveViewport.Width = width;
         effectiveViewport.Height = height;
       }
+
+      // Source DrawViewModels uses DepthRange 0..0.1 so the gun always wins
+      // against world Z. Gloves use the world range, so a hand in front of
+      // the weapon still lost. Keep the full 0..1 range in stereo.
+      if (vr->m_StereoEye != 0
+          && effectiveViewport.MaxZ > 0.0f
+          && effectiveViewport.MaxZ <= 0.15f) {
+        static int s_vmZLog = 0;
+        if (s_vmZLog < 4) {
+          Game::logMsg("Stereo viewmodel DepthRange MaxZ=%.3f -> 1.0",
+            effectiveViewport.MaxZ);
+          ++s_vmZLog;
+        }
+        effectiveViewport.MaxZ = 1.0f;
+      }
     }
 
     if (unlikely(ShouldRecord()))
@@ -4122,6 +4137,11 @@ namespace dxvk {
   HRESULT STDMETHODCALLTYPE D3D9DeviceEx::SetTexture(DWORD Stage, IDirect3DBaseTexture9* pTexture) {
     if (unlikely(InvalidSampler(Stage)))
       return D3D_OK;
+
+    if (pTexture != nullptr && Stage >= 1 && Stage <= 4
+        && g_Game && g_Game->m_VR
+        && pTexture->GetType() == D3DRTYPE_CUBETEXTURE)
+      g_Game->m_VR->NoteSceneCubemap(pTexture);
 
     DWORD stateSampler = RemapSamplerState(Stage);
 

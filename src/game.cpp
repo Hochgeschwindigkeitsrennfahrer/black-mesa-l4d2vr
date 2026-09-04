@@ -10,6 +10,7 @@
 #include <initializer_list>
 #include <cstdarg>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -102,6 +103,7 @@ Game::Game()
     m_ClientEntityList = static_cast<IClientEntityList*>(GetInterfaceAny("client.dll", { "VClientEntityList003" }));
     m_EngineTrace = static_cast<IEngineTrace*>(GetInterfaceAny("engine.dll", { "EngineTraceClient004", "EngineTraceClient003" }));
     m_EngineClient = static_cast<IEngineClient*>(GetInterfaceAny("engine.dll", { "VEngineClient015", "VEngineClient014", "VEngineClient013" }));
+    m_EngineVGui = static_cast<IEngineVGui*>(GetInterfaceAny("engine.dll", { "VEngineVGui001" }));
     m_MaterialSystem = static_cast<IMaterialSystem*>(GetInterfaceAny("MaterialSystem.dll", { "VMaterialSystem081", "VMaterialSystem080" }));
     m_ModelInfo = static_cast<IModelInfo*>(GetInterfaceAny("engine.dll", { "VModelInfoClient006", "VModelInfoClient004" }));
     m_ModelRender = static_cast<IModelRender*>(GetInterfaceAny("engine.dll", { "VEngineModel016" }));
@@ -123,8 +125,8 @@ Game::Game()
     if (!m_Cvar)
         m_Cvar = GetInterfaceAny("engine.dll", { "VEngineCvar004", "VEngineCvar007" });
 
-    Game::logMsg("Interfaces: engine=%p matsys=%p clientent=%p icvar=%p %s",
-        m_EngineClient, m_MaterialSystem, m_ClientEntityList, m_Cvar,
+    Game::logMsg("Interfaces: engine=%p vgui=%p matsys=%p clientent=%p icvar=%p %s",
+        m_EngineClient, m_EngineVGui, m_MaterialSystem, m_ClientEntityList, m_Cvar,
         cvarIface ? cvarIface : "none");
     Game::logMsg("IEngineClient vtbl ClientCmd7=%p slot107=%p slot108=%p",
         SehVtableSlot(m_EngineClient, 7),
@@ -418,6 +420,33 @@ const char* Game::GetEntityNetworkName(int entityIndex)
     const char* name = nullptr;
     __try
     {
+        void** vt = *reinterpret_cast<void***>(net);
+        using tGetClientClass = ClientClassLite*(__thiscall*)(void*);
+        ClientClassLite* cc = reinterpret_cast<tGetClientClass>(vt[2])(net);
+        if (cc)
+            name = cc->networkName;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+    return name;
+}
+
+const char* Game::GetEntityClientClassName(C_BaseEntity* entity)
+{
+    if (!entity)
+        return nullptr;
+    struct ClientClassLite
+    {
+        void* createFn;
+        void* createEventFn;
+        const char* networkName;
+    };
+    const char* name = nullptr;
+    __try
+    {
+        unsigned char* net = reinterpret_cast<unsigned char*>(entity) + 8;
         void** vt = *reinterpret_cast<void***>(net);
         using tGetClientClass = ClientClassLite*(__thiscall*)(void*);
         ClientClassLite* cc = reinterpret_cast<tGetClientClass>(vt[2])(net);
@@ -977,6 +1006,74 @@ bool Game::ClientCmd_Unrestricted(const char* szCmdString)
         logMsg("ClientCmd_Unrestricted SEH for '%s'", szCmdString);
     }
     return ok;
+}
+
+bool Game::TryGetLightForPoint(const Vector& pos, Vector& outRgb, bool clamp) const
+{
+    outRgb.x = 1.f;
+    outRgb.y = 1.f;
+    outRgb.z = 1.f;
+    static bool s_broken;
+    if (s_broken || !m_EngineClient)
+        return false;
+    if (!std::isfinite(pos.x) || !std::isfinite(pos.y) || !std::isfinite(pos.z))
+        return false;
+
+    void** vt = nullptr;
+    __try
+    {
+        vt = *reinterpret_cast<void***>(m_EngineClient);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        vt = nullptr;
+    }
+    if (!vt || !vt[Offsets::kIEngineClient_GetLightForPoint])
+        return false;
+
+    // MSVC x86 thiscall: Vector-by-value is a hidden first stack pointer.
+    using Fn = Vector* (__thiscall*)(void*, Vector*, const Vector*, int);
+    Vector sampled;
+    sampled.x = 0.f;
+    sampled.y = 0.f;
+    sampled.z = 0.f;
+    Vector* ret = nullptr;
+    __try
+    {
+        ret = reinterpret_cast<Fn>(vt[Offsets::kIEngineClient_GetLightForPoint])(
+            m_EngineClient, &sampled, &pos, clamp ? 1 : 0);
+        (void)ret;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        s_broken = true;
+        logMsg("GetLightForPoint SEH — VR glove scene light disabled");
+        return false;
+    }
+
+    if (!std::isfinite(sampled.x) || !std::isfinite(sampled.y) || !std::isfinite(sampled.z)
+        || sampled.x < -0.05f || sampled.y < -0.05f || sampled.z < -0.05f
+        || sampled.x > 8.f || sampled.y > 8.f || sampled.z > 8.f)
+    {
+        static int s_junk;
+        if (s_junk < 4)
+        {
+            logMsg("GetLightForPoint junk (%.3f %.3f %.3f) — using fill light",
+                sampled.x, sampled.y, sampled.z);
+            ++s_junk;
+        }
+        return false;
+    }
+
+    outRgb = sampled;
+    static int s_ok;
+    if (s_ok < 4)
+    {
+        logMsg("GetLightForPoint (%.1f %.1f %.1f) rgb=(%.3f %.3f %.3f)",
+            pos.x, pos.y, pos.z, outRgb.x, outRgb.y, outRgb.z);
+        ++s_ok;
+    }
+    return true;
 }
 
 void Game::ResolveMaterialThreadSlots() const

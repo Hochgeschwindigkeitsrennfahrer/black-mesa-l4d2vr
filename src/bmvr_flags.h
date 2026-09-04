@@ -165,6 +165,9 @@ namespace bmvr
     // zoomed. Compositor / OpenXR submit keep the real HMD FOV, so the
     // narrower render is magnified in the lenses. 0.28 ≈ 3.5× (HL2 20/75).
     extern float g_ScopeZoomFovScale;
+    // Exponential smoothing time (seconds) applied to HMD pitch/yaw while
+    // scoped. Magnification otherwise turns every micro-movement into shake.
+    extern float g_ScopeZoomSmoothSec;
     // SteamVR glove local Rx,Ry,Rz (degrees) inside BuildControllerWorld.
     // Default yaw 180: OpenVR glove +Z is opposite Source controller forward,
     // which made the mesh point backward and clip the near plane (mostly invisible).
@@ -212,6 +215,11 @@ namespace bmvr
     extern float g_HudDisplayRatio;
     extern float g_HudDistance;
     extern float g_HudSize;
+    // 2D GameUI in the HMD: fraction of the full-width letterbox (1 = glued to
+    // the view). ~0.70 is a closer monitor; lower = farther / smaller.
+    extern float g_MenuPanelScale;
+    // Seconds of low-pass on the VR menu pointer (hand tremor).
+    extern float g_MenuCursorSmoothSec;
 
     bool TryHudOverlay();
     bool TryVguiPaint();

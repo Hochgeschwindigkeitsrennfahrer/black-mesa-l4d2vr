@@ -1,4 +1,4 @@
-Black Mesa VR — drop-in (2026-09-03)
+Black Mesa VR — drop-in (2026-09-04)
 ====================================
 
 Close Black Mesa first. Copy this folder into Steam\steamapps\common\Black Mesa
@@ -12,12 +12,17 @@ Keep a tuned VR\config.txt if you already have one.
 
 This build
 ----------
+- VR main menu with a cursor. Aim it with a motion controller or navigate
+  with buttons.
+- Pause menu in VR (same 2D panel path).
+- HEV gloves pick up environment lighting and metal reflections.
+- Crossbow zoom is smoothed.
+- TAU cannon beam effects and impacts fire from the gun, not the eyes.
+- Gluon gun impact decals sit on the impact surface.
+- Crowbar swings are more reliable.
+- Blue Shift weapon wheel and wrist HUD use Calhoun blue.
+- Hands no longer bob up and down with head movement.
 - Bare hands until you pick up the HEV suit. Blue Shift stays bare-handed
   the whole campaign (Calhoun never wears HEV).
-- Crossbow zoom magnifies the stereo view; while scoped, aim is from the
-  headset so the bolt matches the picture.
-- Hands sit on the controller grip and point along the aim ray.
-- Crowbar melee uses OpenXR hand velocity again (swings were stuck at 0 m/s).
-- Floating bloom ghosts on stereo eyes are skipped.
-- Quest 3: Meta Link OpenXR runtime, or Virtual Desktop with VDXR.
+- Quest 3: Meta Link OpenXR runtime, Steam Link, or Virtual Desktop with VDXR.
   Do not pick SteamVR as Virtual Desktop's OpenXR runtime (upside-down).

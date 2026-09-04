@@ -11,6 +11,7 @@
 class IClientEntityList;
 class IEngineTrace;
 class IEngineClient;
+class IEngineVGui;
 class IMaterialSystem;
 class IModelInfo;
 class IModelRender;
@@ -32,6 +33,7 @@ public:
     IClientEntityList* m_ClientEntityList = nullptr;
     IEngineTrace* m_EngineTrace = nullptr;
     IEngineClient* m_EngineClient = nullptr;
+    IEngineVGui* m_EngineVGui = nullptr;
     IMaterialSystem* m_MaterialSystem = nullptr;
     IModelInfo* m_ModelInfo = nullptr;
     IModelRender* m_ModelRender = nullptr;
@@ -94,6 +96,7 @@ public:
     const char* GetActiveWeaponModelName();
     const char* GetEntityModelName(C_BaseEntity* entity);
     const char* GetEntityNetworkName(int entityIndex);
+    const char* GetEntityClientClassName(C_BaseEntity* entity);
     struct InventoryWeapon
     {
         int entityIndex = 0;
@@ -104,6 +107,9 @@ public:
     int CycleWeaponSelect(int direction);
     bool ClientCmd(const char* szCmdString);
     bool ClientCmd_Unrestricted(const char* szCmdString);
+    // IVEngineClient slot 1. Samples static + dynamic light at a world point.
+    // Does not include the deferred flashlight projection. False on SEH / junk.
+    bool TryGetLightForPoint(const Vector& pos, Vector& outRgb, bool clamp = true) const;
     int GetMatQueueMode() const;
     void ResolveMaterialThreadSlots() const;
     bool MaterialThreadSlotsValid() const { return m_MatSlotsValid; }

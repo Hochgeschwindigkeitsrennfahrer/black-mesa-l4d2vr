@@ -147,7 +147,23 @@ Fix: capture path Submits `{0,0,1,1}`. Projection bounds stay for a future direc
 
 ## Menu compositor retry (`menu_vr`)
 
-Main menu never appeared in VR because capture/`WaitGetPoses`/Submit were gated on `m_GameplayEligible` (reject `background*`). That gate was from an earlier 1 FPS hang when DXVK `VrResolveEyeSurfacesToSubmit` ran with `m_StereoRenderViewActive`. The capture path sets that false. Retry private 1080 capture + Submit on any LevelInit map including `background*`. Crash-sticky `bmvr_in_menu_vr.flag`. Pre-LevelInit StretchRect still skipped (empty map name).
+Main menu never appeared in VR because capture/`WaitGetPoses`/Submit were gated on `m_GameplayEligible` (reject `background*`). That gate was from an earlier 1 FPS hang when DXVK `VrResolveEyeSurfacesToSubmit` ran with `m_StereoRenderViewActive`. The capture path sets that false.
+
+**2026-09-03:** skip-file and crash-sticky `menu_vr` are both ignored. Quitting GameUI used to leave `bmvr_in_menu_vr.flag` and the next launch disabled Submit (`menuVR=0`, helper `submitted=0`, black HMD). Look/CreateMove stay off until a gameplay map.
+
+**Verified miss 2026-09-03:** `-oldgameui` never loads `background01`. Log: ~11k Presents at ~288 fps, `inGame=0 eligible=0 map=` `createdRT=0`. Requiring a LevelInit map name for capture/Submit left the HMD black until `LevelInit bm_c2a5c`. Submit now always runs on the no-map GameUI; capture still no-ops if the backbuffer is tiny. Do not CreateNamedRT `bmvrHUD` until a gameplay map. Point the right controller at the captured 2D menu; trigger/MenuSelect clicks. Left-menu/Pause is Escape (back).
+
+**Verified crash 2026-09-03:** empty-map Submit worked (CreateVRTextures, OpenXR publish, ~286 fps to present 704). Process died on the first `Update` after `controller poses L=1 R=1`. Cause: VGUI `IInput` from the DXVK Present thread. Cursor is HWND `SetCursorPos` + throttled mouse messages only. `BeginRisky(menu_vr)` only covers `CreateVRTextures`.
+
+**Verified miss 2026-09-03 (black HMD, desktop cursor worked):** OpenXR left `m_FrameCopyLatched` set, then `CreateVRTextures` replaced the 2560×1440 capture with an empty 3168×3104 RT and kept submitting it. Capture stays HWND-sized; letterbox into the eyes; clear the latch after publish. Left stick = arrows, A = Enter, B = Escape. Do not Y-flip this 2D path.
+
+**Verified miss 2026-09-03 (still black, no Submit):** previous GameUI exit left `bmvr_in_menu_vr.flag` (risky stayed armed until LevelInit). Next launch logged `Disabled menu/background compositor Submit this launch only`, `menuVR=0`, `createdRT=0`. Helper: `Waiting for shared game eye textures`, `submitted=0`. Crash-sticky for `menu_vr` is ignored; BeginRisky only covers `CreateVRTextures`.
+
+**Pause GameUI 2026-09-03:** Direct-eye Submit blit the BB into the eyes, then OpenXR letterboxed a stale frame copy over them. Desktop showed pause; HMD did not. Pause now uses the same HWND 2D panel as the main menu (cursor drawn in). Do not extra-paint VGUI onto `bmvrHUD` for pause.
+
+**Menu follow-head 2026-09-03:** 2D Submit published the live HMD pose every frame, so the letterboxed GameUI stuck to the visor. Latch that pose when the panel appears; look around it. Recenter clears the latch.
+
+**Menu tilt / 2D after save 2026-09-03:** Latch was the full HMD quaternion, so head roll made the panel crooked. Store yaw-only (world up). After a save load, `IsPaused()` or our `m_GameUiVisible` latch kept the 2D panel up while desktop GameUI was already gone. In-game 2D is `VEngineVGui001::IsGameUIVisible` (and our pause toggle), not `IsPaused`. LevelInit clears the pause latch.
 
 ## WaitGetPoses on Present thread (verified hang 2026-08-16)
 
@@ -313,6 +329,25 @@ Overnight port of the L4D2VR `main2` multicore **subset** plus remaining safe Qo
 - **SteamVR overlay SS still cannot enlarge BM G-buffers past the HWND.** `hmd_world` persist-skip. Eyes can still be the recommended size; unmatched G-buffers upscale from the window blit.
 - **Verified miss (2026-08-26, user):** FullFrame + G-buffer + eyes all 2544×2480 (`worldMatch=1 redirected=1`). Engine PushRT/Viewport stayed **2560×1440** (rewrite never logged). HMD: warped top strip + garbage/black below. Desktop letterbox copied that broken eye. Persist-skip `hmd_world` — do not LITERAL-grow world RTs taller than the HWND. Eyes can still be SteamVR rec; gbmatch squash-blit from the window. Native pixels above the window need `hmd_swap` (already persist-skipped, black desktop) or a larger game window.
 
+## Quest 3 + Horizon Link / Oculus OpenXR 2D menu double (2026-09-03)
+
+User: Meta Horizon Link + Oculus OpenXR. **In-game stereo is fine.** 2D main menu / pause is **double**.
+
+The 2D path letterboxes the same HWND capture into both eyes with `POSE_FLAG_MONO`. First helper attempt copied left pose+FOV onto the right projection view. Logs confirmed that ran (`OpenXR 2D menu/pause: identical pose+FOV both eyes`); the tester still saw double. Matching a stereo **projection** layer is not enough on Oculus 1.207 — the runtime still maps each eye with its native frustum.
+
+Next: when `POSE_FLAG_MONO`, skip the projection layer and submit one `XrCompositionLayerQuad` (`XR_EYE_VISIBILITY_BOTH`) from the left eye swapchain. HUD overlays stay hidden during 2D. In-game stereo is unchanged.
+
+**2026-09-03:** first quad used pause-HUD 1.15 m × 1.35 m and a 16:9 crop of the portrait swapchain. The 0.70 letterbox sat at ~43° and felt far. Quad is now 0.65 m × 1.05 m (~78°) cropped to that letterbox. Confirm in the helper log:
+
+    OpenXR 2D menu/pause: quad layer both-eyes ... dist=0.65m; stereo projection skipped
+    [OpenXR][EndFrameSubmit] ... projection=0 ... overlays=1 mono2dQuad=1
+
+Do not Y-flip the 2D capture. Do not turn stereo eye-swap back on (Link duplication is not L/R swap).
+
+## Quest 3 + Steam Link (2026-09-03)
+
+Runtime name: `SteamVR/OpenXR in Meta compatibility mode` (SteamVR 2.16.7). Auto Y-flip treated that as SteamVR+Touch and enabled the vertex NDC Y-flip (`flipY=1 ndcYFlip=1`). User view in the Quest was **upside-down**. Steam Link uses Meta's image Y (same as Oculus/Link, which must not flip). Auto-flip now returns off when the runtime name contains `Meta compatibility`. Virtual Desktop → SteamVR (not this string) still flips. Do **not** Y-flip the 2D/menu capture path.
+
 ## Quest 3 + Virtual Desktop / SteamVR OpenXR (2026-09-01)
 
 User-reported: Quest 3 via Virtual Desktop, world **upside-down** when Streamer Options → OpenXR Runtime = **SteamVR**. Same machine upright when that dropdown is **VDXR**. Windows ActiveRuntime can still be `virtualdesktop-openxr.json` in both cases; the helper's `xrGetInstanceProperties` runtime name plus VD Settings.json/registry decide the blit.
@@ -336,3 +371,11 @@ Failed fix (user 2026-09-03): run bloom, draw `engine_post_nxtgen` at eye dest (
 Keep skipping that bloom chain on stereo eyes. Do not disable the rest of post. Do not retry dest/UV/viewport rescale of `engine_post` without a new integration point (shader constants / bloom RT contents, not dest size).
 
 **Verified fail 2026-09-03 (user):** grow `_rt_Small*FB*` to eye/N — ghosts gone but the **entire picture zoomed and warped with head movement**. Same after reverting the `DoEnginePostProcessing` eye w/h override. Do not grow bloom scratch RTs. Skip bloom on stereo eyes.
+
+## Water (2026-09-03; FPS verified 2026-09-04)
+
+`r_WaterDrawRefraction` / cheap-water force was 0 so HMD-sized planar water would not stamp a view-locked ghost world (DrawSetup is not a nested RenderView). That left Xen/coast water as a flat fog fill.
+
+Refraction-only (user): surface better. Full water retry: `r_WaterDrawReflection` / `r_waterforcereflectentities` / `r_waterforceexpensive` / `nr_gbuffer_for_reflection_enabled` on. Keep `nr_gbuffer_for_refraction_enabled 0` (wall color-buffer stamps, not the water surface). Cafeteria ghosts were bloom, already skipped on stereo eyes. Do not grow `_rt_Water*` / Refract RTs to the eye.
+
+**Verified 2026-09-04 (user):** that full-water set was the GitHub 47 FPS vs local 32 FPS regression in the same spot. Hands and menu were not the cause. Current path keeps all five at 0 (`waterrefl0`). Do not retry stereo full water. A cheaper water surface still needs a different approach — not these cvars per eye.

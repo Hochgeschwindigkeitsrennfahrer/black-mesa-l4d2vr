@@ -111,6 +111,7 @@ Hooks::Hooks(Game* game)
     enableIfReady(hkGetViewport, "GetViewport");
     enableIfReady(hkGetBackBufferDimensions, "GetBackBufferDimensions");
     enableIfReady(hkGetScreenSize, "GetScreenSize");
+    enableIfReady(hkGetScreenAspectRatio, "GetScreenAspectRatio");
     enableIfReady(hkCreateNamedRTEx, "CreateNamedRTEx");
     enableIfReady(hkAdjustEngineViewport, "AdjustEngineViewport");
     enableIfReady(hkDrawModelExecute, "DrawModelExecute");
@@ -166,6 +167,8 @@ int Hooks::initSourceHooks()
         hkGetBackBufferDimensions.createHook((LPVOID)o.GetBackBufferDimensions.address, &dGetBackBufferDimensions);
     if (o.GetScreenSize.valid && !hkGetScreenSize.pTarget)
         hkGetScreenSize.createHook((LPVOID)o.GetScreenSize.address, &dGetScreenSize);
+    if (o.GetScreenAspectRatio.valid && !hkGetScreenAspectRatio.pTarget)
+        hkGetScreenAspectRatio.createHook((LPVOID)o.GetScreenAspectRatio.address, &dGetScreenAspectRatio);
     if (o.CreateNamedRTEx.valid)
         hkCreateNamedRTEx.createHook((LPVOID)o.CreateNamedRTEx.address, &dCreateNamedRTEx);
     if (o.VGui_Paint.valid && bmvr::TryVguiPaint())
@@ -229,6 +232,11 @@ namespace
     thread_local ITexture* g_StereoRedirect = nullptr;
     thread_local int g_VguiOverlayReentry = 0;
     thread_local int g_RenderViewNest = 0;
+    thread_local int g_GluonFx = 0;
+    DWORD g_GluonFxUntilMs = 0;
+    thread_local Vector g_CurViewOrigin{};
+    thread_local Vector g_CurViewForward{};
+    thread_local bool g_HaveCurView = false;
     constexpr int kRtStackMax = 32;
     struct RtStackEntry
     {
@@ -333,6 +341,29 @@ namespace
     {
         RenderViewNestScope() { ++g_RenderViewNest; }
         ~RenderViewNestScope() { --g_RenderViewNest; }
+    };
+
+    struct CurrentViewScope
+    {
+        Vector oldOrigin{};
+        Vector oldForward{};
+        bool oldHave = false;
+        CurrentViewScope(const CViewSetup& setup)
+        {
+            oldOrigin = g_CurViewOrigin;
+            oldForward = g_CurViewForward;
+            oldHave = g_HaveCurView;
+            g_CurViewOrigin = setup.origin;
+            const QAngle ang(setup.angles.x, setup.angles.y, setup.angles.z);
+            QAngle::AngleVectors(ang, &g_CurViewForward, nullptr, nullptr);
+            g_HaveCurView = VectorNormalize(g_CurViewForward) > 0.01f;
+        }
+        ~CurrentViewScope()
+        {
+            g_CurViewOrigin = oldOrigin;
+            g_CurViewForward = oldForward;
+            g_HaveCurView = oldHave;
+        }
     };
 
     void NoteMatContext(void* ecx)
@@ -921,24 +952,26 @@ namespace
         }
     }
 
-    // Source VM layer builds yScale = xScale * aspect from the *window*
-    // (l4d2vr-hands.md). Eye RTs are ~1.1 while the HWND is 16:9, so the gun
-    // stretches along view-up: barrel when the controller is upright, grip
-    // when it is on its side. Undo that in world space around the HMD camera.
-    void UnstretchMatrix3x4ViewY(float m[3][4], const float cam[3],
+    // Anisotropic view-Y scale around the controller grip, not the HMD.
+    // Scaling translations toward the camera parented the gun to nod
+    // (lower head → weapon rose; live log yFix=0.577 pulled origin Z onto
+    // the eye). Stereo already draws at the eye RT aspect (worldMatch /
+    // NormalizeViewSetupForVREye), so this is only for a leftover viewport
+    // mismatch and must not move the grip.
+    void UnstretchMatrix3x4ViewY(float m[3][4], const float pivot[3],
         const float right[3], const float up[3], const float fwd[3], float yFix)
     {
         const float rel[3] = {
-            m[0][3] - cam[0],
-            m[1][3] - cam[1],
-            m[2][3] - cam[2]
+            m[0][3] - pivot[0],
+            m[1][3] - pivot[1],
+            m[2][3] - pivot[2]
         };
         const float vx = rel[0] * right[0] + rel[1] * right[1] + rel[2] * right[2];
         const float vy = (rel[0] * up[0] + rel[1] * up[1] + rel[2] * up[2]) * yFix;
         const float vz = rel[0] * fwd[0] + rel[1] * fwd[1] + rel[2] * fwd[2];
-        m[0][3] = cam[0] + right[0] * vx + up[0] * vy + fwd[0] * vz;
-        m[1][3] = cam[1] + right[1] * vx + up[1] * vy + fwd[1] * vz;
-        m[2][3] = cam[2] + right[2] * vx + up[2] * vy + fwd[2] * vz;
+        m[0][3] = pivot[0] + right[0] * vx + up[0] * vy + fwd[0] * vz;
+        m[1][3] = pivot[1] + right[1] * vx + up[1] * vy + fwd[1] * vz;
+        m[2][3] = pivot[2] + right[2] * vx + up[2] * vy + fwd[2] * vz;
         const float k = yFix - 1.f;
         for (int c = 0; c < 3; ++c)
         {
@@ -947,18 +980,6 @@ namespace
             m[1][c] += up[1] * au * k;
             m[2][c] += up[2] * au * k;
         }
-    }
-
-    void UnstretchPointViewY(float p[3], const float cam[3],
-        const float right[3], const float up[3], const float fwd[3], float yFix)
-    {
-        const float rel[3] = { p[0] - cam[0], p[1] - cam[1], p[2] - cam[2] };
-        const float vx = rel[0] * right[0] + rel[1] * right[1] + rel[2] * right[2];
-        const float vy = (rel[0] * up[0] + rel[1] * up[1] + rel[2] * up[2]) * yFix;
-        const float vz = rel[0] * fwd[0] + rel[1] * fwd[1] + rel[2] * fwd[2];
-        p[0] = cam[0] + right[0] * vx + up[0] * vy + fwd[0] * vz;
-        p[1] = cam[1] + right[1] * vx + up[1] * vy + fwd[1] * vz;
-        p[2] = cam[2] + right[2] * vx + up[2] * vy + fwd[2] * vz;
     }
 
     void BuildMatrix3x4FromOrgAngles(float out[3][4], const Vector& origin, const QAngle& ang)
@@ -1017,7 +1038,7 @@ namespace
 
     bool SehCopyAndFixViewmodelMatrices(float* dst, const void* src, int count,
         const float pivot[3], float scale,
-        const float cam[3], const float right[3], const float up[3], const float fwd[3],
+        const float yFixOrigin[3], const float right[3], const float up[3], const float fwd[3],
         float yFix, const float* rigidDelta)
     {
         if (!dst || !src || count < 1)
@@ -1032,7 +1053,7 @@ namespace
                 if (rigidDelta)
                     ApplyMatrix3x4Delta(matrix, reinterpret_cast<const float(*)[4]>(rigidDelta));
                 if (yFix > 0.2f && yFix < 2.f && fabsf(yFix - 1.f) > 0.03f)
-                    UnstretchMatrix3x4ViewY(matrix, cam, right, up, fwd, yFix);
+                    UnstretchMatrix3x4ViewY(matrix, yFixOrigin, right, up, fwd, yFix);
                 if (scale > 0.2f && scale < 1.5f && fabsf(scale - 1.f) > 0.001f)
                     ScaleMatrix3x4AroundPivot(matrix, pivot, scale);
             }
@@ -1499,6 +1520,639 @@ namespace
         }
     }
 
+    bool EntityLooksLikeLaserDot(C_BaseEntity* ent)
+    {
+        if (!ent || !Hooks::m_Game)
+            return false;
+        const char* cls = Hooks::m_Game->GetEntityClientClassName(ent);
+        if (cls && cls[0] && (std::strstr(cls, "EnvLaserDot") || std::strstr(cls, "LaserDot")))
+            return true;
+        const char* model = Hooks::m_Game->GetEntityModelName(ent);
+        if (model && model[0] && (std::strstr(model, "laserdot") || std::strstr(model, "laser_dot")))
+            return true;
+        return false;
+    }
+
+    bool LaserDotMaterialName(const char* name)
+    {
+        if (!name || !name[0])
+            return false;
+        return std::strstr(name, "laserdot") != nullptr
+            || std::strstr(name, "laser_dot") != nullptr;
+    }
+
+    bool ExactGlowDotMaterial(const char* name)
+    {
+        if (!name || !name[0])
+            return false;
+        const char* slash = std::strrchr(name, '/');
+        const char* base = slash ? slash + 1 : name;
+        return std::strcmp(base, "glow.vmt") == 0 || std::strcmp(base, "glow.spr") == 0;
+    }
+
+    bool RpgLaserWorldSpriteMaterial(const char* name)
+    {
+        if (LaserDotMaterialName(name) || ExactGlowDotMaterial(name))
+            return true;
+        if (!name || !name[0])
+            return false;
+        // bmvr_log: look-ray sprites/glow01.spr stay centred after glow.vmt
+        // is moved. They hide during RPG reload with the weapon laser.
+        // glow06 is map lights — never match that.
+        return std::strstr(name, "glow01") != nullptr;
+    }
+
+    bool GlowSpriteMaterialName(const char* name)
+    {
+        if (!name || !name[0])
+            return false;
+        if (std::strstr(name, "glow06"))
+            return true;
+        return ExactGlowDotMaterial(name);
+    }
+
+    bool SameClientEntity(const void* a, const void* b)
+    {
+        if (!a || !b)
+            return false;
+        if (a == b)
+            return true;
+        const char* pa = static_cast<const char*>(a);
+        const char* pb = static_cast<const char*>(b);
+        return pa + 4 == pb || pa - 4 == pb;
+    }
+
+    bool SpriteEyeAndForward(Vector& eye, Vector& fwd)
+    {
+        if (!Hooks::m_VR)
+            return false;
+        Vector setup = Hooks::m_VR->m_HasStereoBodyOrigin
+            ? Hooks::m_VR->m_StereoBodyOrigin
+            : Hooks::m_VR->m_SetupOrigin;
+        if (setup.LengthSqr() < 1.f)
+            setup = Hooks::m_VR->m_SetupOrigin;
+        if (setup.LengthSqr() < 1.f)
+            return false;
+        eye = Hooks::m_VR->GetViewOrigin(setup);
+        Hooks::m_VR->GetViewBasis(&fwd, nullptr, nullptr);
+        return VectorNormalize(fwd) > 0.01f;
+    }
+
+    float AimOffLookDegrees()
+    {
+        if (!Hooks::m_VR)
+            return 0.f;
+        Vector look{};
+        Hooks::m_VR->GetViewBasis(&look, nullptr, nullptr);
+        if (VectorNormalize(look) <= 0.01f)
+            return 0.f;
+        Vector aim{};
+        QAngle::AngleVectors(Hooks::m_VR->GetAimAngles(), &aim, nullptr, nullptr);
+        if (VectorNormalize(aim) <= 0.01f)
+            return 0.f;
+        float c = aim.Dot(look);
+        if (c > 1.f) c = 1.f;
+        if (c < -1.f) c = -1.f;
+        return acosf(c) * (180.f / 3.14159265f);
+    }
+
+    float PointOffCurrentViewDegrees(const float* origin)
+    {
+        if (!origin || !g_HaveCurView)
+            return 180.f;
+        Vector dir(origin[0] - g_CurViewOrigin.x,
+            origin[1] - g_CurViewOrigin.y,
+            origin[2] - g_CurViewOrigin.z);
+        if (VectorNormalize(dir) <= 0.01f)
+            return 180.f;
+        float c = dir.Dot(g_CurViewForward);
+        if (c > 1.f) c = 1.f;
+        if (c < -1.f) c = -1.f;
+        return acosf(c) * (180.f / 3.14159265f);
+    }
+
+    float PointOffLookDegrees(const float* origin)
+    {
+        if (!origin)
+            return 180.f;
+        Vector pos(origin[0], origin[1], origin[2]);
+        Vector eye{};
+        Vector fwd{};
+        if (!SpriteEyeAndForward(eye, fwd))
+            return 180.f;
+        Vector dir = pos - eye;
+        if (VectorNormalize(dir) <= 0.01f)
+            return 180.f;
+        float c = dir.Dot(fwd);
+        if (c > 1.f) c = 1.f;
+        if (c < -1.f) c = -1.f;
+        return acosf(c) * (180.f / 3.14159265f);
+    }
+
+    bool SpriteOriginOnLookRay(const float* origin)
+    {
+        if (!origin)
+            return false;
+        Vector pos(origin[0], origin[1], origin[2]);
+        if (pos.LengthSqr() < 1.f)
+            return false;
+        Vector eye{};
+        Vector fwd{};
+        if (!SpriteEyeAndForward(eye, fwd))
+            return false;
+        const Vector delta = pos - eye;
+        const float along = delta.Dot(fwd);
+        if (along < 48.f)
+            return false;
+        const Vector closest = eye + fwd * along;
+        const Vector off = pos - closest;
+        return off.LengthSqr() < (72.f * 72.f);
+    }
+
+    // Camera-locked glow sits a few dozen hu in front of the HMD. Look-ray
+    // required along>=48, so those sprites logged look=0 and were left stuck
+    // on centre while unrelated world glow06 lights were rewritten into the
+    // giant blue blob.
+    bool SpriteOriginNearEye(const float* origin)
+    {
+        if (!origin)
+            return false;
+        Vector pos(origin[0], origin[1], origin[2]);
+        Vector eye{};
+        Vector fwd{};
+        if (!SpriteEyeAndForward(eye, fwd))
+            return false;
+        const Vector delta = pos - eye;
+        const float dist = delta.Length();
+        if (dist < 1.f || dist > 120.f)
+            return false;
+        const float along = delta.Dot(fwd);
+        if (along < 0.5f || along > 120.f)
+            return false;
+        const Vector closest = eye + fwd * along;
+        return (pos - closest).LengthSqr() < (40.f * 40.f);
+    }
+
+    bool RpgWeaponHeld()
+    {
+        if (!Hooks::m_VR || !Hooks::m_VR->m_IsVREnabled)
+            return false;
+        if (Hooks::m_VR->RpgLaserActive() || Hooks::m_VR->RpgLaserLatched())
+            return true;
+        if (VR::IsRpgWeaponModel(Hooks::m_VR->m_LastViewmodelModel.c_str()))
+            return true;
+        return Hooks::m_Game
+            && VR::IsRpgWeaponModel(Hooks::m_Game->GetActiveWeaponModelName());
+    }
+
+    bool GluonWeaponHeld()
+    {
+        if (!Hooks::m_VR || !Hooks::m_VR->m_IsVREnabled)
+            return false;
+        if (VR::IsGluonWeaponModel(Hooks::m_VR->m_LastViewmodelModel.c_str()))
+            return true;
+        return Hooks::m_Game
+            && VR::IsGluonWeaponModel(Hooks::m_Game->GetActiveWeaponModelName());
+    }
+
+    void NoteGluonFx()
+    {
+        ++g_GluonFx;
+        g_GluonFxUntilMs = GetTickCount() + 250;
+    }
+
+    void EndGluonFx()
+    {
+        if (g_GluonFx > 0)
+            --g_GluonFx;
+    }
+
+    bool GluonFxLive()
+    {
+        if (g_GluonFx > 0)
+            return true;
+        if (GetTickCount() < g_GluonFxUntilMs)
+            return true;
+        return GluonWeaponHeld();
+    }
+
+    bool GluonGlowMaterialName(const char* name)
+    {
+        if (!name || !name[0])
+            return false;
+        return std::strstr(name, "gluon_glow") != nullptr
+            || std::strstr(name, "gluon_beam_end") != nullptr
+            || std::strstr(name, "gluon_beam_burst") != nullptr;
+    }
+
+    void ApplyVrTraceHit(CGameTrace* trace, const Vector& start, const Vector& end, const Vector& n)
+    {
+        if (!trace)
+            return;
+        trace->startpos = start;
+        trace->endpos = end;
+        trace->startsolid = false;
+        trace->allsolid = false;
+        if (n.LengthSqr() > 0.01f)
+        {
+            trace->plane.normal = n;
+            trace->plane.dist = n.x * end.x + n.y * end.y + n.z * end.z;
+        }
+        Vector delta = end - start;
+        const float dist = delta.Length();
+        constexpr float kMax = 16384.f;
+        float frac = (dist > 1.f) ? (dist / kMax) : 1.f;
+        if (frac > 1.f)
+            frac = 1.f;
+        if (frac < 0.f)
+            frac = 0.f;
+        trace->fraction = frac;
+    }
+
+    bool TryParkedFxWorld(Vector& parked)
+    {
+        if (!Hooks::m_VR)
+            return false;
+        if (Hooks::m_VR->TryGetRpgLaserWorld(parked))
+            return true;
+        Vector start{};
+        return Hooks::m_VR->TryGetVrBeamSegment(start, parked);
+    }
+
+    bool RewriteToVrBeamEnd(Vector* p)
+    {
+        if (!p || !Hooks::m_VR || !Hooks::m_VR->m_IsVREnabled)
+            return false;
+        Vector start{};
+        Vector end{};
+        Vector n{};
+        if (!Hooks::m_VR->TryGetVrBeamSegment(start, end, &n))
+            return false;
+        p->x = end.x;
+        p->y = end.y;
+        p->z = end.z;
+        return true;
+    }
+
+    const char* ParticleDefName(void* def)
+    {
+        if (!def)
+            return nullptr;
+        const char* name = nullptr;
+        __try
+        {
+            name = *reinterpret_cast<const char**>(
+                static_cast<char*>(def) + Offsets::kCParticleDef_Name);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            name = nullptr;
+        }
+        return name;
+    }
+
+    bool IsGluonImpactParticleName(const char* name)
+    {
+        if (!name || !name[0])
+            return false;
+        return std::strncmp(name, "gluon_beam_end", 14) == 0;
+    }
+
+    void* ParticleEffectDef(void* effect)
+    {
+        if (!effect)
+            return nullptr;
+        void* def = nullptr;
+        __try
+        {
+            def = *reinterpret_cast<void**>(
+                static_cast<char*>(effect) + Offsets::kCNewParticleEffect_Def);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            def = nullptr;
+        }
+        return def;
+    }
+
+    bool ClearParticleViewModelEffect(void* def)
+    {
+        if (!def)
+            return false;
+        bool changed = false;
+        __try
+        {
+            unsigned char* flag = reinterpret_cast<unsigned char*>(def)
+                + Offsets::kCParticleDef_ViewModelEffect;
+            if (*flag)
+            {
+                *flag = 0;
+                changed = true;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+        return changed;
+    }
+
+    void ClearEffectViewModelFlag(void* effect)
+    {
+        if (!effect)
+            return;
+        __try
+        {
+            *(static_cast<unsigned char*>(effect) + Offsets::kCNewParticleEffect_ViewModel) = 0;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    void PatchGluonImpactParticleDefs()
+    {
+        if (!Hooks::m_VR || !Hooks::m_VR->m_IsVREnabled)
+            return;
+        HMODULE client = GetModuleHandleA("client.dll");
+        if (!client)
+            return;
+        static const char* const kNames[] = {
+            "gluon_beam_end",
+            "gluon_beam_end_small_particles",
+            "gluon_beam_end_supercharge",
+            "gluon_beam_end_small_particles_supercharge",
+            "gluon_beam_end_small_particles_a_supercharge",
+            "gluon_beam_end_thirdperson",
+            "gluon_beam_end_small_particles_thirdperson",
+        };
+        using tFind = void*(__thiscall*)(void* thisptr, const char* name);
+        auto* find = reinterpret_cast<tFind>(
+            reinterpret_cast<unsigned char*>(client) + Offsets::kParticleSystemMgr_Find);
+        void* mgr = nullptr;
+        __try
+        {
+            mgr = *reinterpret_cast<void**>(
+                reinterpret_cast<unsigned char*>(client) + Offsets::kParticleSystemMgr);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            mgr = nullptr;
+        }
+        if (!mgr)
+            return;
+        static int s_patched;
+        for (const char* name : kNames)
+        {
+            void* def = nullptr;
+            __try
+            {
+                def = find(mgr, name);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                def = nullptr;
+            }
+            if (ClearParticleViewModelEffect(def) && s_patched < 12)
+            {
+                Game::logMsg("gluon particle world-pass %s", name);
+                ++s_patched;
+            }
+        }
+    }
+
+    void ClearEntityNodraw(C_BaseEntity* ent)
+    {
+        if (!ent)
+            return;
+        __try
+        {
+            int* fx = reinterpret_cast<int*>(
+                reinterpret_cast<char*>(ent) + Offsets::kCBaseEntity_fEffects);
+            *fx &= ~Offsets::kEF_NODRAW;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+        }
+    }
+
+    C_BaseEntity* FindRpgLaserDot();
+
+    void DumpRpgLaserEntitiesOnce()
+    {
+        static bool s_wasOn;
+        static int s_dumps;
+        const bool on = Hooks::m_VR && Hooks::m_VR->RpgLaserActive();
+        const bool rising = on && !s_wasOn;
+        s_wasOn = on;
+        if (!rising || s_dumps >= 4 || !Hooks::m_Game || !Hooks::m_Game->m_ClientEntityList)
+            return;
+        ++s_dumps;
+        C_BaseEntity* laserDot = FindRpgLaserDot();
+        if (laserDot)
+            Game::logMsg("RPG EnvLaserDot ptr=%p class=%s", laserDot,
+                Hooks::m_Game->GetEntityClientClassName(laserDot)
+                    ? Hooks::m_Game->GetEntityClientClassName(laserDot) : "?");
+        else
+            Game::logMsg("RPG EnvLaserDot not in client list");
+        const int hi = Hooks::m_Game->m_ClientEntityList->GetHighestEntityIndex();
+        int n = 0;
+        int glow06 = 0;
+        for (int e = 1; e <= hi && n < 40; ++e)
+        {
+            C_BaseEntity* ent = Hooks::m_Game->GetClientEntity(e);
+            if (!ent)
+                continue;
+            const char* cls = Hooks::m_Game->GetEntityClientClassName(ent);
+            const char* net = Hooks::m_Game->GetEntityNetworkName(e);
+            const char* model = Hooks::m_Game->GetEntityModelName(ent);
+            const bool priority = (cls && (std::strstr(cls, "Laser") || std::strstr(cls, "Beam")
+                    || std::strstr(cls, "Particle")))
+                || (net && (std::strstr(net, "Laser") || std::strstr(net, "Beam")))
+                || (model && (std::strstr(model, "laser") || std::strstr(model, "glow.vmt")
+                    || std::strstr(model, "glow01") || std::strstr(model, "laserdot")));
+            const bool glow06Hit = model && std::strstr(model, "glow06");
+            const bool hit = priority
+                || (cls && std::strstr(cls, "Sprite"))
+                || (net && std::strstr(net, "Sprite"))
+                || (model && std::strstr(model, "glow"));
+            if (!hit)
+                continue;
+            if (glow06Hit)
+            {
+                if (glow06 >= 6)
+                    continue;
+                ++glow06;
+            }
+            Game::logMsg("RPG ent[%d] class=%s net=%s model=%s", e,
+                cls ? cls : "?", net ? net : "?", model ? model : "?");
+            ++n;
+        }
+        if (n == 0)
+            Game::logMsg("RPG laser: no Sprite/Laser/Beam entities in client list");
+    }
+
+    bool QueryContextColorRtSize(void* ctx, int& w, int& h, const char** nameOut);
+
+    C_BaseEntity* g_rpgLaserDotEnt = nullptr;
+    thread_local bool g_EnvLaserDotQuad = false;
+
+    bool RpgLaserSpriteCandidate(C_BaseEntity* entity, const char* name, const float* origin)
+    {
+        if (!Hooks::m_VR || !Hooks::m_VR->RpgLaserActive())
+            return false;
+        const bool classDot = EntityLooksLikeLaserDot(entity);
+        const bool materialDot = LaserDotMaterialName(name);
+        const bool glowDot = RpgLaserWorldSpriteMaterial(name);
+        const bool cachedDot = SameClientEntity(entity, g_rpgLaserDotEnt);
+        const bool look = SpriteOriginOnLookRay(origin);
+        return classDot || materialDot || cachedDot || (glowDot && look);
+    }
+
+    void LogRpgLaserSpriteSkip(const char* path, const char* name, const char* cls, const float* origin)
+    {
+        static int s_skip;
+        if (s_skip >= 12)
+            return;
+        const char* rtName = "";
+        int rtW = 0, rtH = 0;
+        QueryContextColorRtSize(g_MatCtx, rtW, rtH, &rtName);
+        Vector parked{};
+        const int haveParked = (Hooks::m_VR && Hooks::m_VR->TryGetRpgLaserWorld(parked)) ? 1 : 0;
+        Game::logMsg(
+            "RPG laser HIDE %s model=%s class=%s at=(%.0f,%.0f,%.0f) offLook=%.1fdeg aimOff=%.1fdeg parked=%d (%.0f,%.0f,%.0f) rt=%s",
+            path, name ? name : "?", cls ? cls : "?",
+            origin ? origin[0] : 0.f, origin ? origin[1] : 0.f, origin ? origin[2] : 0.f,
+            PointOffLookDegrees(origin), AimOffLookDegrees(),
+            haveParked, parked.x, parked.y, parked.z,
+            rtName && rtName[0] ? rtName : "?");
+        ++s_skip;
+    }
+
+    C_BaseEntity* FindRpgLaserDot()
+    {
+        if (!Hooks::m_Game)
+            return nullptr;
+        C_BaseEntity* dot = Hooks::m_Game->FindEntityByNetworkNameContains("EnvLaserDot");
+        if (!dot)
+            dot = Hooks::m_Game->FindEntityByNetworkNameContains("laserdot");
+        if (!dot)
+            dot = Hooks::m_Game->FindEntityByNetworkNameContains("laser_dot");
+        if (dot)
+        {
+            g_rpgLaserDotEnt = dot;
+            return dot;
+        }
+        if (!Hooks::m_Game->m_ClientEntityList)
+            return nullptr;
+        const int hi = Hooks::m_Game->m_ClientEntityList->GetHighestEntityIndex();
+        for (int e = 1; e <= hi; ++e)
+        {
+            C_BaseEntity* ent = Hooks::m_Game->GetClientEntity(e);
+            if (EntityLooksLikeLaserDot(ent))
+            {
+                g_rpgLaserDotEnt = ent;
+                return ent;
+            }
+        }
+        g_rpgLaserDotEnt = nullptr;
+        return nullptr;
+    }
+
+    void SnapRpgLaserDot()
+    {
+        if (!Hooks::m_VR || !Hooks::m_Game || !Hooks::m_VR->m_IsVREnabled)
+            return;
+        if (!Hooks::m_VR->IsGameplayEligible() || !Hooks::m_VR->RpgLaserActive())
+            return;
+        Vector end{};
+        if (!Hooks::m_VR->TryGetRpgLaserWorld(end))
+            return;
+        DumpRpgLaserEntitiesOnce();
+        C_BaseEntity* dot = FindRpgLaserDot();
+        if (!dot)
+            return;
+        ClearEntityNodraw(dot);
+        const float origin3[3] = { end.x, end.y, end.z };
+        const float angles3[3] = { 0.f, 0.f, 0.f };
+        CallSetAbsOriginAngles(dot, origin3, angles3);
+    }
+
+    bool BeamAlongLook(const Vector& start, const Vector& delta)
+    {
+        Vector eye{};
+        Vector fwd{};
+        if (!SpriteEyeAndForward(eye, fwd))
+            return false;
+        const float dLen = delta.Length();
+        if (dLen < 8.f)
+            return false;
+        Vector dN = delta;
+        VectorNormalize(dN);
+        if (dN.Dot(fwd) < 0.92f)
+            return false;
+        const Vector fromEye = start - eye;
+        const float along = fromEye.Dot(fwd);
+        const Vector closest = eye + fwd * along;
+        const float off = (start - closest).Length();
+        // Start at the eye, or at the look-hit (short end-cap beam).
+        return off < 80.f && along > -48.f;
+    }
+
+    void RetargetRpgLaserBeam(void* beam)
+    {
+        if (!beam || !Hooks::m_VR || !Hooks::m_VR->RpgLaserActive())
+            return;
+        Vector muzzle{};
+        Vector hit{};
+        if (!Hooks::m_VR->TryGetVrBeamSegment(muzzle, hit))
+            return;
+        float* start = nullptr;
+        float* delta = nullptr;
+        int type = -1;
+        float r = 0.f, g = 0.f, b = 0.f;
+        __try
+        {
+            type = *reinterpret_cast<int*>(static_cast<char*>(beam) + Offsets::kBeam_t_type);
+            start = reinterpret_cast<float*>(static_cast<char*>(beam) + Offsets::kBeam_t_start);
+            delta = reinterpret_cast<float*>(static_cast<char*>(beam) + Offsets::kBeam_t_delta);
+            r = *reinterpret_cast<float*>(static_cast<char*>(beam) + Offsets::kBeam_t_r);
+            g = *reinterpret_cast<float*>(static_cast<char*>(beam) + Offsets::kBeam_t_r + 4);
+            b = *reinterpret_cast<float*>(static_cast<char*>(beam) + Offsets::kBeam_t_r + 8);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return;
+        }
+        if (!start || !delta)
+            return;
+        Vector st(start[0], start[1], start[2]);
+        Vector d(delta[0], delta[1], delta[2]);
+        static int s_beamLog;
+        if (s_beamLog < 16)
+        {
+            Game::logMsg("DrawBeam type=%d rgb=(%.2f,%.2f,%.2f) start=(%.0f,%.0f,%.0f) dlen=%.0f look=%d",
+                type, r, g, b, st.x, st.y, st.z, d.Length(),
+                BeamAlongLook(st, d) ? 1 : 0);
+            ++s_beamLog;
+        }
+        if (!BeamAlongLook(st, d))
+            return;
+        Vector nd = hit - muzzle;
+        start[0] = muzzle.x;
+        start[1] = muzzle.y;
+        start[2] = muzzle.z;
+        delta[0] = nd.x;
+        delta[1] = nd.y;
+        delta[2] = nd.z;
+        static int s_retarget;
+        if (s_retarget < 8)
+        {
+            Game::logMsg("RPG laser beam -> muzzle=(%.0f,%.0f,%.0f) hit=(%.0f,%.0f,%.0f)",
+                muzzle.x, muzzle.y, muzzle.z, hit.x, hit.y, hit.z);
+            ++s_retarget;
+        }
+    }
+
     void SnapLocalViewmodelForFire()
     {
         if (!Hooks::m_VR || !Hooks::m_Game || !Hooks::m_VR->m_IsVREnabled)
@@ -1672,9 +2326,10 @@ namespace
             view.m_nUnscaledWidth = eyeWidth;
             view.m_nUnscaledHeight = eyeHeight;
         }
-        // Viewmodel pass uses viewport aspect, not m_flAspectRatio (L4D2VR
-        // vr_hand_math / l4d2vr-hands.md). Match both to the eye RT so the gun
-        // is not 16:9-projected into a ~1.1 HMD buffer (tall grip, short slide).
+        // DrawViewModels (client FUN_1020a8f0) copies this setup, then
+        // overwrites m_flAspectRatio with engine GetScreenAspectRatio()
+        // (window 16:9). dGetScreenAspectRatio returns the eye aspect during
+        // the stereo pass so the gun frustum matches world/gloves.
         const float rtAspect = static_cast<float>(eyeWidth) / static_cast<float>(eyeHeight);
         view.m_flAspectRatio = rtAspect;
         const float eyeFov = vr->WorldRenderFov();
@@ -1751,13 +2406,20 @@ namespace
         const Vector body = Hooks::m_VR->m_HasStereoBodyOrigin
             ? Hooks::m_VR->m_StereoBodyOrigin
             : Hooks::m_VR->m_SetupOrigin;
-        const float dx = setup.origin.x - body.x;
-        const float dy = setup.origin.y - body.y;
-        const float dz = setup.origin.z - body.z;
-        if ((dx * dx + dy * dy + dz * dz) > 25.f)
-            return true;
+        if (body.LengthSqr() > 1.f)
+        {
+            const float dx = setup.origin.x - body.x;
+            const float dy = setup.origin.y - body.y;
+            const float dz = setup.origin.z - body.z;
+            if ((dx * dx + dy * dy + dz * dz) > 25.f)
+                return true;
+        }
         const Vector va = Hooks::m_VR->GetViewAngle();
         if (fabsf(setup.angles.x + va.x) < 12.f && fabsf(va.x) > 1.f)
+            return true;
+        float dyaw = setup.angles.y - va.y;
+        dyaw -= 360.f * floorf((dyaw + 180.f) / 360.f);
+        if (fabsf(dyaw) > 90.f)
             return true;
         return false;
     }
@@ -2068,6 +2730,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
 {
     (void)edx;
     RenderViewNestScope nest;
+    CurrentViewScope curView(setup);
     if (!hkRenderView.fOriginal)
         return;
 
@@ -2097,6 +2760,11 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
     const bool mainView = setup.width >= 640 && setup.height >= 360;
     const bool inGame = m_Game && m_Game->m_EngineClient && m_Game->m_EngineClient->IsInGame();
 
+    const bool originOk = std::isfinite(setup.origin.x) && std::isfinite(setup.origin.y)
+        && std::isfinite(setup.origin.z)
+        && fabsf(setup.origin.x) < 100000.f && fabsf(setup.origin.y) < 100000.f;
+    const bool fovOk = std::isfinite(setup.fov) && setup.fov > 10.f && setup.fov < 170.f;
+
     if (m_VR && mainView)
         m_VR->m_SetupOrigin = setup.origin;
 
@@ -2117,6 +2785,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         if (!m_VR || !m_VR->m_HmdPoseValid)
             return;
         view.angles = m_VR->GetViewAngle();
+        SnapRpgLaserDot();
         if (stereo)
             view.origin = leftEye ? m_VR->GetViewOriginLeft(setup.origin)
                                   : m_VR->GetViewOriginRight(setup.origin);
@@ -2185,11 +2854,6 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             ++s_smallLog;
         }
     }
-
-    const bool originOk = std::isfinite(setup.origin.x) && std::isfinite(setup.origin.y)
-        && std::isfinite(setup.origin.z)
-        && fabsf(setup.origin.x) < 100000.f && fabsf(setup.origin.y) < 100000.f;
-    const bool fovOk = std::isfinite(setup.fov) && setup.fov > 10.f && setup.fov < 170.f;
 
     // 2026-08-17: GetScreenSize made the first gameplay view 1584x1440, then
     // this hook immediately ran two RenderViews with HMD FOV/zNear/IPD during
@@ -2298,6 +2962,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         CViewSetup rightEyeView = setup;
         NormalizeViewSetupForVREye(leftEyeView, m_VR);
         NormalizeViewSetupForVREye(rightEyeView, m_VR);
+        m_VR->NoteStereoClipPlanes(leftEyeView.zNear, leftEyeView.zFar);
         applyL4d2VrHead(leftEyeView, true, true);
         applyL4d2VrHead(rightEyeView, true, false);
         const float ipd = m_VR->m_Ipd * m_VR->m_IpdScale * m_VR->m_VRScale;
@@ -2362,8 +3027,12 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             // Unbind of A2R10 FullFrame still whites LDR eyes (ff_hmdfit).
             const bool keepNative = bmvr::OffscreenWorldMatchesEyes()
                 && m_VR->StereoRedirectedToEye();
+            bool glovesInBlit = false;
             if (!keepNative)
             {
+                const long long tHands = QpcNow();
+                glovesInBlit = m_VR->DrawVrGlovesIntoBlitSource(1);
+                g_Cost.handsTicks += QpcNow() - tHands;
                 const long long t0 = QpcNow();
                 // Always GPU-wait this copy. Both eyes share _rt_FullFrameFB /
                 // the HWND backbuffer; without a flush the right-eye RenderView
@@ -2374,8 +3043,11 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 const bool leftBb = m_VR->BlitHmdViewFromBackbuffer(
                     m_VR->m_D9LeftEyeSurface, true);
                 if (!leftBb)
+                {
+                    glovesInBlit = false;
                     m_VR->BlitCurrentGameColorTo(
                         m_VR->m_D9LeftEyeSurface, true);
+                }
                 g_Cost.blitTicks += QpcNow() - t0;
             }
             else
@@ -2389,7 +3061,8 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 || m_VR->WeaponMenuOpen() || m_VR->AimCrosshairVisible())
             {
                 const long long t0 = QpcNow();
-                m_VR->DrawIndependentHandMarkers(m_VR->ColorTargetForStereoEye(1), 1);
+                m_VR->DrawIndependentHandMarkers(
+                    m_VR->ColorTargetForStereoEye(1), 1, true, !glovesInBlit);
                 g_Cost.handsTicks += QpcNow() - t0;
             }
         }
@@ -2415,20 +3088,28 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             (void)rightUnbind;
             const bool keepNative = bmvr::OffscreenWorldMatchesEyes()
                 && m_VR->StereoRedirectedToEye();
+            bool glovesInBlit = false;
             if (!keepNative)
             {
+                const long long tHands = QpcNow();
+                glovesInBlit = m_VR->DrawVrGlovesIntoBlitSource(2);
+                g_Cost.handsTicks += QpcNow() - tHands;
                 const long long t0 = QpcNow();
                 const bool rightBb = m_VR->BlitHmdViewFromBackbuffer(
                     m_VR->m_D9RightEyeSurface, false);
                 if (!rightBb)
+                {
+                    glovesInBlit = false;
                     m_VR->BlitCurrentGameColorTo(m_VR->m_D9RightEyeSurface, false);
+                }
                 g_Cost.blitTicks += QpcNow() - t0;
             }
             if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud
                 || m_VR->WeaponMenuOpen() || m_VR->AimCrosshairVisible())
             {
                 const long long t0 = QpcNow();
-                m_VR->DrawIndependentHandMarkers(m_VR->ColorTargetForStereoEye(2), 2);
+                m_VR->DrawIndependentHandMarkers(
+                    m_VR->ColorTargetForStereoEye(2), 2, true, !glovesInBlit);
                 g_Cost.handsTicks += QpcNow() - t0;
             }
         }
@@ -2461,7 +3142,8 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         // top of that put a second, slightly offset copy of each hand on the
         // window, which is what read as the hands being see-through there.
         if ((bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes)
-            && !bmvr::OffscreenWorldMatchesEyes())
+            && !bmvr::OffscreenWorldMatchesEyes()
+            && !m_VR->VrGlovesDrawnIntoScene())
             m_VR->DrawIndependentHandsOnDesktop();
         m_VR->m_HasStereoBodyOrigin = false;
         m_VR->EndStereoFramePose();
@@ -2754,11 +3436,14 @@ void __fastcall Hooks::dCalcViewModelView(void* ecx, void* edx, void* owner, con
             SuppressViewmodelMovementAnims(ecx);
             return;
         }
-        Vector origin = m_VR->GetViewOrigin(
-            m_VR->m_HasStereoBodyOrigin ? m_VR->m_StereoBodyOrigin : eyePosition);
-        const Vector va = m_VR->GetViewAngle();
-        QAngle ang(va.x, va.y, va.z);
-        hkCalcViewModelView.fOriginal(ecx, owner, origin, ang);
+        // Controller pose dropped: keep the gun on the last tracking pose.
+        // Feeding HMD origin/angles here parented the weapon to nod.
+        const Vector targetOrigin = m_VR->GetRecommendedViewmodelAbsPos(eyePosition);
+        const QAngle targetAng = m_VR->GetRecommendedViewmodelAbsAngle();
+        CallCalcViewModelViewOriginal(ecx, owner, targetOrigin, targetAng);
+        const float origin3[3] = { targetOrigin.x, targetOrigin.y, targetOrigin.z };
+        const float angles3[3] = { targetAng.x, targetAng.y, targetAng.z };
+        CallSetAbsOriginAngles(ecx, origin3, angles3);
         return;
     }
     hkCalcViewModelView.fOriginal(ecx, owner, eyePosition, eyeAngles);
@@ -2938,11 +3623,14 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
         }();
         float yFix = 1.f;
         bool eyePass = m_VR->m_StereoEye != 0 || m_VR->StereoEyeBlitActive();
-        if (!eyePass && g_MatCtx && hkGetViewport.fOriginal)
+        int vw = 0, vh = 0;
+        if (g_MatCtx && hkGetViewport.fOriginal)
         {
-            int vx = 0, vy = 0, vw = 0, vh = 0;
+            int vx = 0, vy = 0;
             hkGetViewport.fOriginal(g_MatCtx, vx, vy, vw, vh);
-            if (vw >= 640 && vh >= 360 && m_VR->m_RenderWidth >= 640 && m_VR->m_RenderHeight >= 360)
+            ClampStereoViewport(vx, vy, vw, vh);
+            if (!eyePass && vw >= 640 && vh >= 360 && m_VR->m_RenderWidth >= 640
+                && m_VR->m_RenderHeight >= 360)
             {
                 const float vpAspect = static_cast<float>(vw) / static_cast<float>(vh);
                 const float eyeAspect = static_cast<float>(m_VR->m_RenderWidth)
@@ -2951,20 +3639,18 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
                     eyePass = true;
             }
         }
-        if (eyePass && m_VR->m_RenderWidth >= 640 && m_VR->m_RenderHeight >= 360)
+        // Stereo CViewSetup is already eye-sized (worldMatch) or uses HMD
+        // m_flAspectRatio. DrawViewModels still forced window aspect via
+        // GetScreenAspectRatio; that is hooked separately. Do not unstretch
+        // around the HMD — that parented the grip to the look plane.
+        if (eyePass && vw >= 640 && vh >= 360 && m_VR->m_RenderWidth >= 640
+            && m_VR->m_RenderHeight >= 360)
         {
-            uint32_t winW = 0, winH = 0;
-            bmvr::QueryWindowClientSize(winW, winH);
-            if (winW < 640 || winH < 360)
-            {
-                winW = 16;
-                winH = 9;
-            }
-            const float winAspect = static_cast<float>(winW) / static_cast<float>(winH);
+            const float vpAspect = static_cast<float>(vw) / static_cast<float>(vh);
             const float eyeAspect = static_cast<float>(m_VR->m_RenderWidth)
                 / static_cast<float>(m_VR->m_RenderHeight);
-            if (winAspect > 0.5f && eyeAspect > 0.5f)
-                yFix = eyeAspect / winAspect;
+            if (vpAspect > 0.5f && eyeAspect > 0.5f)
+                yFix = eyeAspect / vpAspect;
         }
         const bool needScale = scale > 0.2f && scale < 1.5f && fabsf(scale - 1.f) > 0.001f;
         const bool needYFix = yFix > 0.2f && yFix < 2.f && fabsf(yFix - 1.f) > 0.03f;
@@ -2993,21 +3679,24 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
                 rigidPtr = &rigidDelta[0][0];
             }
 
-            // Same world mesh both eyes. Per-eye unstretch (IPD) drew two guns.
-            const Vector cam = m_VR->GetViewOrigin(body.LengthSqr() > 1.f ? body : info.origin);
             Vector fwd, right, up;
-            m_VR->GetViewBasis(&fwd, &right, &up);
-            const float cam3[3] = { cam.x, cam.y, cam.z };
-            const float right3[3] = { right.x, right.y, right.z };
-            const float up3[3] = { up.x, up.y, up.z };
-            const float fwd3[3] = { fwd.x, fwd.y, fwd.z };
+            float right3[3]{};
+            float up3[3]{};
+            float fwd3[3]{};
+            if (needYFix)
+            {
+                m_VR->GetViewBasis(&fwd, &right, &up);
+                right3[0] = right.x; right3[1] = right.y; right3[2] = right.z;
+                up3[0] = up.x; up3[1] = up.y; up3[2] = up.z;
+                fwd3[0] = fwd.x; fwd3[1] = fwd.y; fwd3[2] = fwd.z;
+            }
 
             unsigned char* hdr = ResolveStudioHdr(state);
             const int nBones = StudioHdrNumBones(hdr);
             bool usedBones = false;
             if (pCustomBoneToWorld && nBones > 0
                 && SehCopyAndFixViewmodelMatrices(&g_ScaledViewmodelBones[slot][0][0][0], pCustomBoneToWorld,
-                    nBones, pivot3, needScale ? scale : 1.f, cam3, right3, up3, fwd3,
+                    nBones, pivot3, needScale ? scale : 1.f, pivot3, right3, up3, fwd3,
                     needYFix ? yFix : 1.f, rigidPtr))
             {
                 bonesToDraw = g_ScaledViewmodelBones[slot];
@@ -3021,8 +3710,6 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
             scaledInfo->origin = targetOrigin;
             scaledInfo->angles = targetAng;
             float origin3[3] = { targetOrigin.x, targetOrigin.y, targetOrigin.z };
-            if (needYFix)
-                UnstretchPointViewY(origin3, cam3, right3, up3, fwd3, yFix);
             if (needScale)
             {
                 origin3[0] = pivot.x + (origin3[0] - pivot.x) * scale;
@@ -3034,7 +3721,7 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
             scaledInfo->origin.z = origin3[2];
             if (info.pModelToWorld
                 && SehCopyAndFixViewmodelMatrices(&g_ScaledViewmodelModelToWorld[slot][0][0], info.pModelToWorld,
-                    1, pivot3, needScale ? scale : 1.f, cam3, right3, up3, fwd3,
+                    1, pivot3, needScale ? scale : 1.f, pivot3, right3, up3, fwd3,
                     needYFix ? yFix : 1.f, rigidPtr))
             {
                 scaledInfo->pModelToWorld = reinterpret_cast<const matrix3x4_t*>(g_ScaledViewmodelModelToWorld[slot]);
@@ -3204,6 +3891,18 @@ void __fastcall Hooks::dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial
     const int eyeW = m_VR ? static_cast<int>(m_VR->m_RenderWidth) : 0;
     const int eyeH = m_VR ? static_cast<int>(m_VR->m_RenderHeight) : 0;
     const char* matName = SafeMaterialName(material);
+    if (m_VR && m_VR->RpgLaserActive())
+    {
+        static int s_laserDssr;
+        const bool glowish = std::strstr(matName, "glow") || std::strstr(matName, "laser")
+            || std::strstr(matName, "dot") || std::strstr(matName, "flare");
+        const bool smallQuad = width > 0 && height > 0 && width < 256 && height < 256;
+        if (s_laserDssr < 16 && (glowish || smallQuad))
+        {
+            Game::logMsg("DSSR laser-on %s dest=%d,%d %dx%d", matName, destX, destY, width, height);
+            ++s_laserDssr;
+        }
+    }
     const bool windowDest = destX <= 16 && destY <= 16 && LooksLikeWindowExtent(width, height);
     const bool windowUv = LooksLikeWindowUv(srcX0, srcY0, srcX1, srcY1);
     const bool potSrc = SrcLooksLikePowerOfTwoFb(srcWidth, srcHeight, eyeW, eyeH);
@@ -3370,6 +4069,9 @@ void __fastcall Hooks::dVGui_Paint(void* ecx, void* edx, int mode)
         return;
     }
 
+    if (m_VR)
+        m_VR->NoteEngineVGui(ecx);
+
     const bool inGame = EngineInGame();
     const bool eligible = m_VR && m_VR->IsGameplayEligible();
 
@@ -3399,7 +4101,8 @@ void __fastcall Hooks::dVGui_Paint(void* ecx, void* edx, int mode)
         if (m_VR)
             m_VR->SetVguiPaintActive(false);
     }
-    if (inGame && eligible && m_VR && m_VR->HudOverlayReady() && m_VR->PauseUiActive())
+    if (inGame && eligible && m_VR && m_VR->HudOverlayReady() && m_VR->PauseUiActive()
+        && !m_VR->Want2dMenuPanel())
         PaintVguiToOverlay(ecx, mode);
 }
 
@@ -3506,7 +4209,7 @@ void __fastcall Hooks::dUpdateFlashlightState(void* ecx, void* edx, void* flashl
     // Desktop beam works; HMD missed it because FlashlightState_t is filled
     // from player EyePosition/EyeAngles (body) while stereo cameras use the
     // HMD (research/resolution-hud-flashlight.md §8). Retarget to HMD view.
-    if (flashlightState && m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible()
+            if (flashlightState && m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible()
         && m_VR->m_HmdPoseValid && EngineInGame())
     {
         __try
@@ -3524,6 +4227,7 @@ void __fastcall Hooks::dUpdateFlashlightState(void* ecx, void* edx, void* flashl
                 f[3] = fwd.x;
                 f[4] = fwd.y;
                 f[5] = fwd.z;
+                m_VR->NoteFlashlightState(origin, fwd);
                 static int s_flLog;
                 if (s_flLog < 6)
                 {
@@ -3735,7 +4439,7 @@ namespace
         if (Hooks::m_VR->ScopeZoomActive())
             return out;
         Vector muzzle{};
-        // Melee swings start at the crowbar's grip, not at a projection onto
+        // Melee swings start on the visible crowbar, not at a projection onto
         // the controller's aim ray, because dCreateMove has already pointed
         // viewangles down the model's own axis for the duration of the swing.
         QAngle meleeAim{};
@@ -3973,14 +4677,151 @@ void Hooks::EnsureWeaponVfxHooks()
             && CodeBytesMatch(p, "558BEC83EC788B45080F57C956578B7D"))
         {
             if (hkTauBeamWorld.createHook(p, &dTauBeamWorld) == 0 && hkTauBeamWorld.enableHook() == 0)
-                Game::logMsg("Hook enabled: TAU world beam rva=0x%X", Offsets::kCTauBeam_WorldBeam);
+                Game::logMsg("Hook enabled: TAU impact glow rva=0x%X", Offsets::kCTauBeam_WorldBeam);
             else
-                Game::logMsg("TAU world beam hook failed");
+                Game::logMsg("TAU impact glow hook failed");
         }
         else
         {
-            Game::logMsg("TAU world beam skipped (bytes/rva 0x%X)", Offsets::kCTauBeam_WorldBeam);
+            Game::logMsg("TAU impact glow skipped (bytes/rva 0x%X)", Offsets::kCTauBeam_WorldBeam);
             hkTauBeamWorld.pTarget = p;
+        }
+    }
+    if (!hkTauBeamFireTrace.pTarget)
+    {
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCTauBeam_FireTrace;
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            && CodeBytesMatch(p, "538BDC83EC0883E4F083C404558B6B04896C24048BEC81ECEC000000"))
+        {
+            if (hkTauBeamFireTrace.createHook(p, &dTauBeamFireTrace) == 0 && hkTauBeamFireTrace.enableHook() == 0)
+                Game::logMsg("Hook enabled: TAU fire trace rva=0x%X", Offsets::kCTauBeam_FireTrace);
+            else
+                Game::logMsg("TAU fire trace hook failed");
+        }
+        else
+        {
+            Game::logMsg("TAU fire trace skipped (bytes/rva 0x%X)", Offsets::kCTauBeam_FireTrace);
+            hkTauBeamFireTrace.pTarget = p;
+        }
+    }
+    if (!hkGluonImpactTrace.pTarget)
+    {
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kCWeaponGluon_ImpactTrace;
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            && CodeBytesMatch(p, "538BDC83EC0883E4F083C404558B6B04896C24048BEC81ECD8000000"))
+        {
+            if (hkGluonImpactTrace.createHook(p, &dGluonImpactTrace) == 0 && hkGluonImpactTrace.enableHook() == 0)
+                Game::logMsg("Hook enabled: gluon impact trace rva=0x%X", Offsets::kCWeaponGluon_ImpactTrace);
+            else
+                Game::logMsg("gluon impact trace hook failed");
+        }
+        else
+        {
+            Game::logMsg("gluon impact trace skipped (bytes/rva 0x%X)", Offsets::kCWeaponGluon_ImpactTrace);
+            hkGluonImpactTrace.pTarget = p;
+        }
+    }
+    if (!hkGluonBeamUpdate.pTarget)
+    {
+        constexpr const char* kBytes =
+            "558BEC81ECD0000000A1????????33C58945FC56578BF9";
+        auto* p = ResolveCode(client, Offsets::kCWeaponGluon_BeamUpdate, kBytes);
+        if (p)
+        {
+            if (hkGluonBeamUpdate.createHook(p, &dGluonBeamUpdate) == 0
+                && hkGluonBeamUpdate.enableHook() == 0)
+                Game::logMsg("Hook enabled: gluon beam update rva=0x%X",
+                    static_cast<unsigned>(p - reinterpret_cast<unsigned char*>(client)));
+            else
+                Game::logMsg("gluon beam update hook failed");
+        }
+        else
+        {
+            Game::logMsg("gluon beam update skipped (bytes/rva 0x%X)", Offsets::kCWeaponGluon_BeamUpdate);
+            hkGluonBeamUpdate.pTarget = reinterpret_cast<unsigned char*>(client)
+                + Offsets::kCWeaponGluon_BeamUpdate;
+        }
+    }
+    if (!hkGluonBeamFxSet.pTarget)
+    {
+        constexpr const char* kBytes = "558BEC8B450C568BF1C6460C01";
+        auto* p = ResolveCode(client, Offsets::kCGluonBeamFx_SetBeam, kBytes);
+        if (p)
+        {
+            if (hkGluonBeamFxSet.createHook(p, &dGluonBeamFxSet) == 0
+                && hkGluonBeamFxSet.enableHook() == 0)
+                Game::logMsg("Hook enabled: gluon beam set rva=0x%X",
+                    static_cast<unsigned>(p - reinterpret_cast<unsigned char*>(client)));
+            else
+                Game::logMsg("gluon beam set hook failed");
+        }
+        else
+        {
+            Game::logMsg("gluon beam set skipped (bytes/rva 0x%X)", Offsets::kCGluonBeamFx_SetBeam);
+            hkGluonBeamFxSet.pTarget = reinterpret_cast<unsigned char*>(client)
+                + Offsets::kCGluonBeamFx_SetBeam;
+        }
+    }
+    if (!hkGluonBeamFxDraw.pTarget)
+    {
+        constexpr const char* kBytes =
+            "538BDC83EC0883E4F083C404558B6B04896C24048BEC81EC68050000";
+        auto* p = ResolveCode(client, Offsets::kCGluonBeamFx_Draw, kBytes);
+        if (p)
+        {
+            if (hkGluonBeamFxDraw.createHook(p, &dGluonBeamFxDraw) == 0
+                && hkGluonBeamFxDraw.enableHook() == 0)
+                Game::logMsg("Hook enabled: gluon beam draw rva=0x%X",
+                    static_cast<unsigned>(p - reinterpret_cast<unsigned char*>(client)));
+            else
+                Game::logMsg("gluon beam draw hook failed");
+        }
+        else
+        {
+            Game::logMsg("gluon beam draw skipped (bytes/rva 0x%X)", Offsets::kCGluonBeamFx_Draw);
+            hkGluonBeamFxDraw.pTarget = reinterpret_cast<unsigned char*>(client)
+                + Offsets::kCGluonBeamFx_Draw;
+        }
+    }
+    if (!hkParticleSetControlPoint.pTarget)
+    {
+        constexpr const char* kBytes = "558BEC538B5D0C578BF983BF541B0000FF";
+        auto* p = ResolveCode(client, Offsets::kParticleSetControlPoint, kBytes);
+        if (p)
+        {
+            if (hkParticleSetControlPoint.createHook(p, &dParticleSetControlPoint) == 0
+                && hkParticleSetControlPoint.enableHook() == 0)
+                Game::logMsg("Hook enabled: particle SetControlPoint rva=0x%X",
+                    static_cast<unsigned>(p - reinterpret_cast<unsigned char*>(client)));
+            else
+                Game::logMsg("particle SetControlPoint hook failed");
+        }
+        else
+        {
+            Game::logMsg("particle SetControlPoint skipped (bytes/rva 0x%X)",
+                Offsets::kParticleSetControlPoint);
+            hkParticleSetControlPoint.pTarget = reinterpret_cast<unsigned char*>(client)
+                + Offsets::kParticleSetControlPoint;
+        }
+    }
+    if (!hkParticleMgrAddEffect.pTarget)
+    {
+        auto* p = reinterpret_cast<unsigned char*>(client) + Offsets::kParticleMgr_AddEffect;
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            && CodeBytesMatch(p, "558BEC8B414C53568B7508"))
+        {
+            if (hkParticleMgrAddEffect.createHook(p, &dParticleMgrAddEffect) == 0
+                && hkParticleMgrAddEffect.enableHook() == 0)
+                Game::logMsg("Hook enabled: particle AddEffect rva=0x%X",
+                    Offsets::kParticleMgr_AddEffect);
+            else
+                Game::logMsg("particle AddEffect hook failed");
+        }
+        else
+        {
+            Game::logMsg("particle AddEffect skipped (bytes/rva 0x%X)",
+                Offsets::kParticleMgr_AddEffect);
+            hkParticleMgrAddEffect.pTarget = p;
         }
     }
     if (!hkRpgUpdateLaser.pTarget)
@@ -4003,6 +4844,133 @@ void Hooks::EnsureWeaponVfxHooks()
                 + Offsets::kCWeaponRpg_UpdateLaser;
         }
     }
+    if (!hkHudCrosshairPaint.pTarget)
+    {
+        constexpr const char* kHudCrosshairBytes =
+            "558BEC5153568B35????????8BD9578BCE8B06FF5070";
+        auto* p = ResolveCode(client, Offsets::kCHudCrosshair_Paint, kHudCrosshairBytes);
+        if (p)
+        {
+            if (hkHudCrosshairPaint.createHook(p, &dHudCrosshairPaint) == 0
+                && hkHudCrosshairPaint.enableHook() == 0)
+                Game::logMsg("Hook enabled: HUD crosshair rva=0x%X",
+                    static_cast<unsigned>(p - reinterpret_cast<unsigned char*>(client)));
+            else
+                Game::logMsg("HUD crosshair hook failed");
+        }
+        else
+        {
+            Game::logMsg("HUD crosshair skipped (bytes/rva 0x%X)", Offsets::kCHudCrosshair_Paint);
+            hkHudCrosshairPaint.pTarget = reinterpret_cast<unsigned char*>(client)
+                + Offsets::kCHudCrosshair_Paint;
+        }
+    }
+    if (!hkSpriteRendererDraw.pTarget)
+    {
+        constexpr const char* kDrawSpriteBytes =
+            "558BEC83EC48894DF88B0D????????FF15????????8845FF";
+        auto* p = ResolveCode(client, Offsets::kCSpriteRenderer_DrawSprite, kDrawSpriteBytes);
+        if (p)
+        {
+            if (hkSpriteRendererDraw.createHook(p, &dSpriteRendererDraw) == 0
+                && hkSpriteRendererDraw.enableHook() == 0)
+                Game::logMsg("Hook enabled: DrawSprite rva=0x%X",
+                    static_cast<unsigned>(p - reinterpret_cast<unsigned char*>(client)));
+            else
+                Game::logMsg("DrawSprite hook failed");
+        }
+        else
+        {
+            Game::logMsg("DrawSprite skipped (bytes/rva 0x%X)", Offsets::kCSpriteRenderer_DrawSprite);
+            hkSpriteRendererDraw.pTarget = reinterpret_cast<unsigned char*>(client)
+                + Offsets::kCSpriteRenderer_DrawSprite;
+        }
+    }
+    if (!hkViewRenderBeamsDraw.pTarget)
+    {
+        constexpr const char* kDrawBeamBytes =
+            "558BEC83EC2CA1????????33C58945FC894DE88B0D????????568B7508";
+        auto* p = ResolveCode(client, Offsets::kCViewRenderBeams_DrawBeam, kDrawBeamBytes);
+        if (p)
+        {
+            if (hkViewRenderBeamsDraw.createHook(p, &dViewRenderBeamsDraw) == 0
+                && hkViewRenderBeamsDraw.enableHook() == 0)
+                Game::logMsg("Hook enabled: DrawBeam rva=0x%X",
+                    static_cast<unsigned>(p - reinterpret_cast<unsigned char*>(client)));
+            else
+                Game::logMsg("DrawBeam hook failed");
+        }
+        else
+        {
+            Game::logMsg("DrawBeam skipped (bytes/rva 0x%X)", Offsets::kCViewRenderBeams_DrawBeam);
+            hkViewRenderBeamsDraw.pTarget = reinterpret_cast<unsigned char*>(client)
+                + Offsets::kCViewRenderBeams_DrawBeam;
+        }
+    }
+    if (!hkSpriteRenderableDraw.pTarget)
+    {
+        constexpr const char* kSprBytes =
+            "558BEC83EC64538B5D088BCB568B03FF5004";
+        auto* p = ResolveCode(client, Offsets::kCSpriteRenderable_Draw, kSprBytes);
+        if (p)
+        {
+            if (hkSpriteRenderableDraw.createHook(p, &dSpriteRenderableDraw) == 0
+                && hkSpriteRenderableDraw.enableHook() == 0)
+                Game::logMsg("Hook enabled: SpriteRenderableDraw rva=0x%X",
+                    static_cast<unsigned>(p - reinterpret_cast<unsigned char*>(client)));
+            else
+                Game::logMsg("SpriteRenderableDraw hook failed");
+        }
+        else
+        {
+            Game::logMsg("SpriteRenderableDraw skipped (bytes/rva 0x%X)",
+                Offsets::kCSpriteRenderable_Draw);
+            hkSpriteRenderableDraw.pTarget = reinterpret_cast<unsigned char*>(client)
+                + Offsets::kCSpriteRenderable_Draw;
+        }
+    }
+    if (!hkEnvLaserDotDraw.pTarget)
+    {
+        constexpr const char* kDotBytes =
+            "558BEC83ECA0A1????????33C58945FCF745080000004E";
+        auto* p = ResolveCode(client, Offsets::kCEnvLaserDot_Draw, kDotBytes);
+        if (p)
+        {
+            if (hkEnvLaserDotDraw.createHook(p, &dEnvLaserDotDraw) == 0
+                && hkEnvLaserDotDraw.enableHook() == 0)
+                Game::logMsg("Hook enabled: EnvLaserDot draw rva=0x%X",
+                    static_cast<unsigned>(p - reinterpret_cast<unsigned char*>(client)));
+            else
+                Game::logMsg("EnvLaserDot draw hook failed");
+        }
+        else
+        {
+            Game::logMsg("EnvLaserDot draw skipped (bytes/rva 0x%X)", Offsets::kCEnvLaserDot_Draw);
+            hkEnvLaserDotDraw.pTarget = reinterpret_cast<unsigned char*>(client)
+                + Offsets::kCEnvLaserDot_Draw;
+        }
+    }
+    if (!hkSpriteQuad.pTarget)
+    {
+        constexpr const char* kQuadBytes =
+            "538BDC83EC0883E4F083C404558B6B04896C24048BEC81EC58020000";
+        auto* p = ResolveCode(client, Offsets::kSpriteQuad, kQuadBytes);
+        if (p)
+        {
+            if (hkSpriteQuad.createHook(p, &dSpriteQuad) == 0
+                && hkSpriteQuad.enableHook() == 0)
+                Game::logMsg("Hook enabled: sprite quad rva=0x%X",
+                    static_cast<unsigned>(p - reinterpret_cast<unsigned char*>(client)));
+            else
+                Game::logMsg("sprite quad hook failed");
+        }
+        else
+        {
+            Game::logMsg("sprite quad skipped (bytes/rva 0x%X)", Offsets::kSpriteQuad);
+            hkSpriteQuad.pTarget = reinterpret_cast<unsigned char*>(client)
+                + Offsets::kSpriteQuad;
+        }
+    }
 }
 
 void __fastcall Hooks::dTauBeamView(void* ecx, void* edx, Vector* startEnd, void* a2, float a3, int a4, int a5)
@@ -4016,102 +4984,480 @@ void __fastcall Hooks::dTauBeamView(void* ecx, void* edx, Vector* startEnd, void
         hkTauBeamView.fOriginal(ecx, seg, a2, a3, a4, a5);
 }
 
-void __fastcall Hooks::dTauBeamWorld(void* ecx, void* edx, Vector* start, Vector* end, float width)
+void __fastcall Hooks::dTauBeamWorld(void* ecx, void* edx, Vector* impact, Vector* normal, float width)
 {
     (void)edx;
-    Vector s{};
-    Vector e{};
-    if (start && end && m_VR && m_VR->TryGetVrBeamSegment(s, e))
+    // FUN_102346A0 is the impact glow: ProgressBeam passes (endpos, plane.normal).
+    // Treating those as (muzzle, wall) spawned tau_beam_glow on the viewmodel.
+    Vector start{};
+    Vector end{};
+    Vector n{};
+    if (impact && m_VR && m_VR->TryGetVrBeamSegment(start, end, &n))
     {
+        Vector* nPtr = (n.LengthSqr() > 0.01f) ? &n : normal;
         if (hkTauBeamWorld.fOriginal)
-            hkTauBeamWorld.fOriginal(ecx, &s, &e, width);
+            hkTauBeamWorld.fOriginal(ecx, &end, nPtr, width);
         return;
     }
     if (hkTauBeamWorld.fOriginal)
-        hkTauBeamWorld.fOriginal(ecx, start, end, width);
+        hkTauBeamWorld.fOriginal(ecx, impact, normal, width);
+}
+
+void __fastcall Hooks::dTauBeamFireTrace(void* ecx, void* edx)
+{
+    (void)edx;
+    if (ecx && m_VR && m_VR->m_IsVREnabled && m_VR->m_ControllerPoseValid
+        && m_VR->IsGameplayEligible())
+    {
+        Vector start{};
+        Vector end{};
+        Vector n{};
+        if (m_VR->TryGetVrBeamSegment(start, end, &n))
+        {
+            Vector dir = end - start;
+            if (VectorNormalize(dir) > 0.01f)
+            {
+                *reinterpret_cast<Vector*>(reinterpret_cast<char*>(ecx) + 0xC) = start;
+                *reinterpret_cast<Vector*>(reinterpret_cast<char*>(ecx) + 0x18) = dir;
+            }
+        }
+    }
+    if (hkTauBeamFireTrace.fOriginal)
+        hkTauBeamFireTrace.fOriginal(ecx);
+}
+
+void __fastcall Hooks::dGluonImpactTrace(void* ecx, void* edx, void* player, CGameTrace* trace)
+{
+    (void)edx;
+    static int s_enter;
+    if (s_enter < 8)
+    {
+        Game::logMsg("gluon impact enter trace=%p vr=%d",
+            trace, (m_VR && m_VR->m_IsVREnabled) ? 1 : 0);
+        ++s_enter;
+    }
+    ++g_GluonFx;
+    g_GluonFxUntilMs = GetTickCount() + 250;
+    if (hkGluonImpactTrace.fOriginal)
+        hkGluonImpactTrace.fOriginal(ecx, player, trace);
+    Vector start{};
+    Vector end{};
+    Vector n{};
+    if (trace && m_VR && m_VR->m_IsVREnabled && m_VR->TryGetVrBeamSegment(start, end, &n))
+    {
+        static int s_gluonTr;
+        if (s_gluonTr < 8)
+        {
+            Game::logMsg("gluon impact was=(%.0f,%.0f,%.0f) -> (%.0f,%.0f,%.0f) aimOff=%.1fdeg",
+                trace->endpos.x, trace->endpos.y, trace->endpos.z,
+                end.x, end.y, end.z, AimOffLookDegrees());
+            ++s_gluonTr;
+        }
+        ApplyVrTraceHit(trace, start, end, n);
+        float* raw = reinterpret_cast<float*>(trace);
+        raw[3] = end.x;
+        raw[4] = end.y;
+        raw[5] = end.z;
+        raw[0] = start.x;
+        raw[1] = start.y;
+        raw[2] = start.z;
+    }
+    --g_GluonFx;
+    if (g_GluonFx < 0)
+        g_GluonFx = 0;
+}
+
+void __fastcall Hooks::dGluonBeamUpdate(void* ecx, void* edx)
+{
+    (void)edx;
+    NoteGluonFx();
+    PatchGluonImpactParticleDefs();
+    if (hkGluonBeamUpdate.fOriginal)
+        hkGluonBeamUpdate.fOriginal(ecx);
+    EndGluonFx();
+}
+
+void __fastcall Hooks::dGluonBeamFxSet(void* ecx, void* edx, void* viewmodel, Vector* start, Vector* mid, Vector* end)
+{
+    (void)edx;
+    if ((g_GluonFx > 0 || GluonFxLive()) && RewriteToVrBeamEnd(end))
+    {
+        static int s_set;
+        if (s_set < 8)
+        {
+            Game::logMsg("gluon SetBeam end=(%.0f,%.0f,%.0f) aimOff=%.1fdeg",
+                end->x, end->y, end->z, AimOffLookDegrees());
+            ++s_set;
+        }
+    }
+    if (hkGluonBeamFxSet.fOriginal)
+        hkGluonBeamFxSet.fOriginal(ecx, viewmodel, start, mid, end);
+}
+
+int __fastcall Hooks::dGluonBeamFxDraw(void* ecx, void* edx, unsigned flags)
+{
+    (void)edx;
+    if (ecx && m_VR && m_VR->m_IsVREnabled && GluonFxLive())
+    {
+        auto* beamEnd = reinterpret_cast<Vector*>(static_cast<char*>(ecx) + 0x24);
+        if (RewriteToVrBeamEnd(beamEnd))
+        {
+            static int s_draw;
+            if (s_draw < 8)
+            {
+                Game::logMsg("gluon BeamFx draw end=(%.0f,%.0f,%.0f) aimOff=%.1fdeg",
+                    beamEnd->x, beamEnd->y, beamEnd->z, AimOffLookDegrees());
+                ++s_draw;
+            }
+        }
+    }
+    if (!hkGluonBeamFxDraw.fOriginal)
+        return 0;
+    return hkGluonBeamFxDraw.fOriginal(ecx, flags);
+}
+
+void __fastcall Hooks::dParticleSetControlPoint(void* ecx, void* edx, int index, Vector* origin)
+{
+    (void)edx;
+    const bool gluonImpact = IsGluonImpactParticleName(ParticleDefName(ParticleEffectDef(ecx)));
+    if (gluonImpact)
+    {
+        ClearParticleViewModelEffect(ParticleEffectDef(ecx));
+        ClearEffectViewModelFlag(ecx);
+    }
+    if ((g_GluonFx > 0 || gluonImpact) && index == 0 && RewriteToVrBeamEnd(origin))
+    {
+        static int s_cp;
+        if (s_cp < 8)
+        {
+            Game::logMsg("gluon particle CP0 -> (%.0f,%.0f,%.0f) aimOff=%.1fdeg vm=%s",
+                origin->x, origin->y, origin->z, AimOffLookDegrees(),
+                gluonImpact ? "world" : "?");
+            ++s_cp;
+        }
+    }
+    if (hkParticleSetControlPoint.fOriginal)
+        hkParticleSetControlPoint.fOriginal(ecx, index, origin);
+}
+
+void __fastcall Hooks::dParticleMgrAddEffect(void* ecx, void* edx, void* effect)
+{
+    (void)edx;
+    if (m_VR && m_VR->m_IsVREnabled && effect)
+    {
+        void* def = ParticleEffectDef(effect);
+        if (IsGluonImpactParticleName(ParticleDefName(def)))
+        {
+            if (ClearParticleViewModelEffect(def))
+            {
+                static int s_add;
+                if (s_add < 4)
+                {
+                    Game::logMsg("gluon AddEffect world-pass %s", ParticleDefName(def));
+                    ++s_add;
+                }
+            }
+            ClearEffectViewModelFlag(effect);
+        }
+    }
+    if (hkParticleMgrAddEffect.fOriginal)
+        hkParticleMgrAddEffect.fOriginal(ecx, effect);
 }
 
 void __fastcall Hooks::dRpgUpdateLaser(void* ecx, void* edx)
 {
     (void)edx;
-    const bool vrLaser = ecx && m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible()
-        && EngineInGame();
-    if (!vrLaser)
-    {
-        if (hkRpgUpdateLaser.fOriginal)
-            hkRpgUpdateLaser.fOriginal(ecx);
-        return;
-    }
-
+    // CHudCrosshair::Paint calls this at vtable +0x5C4. The body is screen-space
+    // ISurface at ScreenWidth/2, so in VR it is glued to the look centre. Skip
+    // whenever the VR DLL is running — eligibility gates here left the original
+    // drawing, which is the mark the user still saw.
     unsigned char laserOn = 0;
-    uint32_t handle = 0xFFFFFFFFu;
     const int onOff = m_Game ? m_Game->RpgLaserOnOffset() : Offsets::kCWeaponRpg_bLaserOn;
-    const int dotOff = m_Game ? m_Game->RpgLaserDotOffset() : Offsets::kCWeaponRpg_hLaserDot;
-    __try
+    if (ecx)
     {
-        laserOn = *reinterpret_cast<unsigned char*>(static_cast<char*>(ecx) + onOff);
-        handle = *reinterpret_cast<uint32_t*>(static_cast<char*>(ecx) + dotOff);
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER)
-    {
-        laserOn = 0;
-        handle = 0xFFFFFFFFu;
-    }
-    const bool wantLaser = laserOn != 0 || (m_VR && m_VR->RpgLaserLatched());
-    if (!wantLaser)
-    {
-        if (hkRpgUpdateLaser.fOriginal)
-            hkRpgUpdateLaser.fOriginal(ecx);
-        return;
-    }
-
-    C_BaseEntity* dot = nullptr;
-    if (m_Game)
-    {
-        if (handle != 0 && handle != 0xFFFFFFFFu)
-            dot = m_Game->ResolveEntityFromHandle(handle);
-        if (!dot)
-            dot = m_Game->FindEntityByNetworkNameContains("laserdot");
-        if (!dot)
-            dot = m_Game->FindEntityByNetworkNameContains("laser_dot");
-    }
-    // Original draws a screen-space reticle from ScreenWidth/Height (HMD
-    // centre). Call it only to spawn the world dot, then park the dot on the
-    // controller aim ray and skip the 2D path afterwards.
-    if (!dot)
-    {
-        if (hkRpgUpdateLaser.fOriginal)
-            hkRpgUpdateLaser.fOriginal(ecx);
         __try
         {
-            handle = *reinterpret_cast<uint32_t*>(static_cast<char*>(ecx) + dotOff);
+            laserOn = *reinterpret_cast<unsigned char*>(static_cast<char*>(ecx) + onOff);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
-            return;
+            laserOn = 0;
         }
-        if (m_Game && handle != 0 && handle != 0xFFFFFFFFu)
-            dot = m_Game->ResolveEntityFromHandle(handle);
-        if (!dot && m_Game)
-            dot = m_Game->FindEntityByNetworkNameContains("laserdot");
-        if (!dot)
-            return;
     }
+    static int s_entryLog;
+    if (s_entryLog < 16)
+    {
+        Game::logMsg("UpdateLaser vr=%d on=%u latch=%d rpgHeld=%d",
+            (m_VR && m_VR->m_IsVREnabled) ? 1 : 0, laserOn,
+            (m_VR && m_VR->RpgLaserLatched()) ? 1 : 0,
+            RpgWeaponHeld() ? 1 : 0);
+        ++s_entryLog;
+    }
+    if (!(ecx && m_VR && m_VR->m_IsVREnabled))
+    {
+        if (hkRpgUpdateLaser.fOriginal)
+            hkRpgUpdateLaser.fOriginal(ecx);
+        return;
+    }
+
+    const bool wantLaser = laserOn != 0 || m_VR->RpgLaserLatched();
+    m_VR->SetRpgLaserActive(wantLaser);
+    if (!wantLaser)
+        return;
 
     Vector start{};
     Vector end{};
-    if (!m_VR->TryGetVrBeamSegment(start, end) || !dot)
-        return;
-    const float origin3[3] = { end.x, end.y, end.z };
-    const float angles3[3] = { 0.f, 0.f, 0.f };
-    CallSetAbsOriginAngles(dot, origin3, angles3);
-    static int s_rpgLog;
-    if (s_rpgLog < 8)
+    if (m_VR->TryGetVrBeamSegment(start, end))
     {
-        Game::logMsg("RPG laser VR end=(%.1f,%.1f,%.1f) on=%u handle=0x%X",
-            end.x, end.y, end.z, laserOn, handle);
-        ++s_rpgLog;
+        Vector dir = end - start;
+        if (VectorNormalize(dir) > 0.01f)
+            end = end - dir * 1.5f;
+        m_VR->NoteRpgLaserWorld(end);
+        C_BaseEntity* dot = FindRpgLaserDot();
+        if (dot)
+        {
+            ClearEntityNodraw(dot);
+            const float origin3[3] = { end.x, end.y, end.z };
+            const float angles3[3] = { 0.f, 0.f, 0.f };
+            CallSetAbsOriginAngles(dot, origin3, angles3);
+        }
+        static int s_rpgLog;
+        if (s_rpgLog < 8)
+        {
+            Game::logMsg("RPG laser skip HUD end=(%.1f,%.1f,%.1f) on=%u dot=%d",
+                end.x, end.y, end.z, laserOn, dot ? 1 : 0);
+            ++s_rpgLog;
+        }
     }
+}
+
+void __fastcall Hooks::dHudCrosshairPaint(void* ecx, void* edx)
+{
+    (void)edx;
+    const bool skip = m_VR && m_VR->m_IsVREnabled && RpgWeaponHeld();
+    static int s_paint;
+    if (s_paint < 8)
+    {
+        Game::logMsg("HUD crosshair paint skip=%d rpg=%d laser=%d vm=%s",
+            skip ? 1 : 0, RpgWeaponHeld() ? 1 : 0,
+            (m_VR && m_VR->RpgLaserActive()) ? 1 : 0,
+            (m_VR && !m_VR->m_LastViewmodelModel.empty())
+                ? m_VR->m_LastViewmodelModel.c_str() : "-");
+        ++s_paint;
+    }
+    if (skip)
+        return;
+    if (hkHudCrosshairPaint.fOriginal)
+        hkHudCrosshairPaint.fOriginal(ecx);
+}
+
+int __fastcall Hooks::dSpriteRendererDraw(void* ecx, void* edx, void* entity, void* model,
+    float* origin, float* angles, float scale, void* attach, int a7, int a8, int a9,
+    unsigned a10, unsigned a11, unsigned a12, unsigned a13, float frame, int a15)
+{
+    (void)edx;
+    if (hkSpriteRendererDraw.fOriginal && m_VR && m_VR->m_IsVREnabled
+        && m_Game && m_Game->m_ModelInfo)
+    {
+        const char* name = SafeModelName(m_Game->m_ModelInfo, model);
+        const char* cls = m_Game->GetEntityClientClassName(static_cast<C_BaseEntity*>(entity));
+        if (m_VR->RpgLaserActive())
+        {
+            const bool look = SpriteOriginOnLookRay(origin);
+            const bool nearEye = SpriteOriginNearEye(origin);
+            static int s_sprNameLog;
+            if (s_sprNameLog < 24 && (look || nearEye || EntityLooksLikeLaserDot(static_cast<C_BaseEntity*>(entity))
+                    || LaserDotMaterialName(name) || RpgLaserWorldSpriteMaterial(name)))
+            {
+                Game::logMsg("DrawSprite model=%s class=%s look=%d near=%d attach=%d hide=%d at=(%.0f,%.0f,%.0f)",
+                    name ? name : "?", cls ? cls : "?", look ? 1 : 0, nearEye ? 1 : 0,
+                    attach ? 1 : 0,
+                    RpgLaserSpriteCandidate(static_cast<C_BaseEntity*>(entity), name, origin) ? 1 : 0,
+                    origin ? origin[0] : 0.f, origin ? origin[1] : 0.f, origin ? origin[2] : 0.f);
+                ++s_sprNameLog;
+            }
+            if (RpgLaserSpriteCandidate(static_cast<C_BaseEntity*>(entity), name, origin)
+                || (GlowSpriteMaterialName(name) && nearEye && !std::strstr(name ? name : "", "glow06")))
+            {
+                static int s_skipLog;
+                if (s_skipLog < 4)
+                {
+                    LogRpgLaserSpriteSkip("DrawSprite", name, cls, origin);
+                    ++s_skipLog;
+                }
+            }
+        }
+        if (origin && GluonWeaponHeld() && GluonGlowMaterialName(name)
+            && !std::strstr(name ? name : "", "glow06"))
+        {
+            Vector parked{};
+            if (TryParkedFxWorld(parked))
+            {
+                static int s_gluonSpr;
+                if (s_gluonSpr < 8)
+                {
+                    Game::logMsg("gluon DrawSprite %s -> (%.0f,%.0f,%.0f) was (%.0f,%.0f,%.0f) aimOff=%.1fdeg",
+                        name ? name : "?", parked.x, parked.y, parked.z,
+                        origin[0], origin[1], origin[2], AimOffLookDegrees());
+                    ++s_gluonSpr;
+                }
+                origin[0] = parked.x;
+                origin[1] = parked.y;
+                origin[2] = parked.z;
+            }
+        }
+    }
+    if (!hkSpriteRendererDraw.fOriginal)
+        return 0;
+    return hkSpriteRendererDraw.fOriginal(ecx, entity, model, origin, angles, scale, attach,
+        a7, a8, a9, a10, a11, a12, a13, frame, a15);
+}
+
+void __fastcall Hooks::dViewRenderBeamsDraw(void* ecx, void* edx, void* beam)
+{
+    (void)edx;
+    static int s_enter;
+    if (s_enter < 8 && m_VR && m_VR->RpgLaserActive())
+    {
+        Game::logMsg("DrawBeam enter beam=%p laser=1", beam);
+        ++s_enter;
+    }
+    RetargetRpgLaserBeam(beam);
+    if (hkViewRenderBeamsDraw.fOriginal)
+        hkViewRenderBeamsDraw.fOriginal(ecx, beam);
+}
+
+int __stdcall Hooks::dSpriteRenderableDraw(void* renderable, float scale, float frame,
+    int rendermode, int renderfx, unsigned char* color, float hdr, unsigned* unk)
+{
+    if (renderable && m_VR && m_VR->m_IsVREnabled && m_VR->RpgLaserActive()
+        && m_Game && m_Game->m_ModelInfo)
+    {
+        void* model = nullptr;
+        float* origin = nullptr;
+        __try
+        {
+            void** vt = *reinterpret_cast<void***>(renderable);
+            using GetVecFn = float*(__thiscall*)(void*);
+            using GetModelFn = void*(__thiscall*)(void*);
+            if (vt && vt[1])
+                origin = GetVecFn(vt[1])(renderable);
+            if (vt && vt[9])
+                model = GetModelFn(vt[9])(renderable);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            origin = nullptr;
+            model = nullptr;
+        }
+        auto* entity = reinterpret_cast<C_BaseEntity*>(static_cast<char*>(renderable) - 4);
+        const char* name = SafeModelName(m_Game->m_ModelInfo, model);
+        const char* cls = m_Game->GetEntityClientClassName(entity);
+        static int s_alt;
+        if (s_alt < 12)
+        {
+            Game::logMsg("SpriteRenderable model=%s class=%s hide=%d at=(%.0f,%.0f,%.0f)",
+                name ? name : "?", cls ? cls : "?",
+                RpgLaserSpriteCandidate(entity, name, origin) ? 1 : 0,
+                origin ? origin[0] : 0.f, origin ? origin[1] : 0.f, origin ? origin[2] : 0.f);
+            ++s_alt;
+        }
+        if (RpgLaserSpriteCandidate(entity, name, origin))
+        {
+            static int s_altSkip;
+            if (s_altSkip < 4)
+            {
+                LogRpgLaserSpriteSkip("SpriteRenderable", name, cls, origin);
+                ++s_altSkip;
+            }
+        }
+    }
+    if (!hkSpriteRenderableDraw.fOriginal)
+        return 0;
+    return hkSpriteRenderableDraw.fOriginal(renderable, scale, frame, rendermode, renderfx,
+        color, hdr, unk);
+}
+
+int __fastcall Hooks::dEnvLaserDotDraw(void* ecx, void* edx, unsigned flags)
+{
+    (void)edx;
+    static int s_dot;
+    if (s_dot < 12)
+    {
+        Game::logMsg("EnvLaserDot draw flags=0x%X vr=%d laser=%d",
+            flags, (m_VR && m_VR->m_IsVREnabled) ? 1 : 0,
+            (m_VR && m_VR->RpgLaserActive()) ? 1 : 0);
+        ++s_dot;
+    }
+    const bool retarget = ecx && m_VR && m_VR->m_IsVREnabled
+        && (flags & 0x4E000000u) == 0;
+    if (retarget)
+    {
+        m_VR->SetRpgLaserActive(true);
+        g_EnvLaserDotQuad = true;
+    }
+    int result = 0;
+    if (hkEnvLaserDotDraw.fOriginal)
+        result = hkEnvLaserDotDraw.fOriginal(ecx, flags);
+    g_EnvLaserDotQuad = false;
+    return result;
+}
+
+void __cdecl Hooks::dSpriteQuad(float* origin, float width, float height, unsigned color)
+{
+    Vector parked{};
+    const bool rpg = m_VR && m_VR->m_IsVREnabled && m_VR->RpgLaserActive();
+    const bool gluon = GluonFxLive();
+    const float offHmd = origin ? PointOffLookDegrees(origin) : 180.f;
+    const float offView = origin ? PointOffCurrentViewDegrees(origin) : 180.f;
+    const bool onLook = origin && (offHmd < 4.f || offView < 4.f);
+    const unsigned rgb = color & 0x00FFFFFFu;
+    // Distant EnvLaserDot scales well past 80; skybox DrawModel is a nested
+    // RenderView whose look-hit is not the HMD world ray.
+    const bool rpgMark = rpg && onLook && width >= 16.f
+        && (rgb == 0x00FFFFFFu || width >= 20.f);
+    const bool gluonMark = gluon && onLook && width >= 6.f && width <= 256.f
+        && rgb != 0x00FFFFFFu && !(width > 12.2f && width < 13.4f);
+    bool haveParked = (rpgMark || gluonMark) && TryParkedFxWorld(parked);
+    if (haveParked && gluonMark && !rpgMark && PointOffLookDegrees(&parked.x) < 5.f)
+        haveParked = false;
+    static int s_quad;
+    if (s_quad < 16 && origin && (rpg || gluon))
+    {
+        Game::logMsg(
+            "sprite quad at=(%.0f,%.0f,%.0f) offHmd=%.1fdeg offView=%.1fdeg aimOff=%.1fdeg nest=%d retarget=%d size=%.1f rgb=%06X rpg=%d gluon=%d",
+            origin[0], origin[1], origin[2], offHmd, offView, AimOffLookDegrees(),
+            g_RenderViewNest, haveParked ? 1 : 0, width, rgb, rpgMark ? 1 : 0, gluonMark ? 1 : 0);
+        ++s_quad;
+    }
+    if (haveParked && rpgMark && NestedRenderView())
+    {
+        static int s_sky;
+        if (s_sky < 8)
+        {
+            Game::logMsg("RPG laser skip nested/sky quad size=%.1f offView=%.1fdeg",
+                width, offView);
+            ++s_sky;
+        }
+        return;
+    }
+    if (haveParked)
+    {
+        static int s_move;
+        if (s_move < 10)
+        {
+            Game::logMsg("FX quad -> (%.1f,%.1f,%.1f) was (%.1f,%.1f,%.1f) aimOff=%.1fdeg rpg=%d gluon=%d nest=%d size=%.1f",
+                parked.x, parked.y, parked.z, origin[0], origin[1], origin[2],
+                AimOffLookDegrees(), rpgMark ? 1 : 0, gluonMark ? 1 : 0,
+                g_RenderViewNest, width);
+            ++s_move;
+        }
+        origin[0] = parked.x;
+        origin[1] = parked.y;
+        origin[2] = parked.z;
+    }
+    if (hkSpriteQuad.fOriginal)
+        hkSpriteQuad.fOriginal(origin, width, height, color);
 }
 
 void __fastcall Hooks::dGetBackBufferDimensions(void* ecx, void* edx, int& width, int& height)
@@ -4253,6 +5599,41 @@ void __fastcall Hooks::dGetScreenSize(void* ecx, void* edx, int& width, int& hei
     }
 }
 
+float __fastcall Hooks::dGetScreenAspectRatio(void* ecx, void* edx)
+{
+    (void)edx;
+    float aspect = 0.f;
+    if (hkGetScreenAspectRatio.fOriginal)
+        aspect = hkGetScreenAspectRatio.fOriginal(ecx);
+    if (m_VR && m_VR->HudPaintActive())
+        return aspect > 0.1f ? aspect : (4.f / 3.f);
+    // client.dll FUN_1020a8f0 DrawViewModels: viewModelSetup.m_flAspectRatio =
+    // engine->GetScreenAspectRatio() (IVEngineClient slot 96). That is the
+    // HWND 16:9 ratio, not GetScreenSize and not the stereo CViewSetup we
+    // already set to the eye. World/gloves use the HMD frustum (~1.027);
+    // the gun used 16:9 in a ~square eye RT (stretch along view-up, and the
+    // grip rides the look plane when you nod).
+    if (m_VR && m_VR->m_IsVREnabled && m_VR->IsGameplayEligible() && EngineInGame()
+        && (m_VR->StereoEyeBlitActive() || m_VR->m_StereoEye != 0)
+        && m_VR->m_RenderWidth >= 640 && m_VR->m_RenderHeight >= 360
+        && (bmvr::OffscreenWorldMatchesEyes() || m_VR->CachedRt0MatchesEyes()
+            || m_VR->D3dRt0IsEyeSized()))
+    {
+        const float eyeAspect = static_cast<float>(m_VR->m_RenderWidth)
+            / static_cast<float>(m_VR->m_RenderHeight);
+        static int s_arLog;
+        if (s_arLog < 8)
+        {
+            Game::logMsg("GetScreenAspectRatio %.3f -> %.3f (eye %ux%u stereoEye=%d)",
+                aspect, eyeAspect, m_VR->m_RenderWidth, m_VR->m_RenderHeight,
+                m_VR->m_StereoEye);
+            ++s_arLog;
+        }
+        return eyeAspect;
+    }
+    return aspect > 0.1f ? aspect : (4.f / 3.f);
+}
+
 ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags)
 {
     (void)edx;
@@ -4277,6 +5658,7 @@ ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* n
     const bool skipGrow = name && (std::strstr(name, "_rt_Hud") || std::strstr(name, "_rt_gui")
         || std::strstr(name, "Dof") || std::strstr(name, "dof")
         || std::strstr(name, "Water") || std::strstr(name, "Reflect")
+        || std::strstr(name, "Refract")
         || std::strstr(name, "PowerOfTwo") || std::strstr(name, "_rt_Camera"));
 
     uint32_t growW = 0, growH = 0;
@@ -4488,13 +5870,32 @@ void bmvr::InstallEarlyFramebufferHook()
     if (screenOff == 0)
         screenOff = 0xA6BD0;
     void* screenTarget = reinterpret_cast<uint8_t*>(eng) + screenOff;
-    if (Hooks::hkGetScreenSize.pTarget)
-        return;
-    if (Hooks::hkGetScreenSize.createHook(screenTarget, &Hooks::dGetScreenSize) != 0
-        || Hooks::hkGetScreenSize.enableHook() != 0)
+    if (!Hooks::hkGetScreenSize.pTarget)
     {
-        Log("GetScreenSize hook failed rva=0x%X", screenOff);
-        return;
+        if (Hooks::hkGetScreenSize.createHook(screenTarget, &Hooks::dGetScreenSize) != 0
+            || Hooks::hkGetScreenSize.enableHook() != 0)
+        {
+            Log("GetScreenSize hook failed rva=0x%X", screenOff);
+        }
+        else
+            Log("Hook enabled: GetScreenSize rva=0x%X", screenOff);
     }
-    Log("Hook enabled: GetScreenSize rva=0x%X", screenOff);
+    if (!Hooks::hkGetScreenAspectRatio.pTarget)
+    {
+        int aspectOff = SigScanner::VerifyOffset("engine.dll", 0x1012D0,
+            "55 8B EC 8B 0D ? ? ? ? 83 EC 0C 81 F9 ? ? ? ? 75 16 F3 0F 10 0D");
+        if (aspectOff == -1)
+            Log("GetScreenAspectRatio signature not found");
+        else
+        {
+            if (aspectOff == 0)
+                aspectOff = 0x1012D0;
+            void* aspectTarget = reinterpret_cast<uint8_t*>(eng) + aspectOff;
+            if (Hooks::hkGetScreenAspectRatio.createHook(aspectTarget, &Hooks::dGetScreenAspectRatio) != 0
+                || Hooks::hkGetScreenAspectRatio.enableHook() != 0)
+                Log("GetScreenAspectRatio hook failed rva=0x%X", aspectOff);
+            else
+                Log("Hook enabled: GetScreenAspectRatio rva=0x%X", aspectOff);
+        }
+    }
 }

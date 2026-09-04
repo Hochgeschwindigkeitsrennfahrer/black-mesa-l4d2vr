@@ -193,5 +193,186 @@ Do not claim HMD success on 28h.
 
 Do not claim HMD success on 28i.
 
+## Pass 2026-09-03 stereo bloom skip / weapon wheel world-lock
+
+**Bloom (HMD-verified ghosts, skip compiled + installed previously):** Anomalous Materials cafeteria (`bm_c1a0a`) fluorescent copies on the dark ceiling and a table/NPC stamp on the olive wall were **bloom** (`engine_post` / `lumcompare` / `downsample` / `blurfilter` / `blur_combine`). God rays, `bms_postprocess`, xog, DOF are not the cause. Current path skips that bloom DSSR on stereo eyes; the rest of post stays on.
+
+Do **not** retry:
+
+| Attempt | Result |
+|---|---|
+| Dest-expand `engine_post` to eye + write stored `Viewport` so `GetViewport` FLerp matches | Ghosts stayed |
+| Grow `_rt_Small*FB*` to eye/N **and** force `DoEnginePostProcessing` x/y/w/h to eye | Ghosts gone; **picture zoomed and warped with head** |
+| Revert only `DoEnginePostProcessing`; keep SmallFB grow | Same zoom/warp |
+
+Do not grow `_rt_gb*2`. Do not Y-flip 2D capture. HEV charger trail D3D clear, StretchRect HWND→POT, shader-constant rewrite, CopyRTEx eye srcRect grow, viewport/scissor expand, `nr_gbuffer_for_refraction_enabled 0`, motion blur off, god rays on — keep. Reflection gbuffer is on again with full water.
+
+**Weapon wheel this pass:** spawn at the right-hand grip (not 11 HU down the aim ray) and draw/hover in the latched world plane. Screen-pixel honeycomb around a projected origin was why the wheel tilted and slid with the HMD. Snap-turn still yaws with `m_RotationOffsetY`. **Compiled + installed** (`d3d9.dll` 2788352 bytes). **Not HMD-verified.**
+
+Do not claim HMD success. User should confirm: opens at the hand; stays put when looking around (no tilt); hover/select still works.
+
+## Pass 2026-09-03 water refraction / main menu VR
+
+**Compiled + installed this pass** (`d3d9.dll` 2791424 bytes). **Not HMD-verified.** Do not claim headset presentation.
+
+| Item | Change |
+|---|---|
+| Water | `r_WaterDrawRefraction 1` (QoL + `VR/bmvr.cfg`). Cheap-water force 0 was a flat teal fog fill. Planar **reflection** and `nr_gbuffer_for_refraction/reflection` stay **off** (view-locked ghost / wall stamps). Water/Refract named RTs still not grown to the eye. |
+| Main menu in HMD | Skip-file `menu_vr` is ignored (it permanently hid `background*` capture after a 2026-08-16 hang). 2D capture Submit retries on any LevelInit map. Crash-sticky still disables **one** launch if Present dies. Look/CreateMove stay off on `background*`. |
+| Menu controllers | On `background*` maps, right-controller aim maps onto the captured 16:9 menu; trigger / MenuSelect click; left-menu/Pause is Escape. Does not require the game window to be foreground (SteamVR usually has focus). |
+
+Log tags: `Menu compositor begin`, `VR menu click`, `Ignoring menu_vr skip-file`, `waterrefract1`.
+
+**HMD checklist:** main menu visible in the headset before loading a map; point and click New Game / Load; water in Xen/coast has a surface (not a solid fill); no view-locked world in the water; no gbuffer refraction stamps on walls.
+
+Do not claim HMD success.
+
+## Pass 2026-09-03b menu empty-map submit / full water
+
+**Compiled + installed this pass** (`d3d9.dll` 2794496 bytes). **Not HMD-verified.**
+
+User: menu still black until level load. Log (~11k Presents): `inGame=0 eligible=0 map=` `createdRT=0`. `-oldgameui` never names `background01`, so the map-name gate never opened. `menu_vr` skip was already ignored (`menuVR=1`).
+
+| Item | Change |
+|---|---|
+| Menu Submit | `ShouldCompositorSubmit` no longer requires a map name on the GameUI. 2D capture + OpenXR publish from the first healthy Present. Skip `bmvrHUD` CreateNamedRT until a gameplay map. |
+| Menu cursor | Same no-map GameUI path. |
+| Water | Full: `r_WaterDrawReflection` / `r_waterforcereflectentities` / `r_waterforceexpensive` / `nr_gbuffer_for_reflection_enabled`. Keep `nr_gbuffer_for_refraction_enabled 0`. |
+
+Log tags: `Menu compositor begin map=(none)`, `CreateVRTextures begin`, `PrePresent capture`, `OpenXR mono capture copied to both eyes`, `waterfull`.
+
+**HMD checklist:** menu in the headset at GameUI (before New Game); point+click; water has reflections without wall stamps.
+
+Do not claim HMD success.
+
+## Pass 2026-09-03c menu cursor off Present-thread VGUI
+
+**Compiled + installed this pass** (`d3d9.dll` 2794496 bytes). **Not HMD-verified.**
+
+User: crash shortly after reaching the menu. Log: `Menu compositor begin map=(none)`, CreateVRTextures 3168×3104, OpenXR publishing, ~286 fps to present 704, last line `controller poses L=1 R=1`. Submit itself survived; the first controller-tracking `Update` called VGUI `IInput` (`SetCursorPos` / `InternalCursorMoved`) from the DXVK Present thread.
+
+| Item | Change |
+|---|---|
+| Menu cursor | HWND `SetCursorPos` + throttled `WM_MOUSEMOVE` / click. No VGUI IInput from Present. |
+| menu_vr sticky | Stays armed until a gameplay `LevelInit` (was cleared at 120 submits). |
+
+Log tags: `Menu cursor HWND`.
+
+**HMD checklist:** GameUI stays up in the headset; point+click New Game; no crash when controllers track.
+
+Do not claim HMD success.
+
+## Pass 2026-09-03d menu visible + stick nav
+
+**Compiled + installed this pass** (`d3d9.dll` 2798592 bytes). **Not HMD-verified.**
+
+User: menu still black in the HMD, but cursor/nav worked on desktop. Log: one `PrePresent capture 2560x1440`, then `Frame copy RT ready 3168x3104`, then OpenXR kept publishing that empty eye RT. OpenXR never cleared `m_FrameCopyLatched`, so GameUI was never recaptured.
+
+| Item | Change |
+|---|---|
+| Menu image | Keep capture at HWND 2560×1440. Letterbox into the 3168 eyes. Clear the copy latch after each OpenXR publish. |
+| Stick nav | Left stick = arrows. **A** = Enter. **B** / Pause = Escape. Trigger still point-clicks. |
+
+Log tags: `OpenXR mono capture letterboxed 2560x1440`, more `PrePresent capture`, `Menu nav`, `Menu confirm A/MenuSelect`.
+
+**HMD checklist:** old GameUI visible in the headset (letterboxed 16:9); stick moves the highlight; A confirms; B goes back.
+
+Do not claim HMD success.
+
+## Pass 2026-09-03e menu Submit stayed off
+
+**Compiled + installed this pass** (`d3d9.dll` 2799616 bytes). **Not HMD-verified.**
+
+User: still completely black. Last log: `Disabled menu/background compositor Submit this launch only`, `menuVR=0`, `createdRT=0`. Helper `submitted=0`. The letterbox/recapture DLL never ran — quitting GameUI left `bmvr_in_menu_vr.flag`.
+
+| Item | Change |
+|---|---|
+| menu_vr sticky | Ignored. `BeginRisky` only covers `CreateVRTextures`. |
+| GameUI Submit | Always on (empty map). Capture prefers the HWND backbuffer. |
+| Menu FOV | Publish `renderFovXDeg=0` so the helper uses the HMD frustum. |
+
+Log tags: `Ignoring menu_vr crash-sticky`, `Menu compositor begin`, `submit=1`, `createdRT=1`, `PrePresent capture bb`, `OpenXR mono capture letterboxed`, more than one capture.
+
+**HMD checklist:** old GameUI visible in the headset before New Game.
+
+Do not claim HMD success.
+
+## Pass 2026-09-03f menu distance + cursor
+
+**Compiled + installed this pass** (`d3d9.dll` 2802176 bytes). **Not HMD-verified.**
+
+User: GameUI visible, but too close to read, no mouse cursor in VR, pointer too shaky.
+
+| Item | Change |
+|---|---|
+| Distance | Letterbox at `MenuPanelScale=0.44` (was full-width / on your face). |
+| Cursor | Yellow arrow drawn into the captured menu. Windows cursor is not in the backbuffer. |
+| Smooth | 0.18s low-pass; flicks still track. Point at the smaller panel. |
+
+Config: `MenuPanelScale` (lower = farther), `MenuCursorSmoothSec` (higher = steadier).
+
+Do not claim HMD success.
+
+## Pass 2026-09-03g pause 2D + cursor color
+
+**Compiled + installed this pass** (`d3d9.dll` 2804736 bytes). **Not HMD-verified.**
+
+User: panel too far; no pause menu in VR; Windows cursor only on desktop; arrow should match BM orange / Blue Shift blue.
+
+| Item | Change |
+|---|---|
+| Distance | `MenuPanelScale=0.56` (was 0.44). |
+| Cursor | HEV orange, or Calhoun blue if `-game bshift`. Drawn on the 2D panel. |
+| Pause | Same HWND 2D capture as the main menu. Do not blit BB into the eyes then overwrite with a stale copy. |
+
+Log tags: `Pause 2D panel capture`, `Pause 2D letterboxed`.
+
+Do not claim HMD success.
+
+## Pass 2026-09-03h fixed menu + save list
+
+**Compiled + installed this pass** (`d3d9.dll` 2809856 bytes). **Not HMD-verified.**
+
+User: still too far and follows the head; save list needs mouse-wheel; double trigger should load like double-click.
+
+| Item | Change |
+|---|---|
+| Distance | `MenuPanelScale=0.70` |
+| Fixed | Latch HMD pose when the 2D panel appears; look around it. Recenter relatches. |
+| Saves | Right stick Y = `WM_MOUSEWHEEL`. Double trigger = `WM_LBUTTONDBLCLK`. |
+
+Log tags: `Menu panel pose latched`, `Menu wheel`, `VR menu double-click`.
+
+Do not claim HMD success.
+
+## Pass 2026-09-03i level menu + stereo after save
+
+**Compiled + installed this pass** (`d3d9.dll` 2811392 bytes). **Not HMD-verified.**
+
+User: tilted head → tilted menu; after loading a save the desktop menu closes but the HMD stays 2D until pause is toggled.
+
+| Item | Change |
+|---|---|
+| Upright | Latch yaw only (drop headset pitch/roll). |
+| After load | 2D panel only while GameUI is actually visible (`VEngineVGui001`), not `IsPaused`. Clear our pause latch on LevelInit. |
+
+Log tags: `Menu panel pose latched (level yaw`, `GameUI dismissed (engine hide)`.
+
+Do not claim HMD success.
+
+## Pass 2026-09-04 full water was the FPS regression (user-verified)
+
+Same spot: GitHub **47 FPS**, local with full water **32 FPS**. Cheap-water revert (`waterrefl0`) restored GitHub fps. Hands and VR menu were not the cause.
+
+Do **not** retry:
+
+| Attempt | Result | Retry |
+|---|---|---|
+| `r_WaterDrawRefraction/Reflection 1` + `r_waterforcereflectentities 1` + `r_waterforceexpensive 1` + `nr_gbuffer_for_reflection_enabled 1` | Planar water inside each stereo `ViewDrawScene` (~10 ms) | **no** |
+
+Keep all five at 0 (QoL + `VR/bmvr.cfg`). `nr_gbuffer_for_refraction_enabled` stays 0. Do not grow Water/Refract RTs to the eye. Xen/coast stays cheap/fog until a different water path exists.
+
+
+
 
 

@@ -112,20 +112,95 @@ public:
     // Unique bytes: 55 8B EC 83 EC 60 80 7D 14 00 8B 55 08 56 57 8B
     static constexpr int kCTauBeam_ViewMuzzle = 0x234330;
 
-    // client.dll CTauBeam world beam from explicit start/end (FUN_102346A0).
-    // thiscall, 3 stack args (Vector* start, Vector* end, float), ret 0xC.
+    // client.dll CTauBeam impact glow (FUN_102346A0). ProgressBeam calls it as
+    // (trace.endpos, trace.plane.normal, charge), not (beam start, beam end).
     // Unique bytes: 55 8B EC 83 EC 78 8B 45 08 0F 57 C9 56 57 8B 7D
     static constexpr int kCTauBeam_WorldBeam = 0x2346A0;
 
-    // client.dll C_Weapon_RPG laser update (FUN_10291F80). Builds a screen-space
-    // reticle from ScreenWidth/Height, which in VR is the HMD centre. thiscall,
-    // 0 stack args. Unique bytes: 55 8B EC 83 EC 44 A1 60 1D 57 10 33 C5 89 45
-    // FC 8B C1 56 89 45 D0
+    // client.dll CTauBeam fire: AngleVectors(this+0x18) then TraceRay from
+    // this+0xC (FUN_102348B0). thiscall, 0 stack args. Unique bytes:
+    // 53 8B DC 83 EC 08 83 E4 F0 83 C4 04 55 8B 6B 04 89 6C 24 04 8B EC 81 EC EC 00 00 00
+    static constexpr int kCTauBeam_FireTrace = 0x2348B0;
+
+    // client.dll C_Weapon_Gluon impact trace (FUN_1029D430). ShootPosition +
+    // EyeAngles (+0x274), not GetShootAngles, so the glow sits on the HMD look.
+    // thiscall, 2 stack args (player, CGameTrace*), ret 8. Unique bytes:
+    // 53 8B DC 83 EC 08 83 E4 F0 83 C4 04 55 8B 6B 04 89 6C 24 04 8B EC 81 EC D8 00 00 00
+    static constexpr int kCWeaponGluon_ImpactTrace = 0x29D430;
+    // client.dll C_Weapon_Gluon first-person beam update (FUN_1029A7D0).
+    // thiscall, 0 stack args. Calls impact trace then SetControlPoint(0, end)
+    // and C_GluonBeamFx::SetBeam (FUN_1029C960). Unique bytes:
+    // 55 8B EC 81 EC D0 00 00 00 A1 ? ? ? ? 33 C5 89 45 FC 56 57 8B F9
+    static constexpr int kCWeaponGluon_BeamUpdate = 0x29A7D0;
+    // client.dll C_GluonBeamFx::SetBeam (FUN_1029C960). thiscall, 4 stack args
+    // (viewmodel, start, mid, end), ret 0x10. Unique bytes:
+    // 55 8B EC 8B 45 0C 56 8B F1 C6 46 0C 01
+    static constexpr int kCGluonBeamFx_SetBeam = 0x29C960;
+    // client.dll C_GluonBeamFx Draw (FUN_1029B290) on IClientRenderable.
+    // Start at this+0xC, end at this+0x24. thiscall, 1 stack arg, ret 4.
+    // Unique bytes: 53 8B DC 83 EC 08 83 E4 F0 83 C4 04 55 8B 6B 04 89 6C 24 04 8B EC 81 EC 68 05 00 00
+    static constexpr int kCGluonBeamFx_Draw = 0x29B290;
+    // client.dll CNewParticleEffect::SetControlPoint (FUN_101A5170).
+    // thiscall, 2 stack args (index, Vector*), ret 8.
+    // Unique bytes: 55 8B EC 53 8B 5D 0C 57 8B F9 83 BF 54 1B 00 00 FF
+    static constexpr int kParticleSetControlPoint = 0x1A5170;
+    // client.dll CParticleMgr::AddEffect (FUN_1019D940). thiscall, 1 stack arg
+    // (CNewParticleEffect*), ret 4. If def+0x200 (view model effect) is set,
+    // it puts the effect in render group 0xB (viewmodel FOV). Unique bytes:
+    // 55 8B EC 8B 41 4C 53 56 8B 75 08
+    static constexpr int kParticleMgr_AddEffect = 0x19D940;
+    // client.dll CParticleSystemMgr singleton used as this for FUN_10313390.
+    static constexpr int kParticleSystemMgr = 0x5631CC;
+    static constexpr int kParticleSystemMgr_Find = 0x313390;
+    static constexpr int kCParticleDef_ViewModelEffect = 0x200;
+    static constexpr int kCParticleDef_Name = 0x228;
+    static constexpr int kCNewParticleEffect_Def = 0x58;
+    static constexpr int kCNewParticleEffect_ViewModel = 0x1C80;
+    // client.dll g_pClientLeafSystem (IClientLeafSystem*). vtable+0x38 is
+    // SetRenderGroup(handle, group); AddEffect uses group 0xB for viewmodel.
+    static constexpr int kClientLeafSystemPtr = 0x553D10;
+
+    // client.dll C_Weapon_RPG laser update (FUN_10291F80). CHudCrosshair Paint
+    // calls weapon vtable +0x5C4. Draws ISurface circles at ScreenWidth/2,
+    // ScreenHeight/2 (HMD centre in VR). Extra red geometry if m_bLaserOn.
+    // thiscall, 0 stack args.
     static constexpr int kCWeaponRpg_UpdateLaser = 0x291F80;
-    // RecvTable DT_Weapon_RPG: EHANDLE at +0xAE0 (ctor writes -1), m_bLaserOn
-    // RecvProp push 0xAE5 next to the "m_bLaserOn" string at FUN_10291DB0.
-    static constexpr int kCWeaponRpg_hLaserDot = 0xAE0;
+    // RecvTable DT_Weapon_RPG (FUN_10291d30): m_hHomingGrenade +0xAE0,
+    // m_bNeedReload +0xAE4, m_bLaserOn +0xAE5. There is no m_hLaserDot netvar;
+    // the visible mark is a separate CEnvLaserDot sprite (CSprite::DrawModel
+    // FUN_101dbf70) whose origin is the look-trace, so it also sits at centre.
+    static constexpr int kCWeaponRpg_hHomingGrenade = 0xAE0;
+    static constexpr int kCWeaponRpg_hLaserDot = 0xAE0; // stale name; do not resolve as the dot
     static constexpr int kCWeaponRpg_bLaserOn = 0xAE5;
+    // client.dll CHudCrosshair::Paint (FUN_10278460). Calls weapon vtable +0x5C4.
+    // thiscall, 0 stack args. Unique bytes: 55 8B EC 51 53 56 8B 35 ? ? ? ? 8B D9
+    static constexpr int kCHudCrosshair_Paint = 0x278460;
+    // DT_BaseEntity m_fEffects (FUN_100a4cb0). EF_NODRAW = 0x20.
+    static constexpr int kCBaseEntity_fEffects = 0x80;
+    static constexpr int kEF_NODRAW = 0x20;
+    // client.dll C_SpriteRenderer::DrawSprite (FUN_100f6900). thiscall,
+    // 15 stack args, ret 0x3C. ecx is the renderer at CSprite+0x69C.
+    // Copies origin from arg3; CEnvLaserDot's origin is the look-trace.
+    static constexpr int kCSpriteRenderer_DrawSprite = 0xF6900;
+    // client.dll FUN_102dcbf0. stdcall 8 args, ret 0x20. Alternate sprite
+    // draw: origin from IClientRenderable vtable+4, then FUN_100f6b40.
+    // Unique bytes: 55 8B EC 83 EC 64 53 8B 5D 08 8B CB 56 8B 03 FF 50 04
+    static constexpr int kCSpriteRenderable_Draw = 0x2DCBF0;
+    // client.dll C_EnvLaserDot DrawModel override (FUN_10221fd0). thiscall,
+    // 1 stack arg (studio flags), ret 4. Traces from attachment "laser" or
+    // owner EyePosition/EyeAngles (+0x268/+0x26c), then FUN_100821a0.
+    // Unique bytes: 55 8B EC 83 EC A0 A1 ? ? ? ? 33 C5 89 45 FC F7 45 08 00 00 00 4E
+    static constexpr int kCEnvLaserDot_Draw = 0x221FD0;
+    // client.dll camera-facing sprite quad (FUN_100821a0). cdecl, origin* +
+    // width/height/color. Unique bytes: 53 8B DC 83 EC 08 83 E4 F0 83 C4 04 55 8B 6B 04
+    static constexpr int kSpriteQuad = 0x821A0;
+    // client.dll CViewRenderBeams::DrawBeam (FUN_101f5be0). thiscall, Beam_t*
+    // on the stack, ret 4. Unique bytes: 55 8B EC 83 EC 2C A1 ? ? ? ? 33 C5 89 45 FC 89 4D E8
+    static constexpr int kCViewRenderBeams_DrawBeam = 0x1F5BE0;
+    static constexpr int kBeam_t_type = 0x30;
+    static constexpr int kBeam_t_start = 0x3C;
+    static constexpr int kBeam_t_delta = 0xB4;
+    static constexpr int kBeam_t_r = 0xE0;
 
     // IClientMode slot 32. Reads viewmodel_fov_override then weapon GetViewModelFOV
     // (~54). That is why console fov does not change gun/near scale in VR.
@@ -203,12 +278,21 @@ public:
     // Slot 31 (+0x7C) is NOT GetBackBufferFormat on BM (returns a pointer).
     Offset GetBackBufferDimensions{ "materialsystem.dll", 0x52d20,
         "55 8B EC 8B 0D ? ? ? ? 8B 01 8B 80 58 04 00 00 5D FF E0" };
+    // IVEngineClient slot 1 = GetLightForPoint (Vector by value, bClamp).
+    // Same early-vtable layout as Source SDK 2013; slot 5/7 already match BM.
+    static constexpr int kIEngineClient_GetLightForPoint = 1;
     // IVEngineClient slot 5. Goes through videomode, not the D3D backbuffer.
     // After load, Source Reset(2560) while we keep a 1576 swapchain left this
     // at 2560 and HUD downsample (client FUN_10267420) used CViewSetup
     // width/height against _rt_Hud created from GetBackBufferDimensions.
     Offset GetScreenSize{ "engine.dll", 0xA6BD0,
         "55 8B EC 8B 0D ? ? ? ? 56 8B 01 FF 90 9C 01 00 00" };
+    // IVEngineClient slot 96 (+0x180). client.dll DrawViewModels (FUN_1020a8f0)
+    // copies CViewSetup, then overwrites m_flAspectRatio with this (window
+    // 16:9) before Push3DView. GetScreenSize is a different function and is
+    // not on this path — the primary return is a videomode/config float.
+    Offset GetScreenAspectRatio{ "engine.dll", 0x1012D0,
+        "55 8B EC 8B 0D ? ? ? ? 83 EC 0C 81 F9 ? ? ? ? 75 16 F3 0F 10 0D" };
 
     Offset ProcessUsercmds{ "server.dll", 0x5320F0,
         "55 8B EC B8 ? ? ? ? E8 ? ? ? ? A1 ? ? ? ? 33 C5 89 45 FC 8B 45 0C 8B 55 08", 0, true };

@@ -141,6 +141,38 @@ namespace
         delta.y = ny;
     }
 
+    // OpenXR Y-up yaw only. Drops headset pitch/roll so a tilted head cannot
+    // latch a crooked 2D GameUI panel.
+    void LevelOpenXrPoseToYaw(L4D2VROpenXrPoseDesc& pose)
+    {
+        float x = pose.orientation[0];
+        float y = pose.orientation[1];
+        float z = pose.orientation[2];
+        float w = pose.orientation[3];
+        const float lenSq = x * x + y * y + z * z + w * w;
+        if (lenSq > 0.000001f)
+        {
+            const float invLen = 1.f / sqrtf(lenSq);
+            x *= invLen;
+            y *= invLen;
+            z *= invLen;
+            w *= invLen;
+        }
+        else
+        {
+            x = 0.f;
+            y = 0.f;
+            z = 0.f;
+            w = 1.f;
+        }
+        const float yaw = atan2f(2.f * (w * y + x * z), 1.f - 2.f * (y * y + z * z));
+        const float half = yaw * 0.5f;
+        pose.orientation[0] = 0.f;
+        pose.orientation[1] = sinf(half);
+        pose.orientation[2] = 0.f;
+        pose.orientation[3] = cosf(half);
+    }
+
     Vector HmdMatrixToSourcePos(const vr::HmdMatrix34_t& mat, float scale)
     {
         Vector pos;
@@ -959,6 +991,22 @@ namespace
         return paused;
     }
 
+    bool SehIsGameUIVisible(void* engineVgui)
+    {
+        if (!engineVgui)
+            return false;
+        bool vis = false;
+        __try
+        {
+            vis = static_cast<IEngineVGui*>(engineVgui)->IsGameUIVisible();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            vis = false;
+        }
+        return vis;
+    }
+
     HWND FindGameHwnd()
     {
         HWND hwnd = FindWindowA("Valve001", nullptr);
@@ -967,20 +1015,65 @@ namespace
         return hwnd;
     }
 
-    bool GameWindowIsForeground()
+    void QueueKeyToHwnd(HWND hwnd, int vk)
     {
-        HWND hwnd = FindGameHwnd();
         if (!hwnd)
-            return false;
-        return GetForegroundWindow() == hwnd;
+            return;
+        PostMessageA(hwnd, WM_KEYDOWN, static_cast<WPARAM>(vk), 1);
+        PostMessageA(hwnd, WM_KEYUP, static_cast<WPARAM>(vk),
+            static_cast<LPARAM>(1u | (1u << 30) | (1u << 31)));
     }
 
-    void SehSetCursorPos(IInput* input, int x, int y)
+    bool CopySurfaceLetterboxed(IDirect3DDevice9* device, IDirect3DSurface9* src, IDirect3DSurface9* dst, float scale)
     {
-        if (!input)
-            return;
-        __try { input->SetCursorPos(x, y); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (!device || !src || !dst)
+            return false;
+        D3DSURFACE_DESC sd{};
+        D3DSURFACE_DESC dd{};
+        if (FAILED(src->GetDesc(&sd)) || FAILED(dst->GetDesc(&dd)))
+            return false;
+        if (sd.Width < 64 || sd.Height < 64 || dd.Width < 64 || dd.Height < 64)
+            return false;
+        device->ColorFill(dst, nullptr, D3DCOLOR_ARGB(255, 0, 0, 0));
+        const float srcA = static_cast<float>(sd.Width) / static_cast<float>(sd.Height);
+        const float dstA = static_cast<float>(dd.Width) / static_cast<float>(dd.Height);
+        LONG dw = static_cast<LONG>(dd.Width);
+        LONG dh = static_cast<LONG>(dd.Height);
+        LONG dx = 0;
+        LONG dy = 0;
+        if (srcA > dstA + 0.01f)
+        {
+            dh = static_cast<LONG>(static_cast<float>(dd.Width) / srcA + 0.5f);
+            if (dh < 2)
+                dh = 2;
+            dy = (static_cast<LONG>(dd.Height) - dh) / 2;
+        }
+        else if (dstA > srcA + 0.01f)
+        {
+            dw = static_cast<LONG>(static_cast<float>(dd.Height) * srcA + 0.5f);
+            if (dw < 2)
+                dw = 2;
+            dx = (static_cast<LONG>(dd.Width) - dw) / 2;
+        }
+        if (!(scale > 0.2f && scale <= 1.f))
+            scale = 0.70f;
+        if (scale < 0.999f)
+        {
+            const LONG ndw = (std::max)(2L, static_cast<LONG>(static_cast<float>(dw) * scale + 0.5f));
+            const LONG ndh = (std::max)(2L, static_cast<LONG>(static_cast<float>(dh) * scale + 0.5f));
+            dx += (dw - ndw) / 2;
+            dy += (dh - ndh) / 2;
+            dw = ndw;
+            dh = ndh;
+        }
+        RECT dest{ dx, dy, dx + dw, dy + dh };
+        const HRESULT hr = device->StretchRect(src, nullptr, dst, &dest, D3DTEXF_LINEAR);
+        if (SUCCEEDED(hr))
+            return true;
+        Game::logMsg("Letterbox StretchRect failed hr=0x%08X src=%ux%u dst=%ux%u dest=%d,%d %dx%d — squash fallback",
+            (unsigned)hr, sd.Width, sd.Height, dd.Width, dd.Height,
+            (int)dx, (int)dy, (int)dw, (int)dh);
+        return SUCCEEDED(device->StretchRect(src, nullptr, dst, nullptr, D3DTEXF_LINEAR));
     }
 }
 
@@ -1078,7 +1171,12 @@ void VR::OnLevelInit(const char* newmap)
     m_HmdOriginLatched = false;
     m_PassThroughMainViews = 0;
     m_AutoMatQueueModeLastRequested = -999;
+    m_GameUiVisible = false;
+    m_GameUiActivateMs = 0;
+    m_MenuPanelPoseValid = false;
     Game::logMsg("LevelInit map=%s eligible=%d", m_CurrentMapName.c_str(), m_GameplayEligible ? 1 : 0);
+    if (m_GameplayEligible)
+        bmvr::EndRisky(L"menu_vr");
     ApplyRenderTargetFramebufferOverride();
 }
 
@@ -1093,8 +1191,13 @@ bool VR::ShouldCompositorSubmit() const
         // so G-buffers and GetScreenSize match (see hooks.cpp).
         return m_Game && m_Game->m_EngineClient && m_Game->m_EngineClient->IsInGame();
     }
-    // background01 / menu. Pre-LevelInit StretchRect crashed; require a map name.
-    return bmvr::TryMenuCompositor() && !m_CurrentMapName.empty();
+    // -oldgameui never loads background01. GetLevelNameShort stays empty for
+    // the whole main menu (2026-09-03: ~11k Presents, map=, createdRT=0).
+    // Requiring a map name left the HMD black until a real LevelInit.
+    // Skip-file / crash-sticky on menu_vr also left menuVR=0, createdRT=0,
+    // helper submitted=0 (black HMD, desktop cursor still worked). Always
+    // capture+Submit GameUI while VR is up. Capture no-ops if the BB is tiny.
+    return true;
 }
 
 void VR::OnLevelShutdown()
@@ -1117,6 +1220,9 @@ void VR::OnLevelShutdown()
     m_FirstAttackSpikeLogs = 0;
     m_CompositorHandoffSlowCount = 0;
     m_EmptyHands = false;
+    m_GameUiVisible = false;
+    m_GameUiActivateMs = 0;
+    m_MenuPanelPoseValid = false;
     Game::logMsg("LevelShutdown");
 }
 
@@ -1422,6 +1528,11 @@ void VR::BindOpenXrActionHandles()
     m_ActionScoreboard = handle(L4D2VROpenXrActionId::Scoreboard);
     m_ActionPause = handle(L4D2VROpenXrActionId::Pause);
     m_ActionMenuSelect = handle(L4D2VROpenXrActionId::MenuSelect);
+    m_ActionMenuBack = handle(L4D2VROpenXrActionId::MenuBack);
+    m_ActionMenuUp = handle(L4D2VROpenXrActionId::MenuUp);
+    m_ActionMenuDown = handle(L4D2VROpenXrActionId::MenuDown);
+    m_ActionMenuLeft = handle(L4D2VROpenXrActionId::MenuLeft);
+    m_ActionMenuRight = handle(L4D2VROpenXrActionId::MenuRight);
     m_ActionWeaponMenu = handle(L4D2VROpenXrActionId::InventoryQuickSwitch);
     m_ActionInventoryQuickSwitch = handle(L4D2VROpenXrActionId::InventoryQuickSwitch);
     // Helper has no Sprint action id. CustomAction1 is left-stick click (G2 sprint).
@@ -2001,6 +2112,13 @@ void VR::PublishOpenXrResolvedEyeTextures(uint32_t frameId)
     };
     useImageAspect(publishLeft);
     useImageAspect(publishRight);
+    // 2D GameUI is a letterboxed blit, not a 90° world frustum. A non-zero
+    // renderFovXDeg made the helper use "game-when-full-bounds" FOV on WMR.
+    if (Want2dMenuPanel())
+    {
+        publishLeft.renderFovXDeg = 0.f;
+        publishRight.renderFovXDeg = 0.f;
+    }
     // Hands/HUD/wheel are in-eye overlays; helper contain-blits the full RT.
     publishLeft.uMin = 0.0f;
     publishLeft.vMin = 0.0f;
@@ -2286,6 +2404,11 @@ void VR::SetActionManifest()
     grab("/actions/main/in/Pause", &m_ActionPause);
     grab("/actions/main/in/Sprint", &m_ActionSprint);
     grab("/actions/main/in/MenuSelect", &m_ActionMenuSelect);
+    grab("/actions/main/in/MenuBack", &m_ActionMenuBack);
+    grab("/actions/main/in/MenuUp", &m_ActionMenuUp);
+    grab("/actions/main/in/MenuDown", &m_ActionMenuDown);
+    grab("/actions/main/in/MenuLeft", &m_ActionMenuLeft);
+    grab("/actions/main/in/MenuRight", &m_ActionMenuRight);
     grab("/actions/main/in/WeaponMenu", &m_ActionWeaponMenu);
     grab("/actions/main/in/InventoryQuickSwitch", &m_ActionInventoryQuickSwitch);
     grab("/actions/base/in/skeleton_lefthand", &m_ActionSkeletonLeft);
@@ -2438,6 +2561,10 @@ void VR::ProcessInput()
             m_Game->m_AnalogForward = 0.f;
             m_Game->m_AnalogSide = 0.f;
         }
+        // GameUI / -oldgameui (no background map). Look and walk stay off.
+        // Point+click / stick the captured menu in the HMD.
+        ApplyMenuNavigation();
+        ApplyMenuCursor();
         return;
     }
 
@@ -2474,7 +2601,8 @@ void VR::ProcessInput()
     bool usedAnalogTurn = false;
     float turnY = 0.f;
     bool haveTurnY = false;
-    if (GetAnalogActionData(m_ActionTurn, analog))
+    const bool panel2d = Want2dMenuPanel();
+    if (!panel2d && GetAnalogActionData(m_ActionTurn, analog))
     {
         if (!menuStick)
             ApplyTurnStick(analog.x, deltaMs);
@@ -2487,7 +2615,7 @@ void VR::ProcessInput()
             haveTurnY = true;
         }
     }
-    if (!usedAnalogTurn)
+    if (!panel2d && !usedAnalogTurn)
     {
         if (!menuStick && PressedDigitalAction(m_ActionBooleanTurnLeft))
             ApplyTurnStick(-1.f, deltaMs);
@@ -2496,6 +2624,8 @@ void VR::ProcessInput()
         else
             ApplyTurnStick(0.f, deltaMs);
     }
+    if (panel2d)
+        ApplyTurnStick(0.f, deltaMs);
 
     const bool paused = SehIsPaused(m_Game->m_EngineClient);
     RefreshActiveWeaponModel();
@@ -2538,9 +2668,15 @@ void VR::ProcessInput()
         }
     }
     if (paused)
+    {
         m_AimCrosshairValid = false;
+        m_RpgLaserPointValid = false;
+    }
     else
+    {
         UpdateAimCrosshair();
+        UpdateRpgLaserPoint();
+    }
     if (!paused)
     {
         UpdateWeaponFireHaptics();
@@ -2549,7 +2685,7 @@ void VR::ProcessInput()
     }
 
     uint32_t buttons = 0;
-    if (!paused && !m_GameUiVisible)
+    if (!paused && !PauseUiActive())
     {
         if (!m_WeaponMenuOpen && !m_EmptyHands && PressedDigitalAction(m_ActionPrimaryAttack))
             buttons |= IN_ATTACK;
@@ -2652,8 +2788,11 @@ void VR::ProcessInput()
             paused ? 1 : 0, static_cast<unsigned long long>(m_ActionPause));
         QueueGameUiToggle(paused);
     }
-    if (paused || m_GameUiVisible)
+    if (Want2dMenuPanel())
+    {
+        ApplyMenuNavigation();
         ApplyMenuCursor();
+    }
     else
         m_MenuTriggerWasDown = false;
     // Recenter is a short tap of the same right-stick click that opens the
@@ -2661,6 +2800,7 @@ void VR::ProcessInput()
     if (resetHeld && !s_reset && !menuStick && !m_WeaponMenuOpenedThisHold)
     {
         m_HmdOriginLatched = false;
+        m_MenuPanelPoseValid = false;
         if (bmvr::g_RecenterResetsYaw)
             m_RotationOffsetY.store(0.f, std::memory_order_release);
         Game::logMsg("ResetPosition: cleared HMD origin latch%s",
@@ -2976,11 +3116,69 @@ Vector VR::GetViewAngle() const
 {
     std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
     const QAngle& ang = m_StereoFramePoseActive ? m_StereoFrameAngles : m_HmdAngAbs;
-    float yaw = ang.y + m_RotationOffsetY.load(std::memory_order_acquire);
+    const float offset = m_RotationOffsetY.load(std::memory_order_acquire);
+    float pitch = ang.x;
+    float yaw = ang.y;
+    float roll = ang.z;
+    if (m_ScopeZoomActive && m_ZoomSmoothValid)
+    {
+        pitch = m_ZoomSmoothPitch;
+        yaw = m_ZoomSmoothYaw;
+        roll = m_ZoomSmoothRoll;
+    }
+    yaw += offset;
     yaw -= 360.f * floorf((yaw + 180.f) / 360.f);
     // L4D2VR GetViewAngle keeps HMD roll. Zeroing it here while OpenVR
     // Submit uses the full pose makes a head tilt rotate the world.
-    return Vector(ang.x, yaw, ang.z);
+    return Vector(pitch, yaw, roll);
+}
+
+void VR::UpdateScopeZoomSmooth()
+{
+    QAngle ang{};
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
+        ang = m_StereoFramePoseActive ? m_StereoFrameAngles : m_HmdAngAbs;
+    }
+    const double nowMs = static_cast<double>(GetTickCount64());
+    if (!m_ScopeZoomActive)
+    {
+        m_ZoomSmoothPitch = ang.x;
+        m_ZoomSmoothYaw = ang.y;
+        m_ZoomSmoothRoll = ang.z;
+        m_ZoomSmoothValid = true;
+        m_ZoomSmoothMs = nowMs;
+        return;
+    }
+    float dt = 0.f;
+    if (m_ZoomSmoothMs > 0.0)
+        dt = static_cast<float>((nowMs - m_ZoomSmoothMs) * 0.001);
+    m_ZoomSmoothMs = nowMs;
+    if (!m_ZoomSmoothValid)
+    {
+        m_ZoomSmoothPitch = ang.x;
+        m_ZoomSmoothYaw = ang.y;
+        m_ZoomSmoothRoll = ang.z;
+        m_ZoomSmoothValid = true;
+        return;
+    }
+    float tau = bmvr::g_ScopeZoomSmoothSec;
+    if (!(tau >= 0.02f && tau <= 0.6f))
+        tau = 0.16f;
+    if (dt <= 0.f)
+        dt = 0.001f;
+    if (dt > 0.25f)
+        dt = 0.25f;
+    const float a = 1.f - expf(-dt / tau);
+    auto wrapDelta = [](float from, float to) {
+        float d = to - from;
+        d -= 360.f * floorf((d + 180.f) / 360.f);
+        return d;
+    };
+    m_ZoomSmoothPitch += a * wrapDelta(m_ZoomSmoothPitch, ang.x);
+    m_ZoomSmoothYaw += a * wrapDelta(m_ZoomSmoothYaw, ang.y);
+    m_ZoomSmoothRoll += a * wrapDelta(m_ZoomSmoothRoll, ang.z);
+    m_ZoomSmoothYaw -= 360.f * floorf((m_ZoomSmoothYaw + 180.f) / 360.f);
 }
 
 void VR::GetViewBasis(Vector* forward, Vector* right, Vector* up) const
@@ -3036,18 +3234,34 @@ Vector VR::GetViewOriginRight(const Vector& setupOrigin) const
 
 Vector VR::ControllerTrackingToWorld(const Vector& setupOrigin, const Vector& trackingPos) const
 {
-    // Same world frame as stereo RenderView (GetViewOrigin + controller delta).
-    Vector world = GetViewOrigin(setupOrigin);
+    // Baked viewmodel ox/oy/oz are authored on engine eye + (controller -
+    // recenter), not on GetViewOrigin. GetViewOrigin also adds EyeZ along
+    // look-forward; parenting the gun to that pushed every weapon backward.
     std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
-    if (!m_ControllerPoseValid)
+    const Vector& hmdPos = m_StereoFramePoseActive ? m_StereoFrameHmdPosAbs : m_HmdPosAbs;
+    const float yaw = m_RotationOffsetY.load(std::memory_order_acquire);
+    if (!m_ControllerPoseValid && !m_StereoFramePoseActive)
+        return GetViewOrigin(setupOrigin);
+
+    Vector arm = trackingPos - hmdPos;
+    PivotYaw(arm, yaw);
+    if (!std::isfinite(arm.x) || !std::isfinite(arm.y) || !std::isfinite(arm.z)
+        || VectorLength(arm) > 80.f)
+        return GetViewOrigin(setupOrigin);
+
+    if (m_HmdOriginLatched
+        && (m_OpenXrHelperBridgeActive || m_HmdPosAbsZero.z > 24.f))
+    {
+        Vector world = setupOrigin;
+        Vector delta = trackingPos - m_HmdPosAbsZero;
+        PivotYaw(delta, yaw);
+        if (!std::isfinite(delta.x) || !std::isfinite(delta.y) || !std::isfinite(delta.z))
+            return GetViewOrigin(setupOrigin);
+        world += delta;
+        world.z += bmvr::g_HeightOffset;
         return world;
-    Vector delta = trackingPos - m_HmdPosAbs;
-    PivotYaw(delta, m_RotationOffsetY.load(std::memory_order_acquire));
-    if (!std::isfinite(delta.x) || !std::isfinite(delta.y) || !std::isfinite(delta.z))
-        return world;
-    if (VectorLength(delta) > 80.f)
-        return world;
-    return world + delta;
+    }
+    return GetViewOrigin(setupOrigin) + arm;
 }
 
 Vector VR::GetRightControllerAbsPos(const Vector& eyePosition) const
@@ -3080,6 +3294,18 @@ bool VR::IsRpgWeaponModel(const char* model)
         m[n] = static_cast<char>(tolower(static_cast<unsigned char>(model[n])));
     m[n] = 0;
     return std::strstr(m, "rpg") != nullptr || std::strstr(m, "rocket") != nullptr;
+}
+
+bool VR::IsGluonWeaponModel(const char* model)
+{
+    if (!model || !model[0])
+        return false;
+    char m[128]{};
+    size_t n = 0;
+    for (; n + 1 < sizeof(m) && model[n]; ++n)
+        m[n] = static_cast<char>(tolower(static_cast<unsigned char>(model[n])));
+    m[n] = 0;
+    return std::strstr(m, "egon") != nullptr || std::strstr(m, "gluon") != nullptr;
 }
 
 void VR::RememberFireAim(const QAngle& aim)
@@ -3273,29 +3499,70 @@ bool VR::TryGetVrShootOrigin(Vector& origin) const
     return true;
 }
 
-bool VR::TryGetVrBeamSegment(Vector& start, Vector& end) const
+bool VR::TryGetVrBeamSegment(Vector& start, Vector& end, Vector* outNormal) const
 {
     // Visual effects that still trace from EyePosition/EyeAngles (TAU beam,
-    // RPG laser) have to be retargeted onto the same ray the gun fires along,
-    // or the glow leaves the eyes and the impact disagrees with the beam.
-    if (!TryGetVrMuzzleWorld(start))
+    // gluon glow, RPG laser) have to be retargeted onto the same ray the gun
+    // fires along, or the glow leaves the eyes and the impact disagrees.
+    // Cache per engine frame so every hook in the same shot gets identical
+    // start/end/normal.
+    const int tick = static_cast<int>(GetTickCount64() & 0x7FFFFFFF);
+    if (m_CachedBeamFrame >= 0 && (tick - m_CachedBeamFrame) >= 0 && (tick - m_CachedBeamFrame) < 3)
+    {
+        start = m_CachedBeamStart;
+        end = m_CachedBeamEnd;
+        if (outNormal)
+            *outNormal = m_CachedBeamNormal;
+        return true;
+    }
+
+    if (!TryGetVrShootOrigin(start) && !TryGetVrMuzzleWorld(start))
         return false;
     Vector dir{};
     QAngle::AngleVectors(GetAimAngles(), &dir, nullptr, nullptr);
     if (VectorNormalize(dir) <= 0.01f)
         return false;
-    constexpr float kMaxRangeHu = 8192.f;
+    // Start a little past the muzzle so the first hit is the world, not the
+    // viewmodel the muzzle sits inside.
+    start = start + dir * 8.f;
+    constexpr float kMaxRangeHu = 16384.f;
     end = start + dir * kMaxRangeHu;
-    if (!m_Game || !m_Game->m_EngineTrace || !m_Game->m_EngineClient)
+    Vector normal(0.f, 0.f, 0.f);
+    if (!m_Game || !m_Game->m_EngineTrace)
+    {
+        m_CachedBeamStart = start;
+        m_CachedBeamEnd = end;
+        m_CachedBeamNormal = normal;
+        m_CachedBeamFrame = tick;
+        if (outNormal)
+            *outNormal = normal;
         return true;
+    }
     C_BaseEntity* player = m_Game->GetLocalPlayerEntity();
-    CTraceFilterSkipSelf filter(player, 0);
+    C_BaseEntity* vm = m_Game->GetViewModelEntity();
+    CTraceFilterSkipTwoEntities filter(player, vm, 0);
     Ray_t ray;
     ray.Init(start, end);
     CGameTrace tr{};
     m_Game->m_EngineTrace->TraceRay(ray, MASK_SHOT, &filter, &tr);
-    if (tr.fraction < 1.f)
+    if (tr.startsolid || tr.fraction <= 0.02f)
+    {
+        start = start + dir * 24.f;
+        end = start + dir * kMaxRangeHu;
+        ray.Init(start, end);
+        m_Game->m_EngineTrace->TraceRay(ray, MASK_SHOT, &filter, &tr);
+    }
+    if (tr.fraction < 1.f && !tr.startsolid)
+    {
         end = tr.endpos;
+        normal = tr.plane.normal;
+    }
+    m_CachedBeamStart = start;
+    m_CachedBeamEnd = end;
+    m_CachedBeamNormal = normal;
+    m_CachedBeamFrame = tick;
+    if (outNormal)
+        *outNormal = normal;
     return true;
 }
 
@@ -3385,14 +3652,100 @@ bool VR::ComputeHudInset(int fbW, int fbH, int& x, int& y, int& w, int& h) const
 
 void VR::QueueEscapeKey()
 {
-    HWND hwnd = FindWindowA("Valve001", nullptr);
-    if (!hwnd)
-        hwnd = FindWindowA(nullptr, "Black Mesa");
+    QueueVirtualKey(VK_ESCAPE);
+    Game::logMsg("Pause queued as WM_ESCAPE (gameui_activate skipped or sticky)");
+}
+
+void VR::QueueVirtualKey(int vk)
+{
+    QueueKeyToHwnd(FindGameHwnd(), vk);
+}
+
+void VR::ApplyMenuNavigation()
+{
+    HWND hwnd = FindGameHwnd();
     if (!hwnd)
         return;
-    PostMessageA(hwnd, WM_KEYDOWN, VK_ESCAPE, 1);
-    PostMessageA(hwnd, WM_KEYUP, VK_ESCAPE, static_cast<LPARAM>(1u | (1u << 30) | (1u << 31)));
-    Game::logMsg("Pause queued as WM_ESCAPE (gameui_activate skipped or sticky)");
+
+    vr::InputAnalogActionData_t analog{};
+    float stickX = 0.f;
+    float stickY = 0.f;
+    if (GetAnalogActionData(m_ActionWalk, analog))
+    {
+        stickX = analog.x;
+        stickY = analog.y;
+    }
+    constexpr float kStick = 0.55f;
+    const bool analogUp = stickY > kStick;
+    const bool analogDown = stickY < -kStick;
+    const bool analogLeft = stickX < -kStick;
+    const bool analogRight = stickX > kStick;
+
+    const DWORD nowMs = GetTickCount();
+    auto dpad = [&](bool down, int vk, bool& held, DWORD& lastMs, const char* name) {
+        if (!down)
+        {
+            held = false;
+            return;
+        }
+        if (!held || nowMs - lastMs >= 250u)
+        {
+            QueueKeyToHwnd(hwnd, vk);
+            lastMs = nowMs;
+            static int s_navLog;
+            if (s_navLog < 12)
+            {
+                Game::logMsg("Menu nav %s vk=0x%X", name, vk);
+                ++s_navLog;
+            }
+        }
+        held = true;
+    };
+
+    static bool s_up, s_down, s_left, s_right, s_ok, s_back;
+    static DWORD s_upMs, s_downMs, s_leftMs, s_rightMs;
+    dpad(analogUp || PressedDigitalAction(m_ActionMenuUp), VK_UP, s_up, s_upMs, "up");
+    dpad(analogDown || PressedDigitalAction(m_ActionMenuDown), VK_DOWN, s_down, s_downMs, "down");
+    dpad(analogLeft || PressedDigitalAction(m_ActionMenuLeft), VK_LEFT, s_left, s_leftMs, "left");
+    dpad(analogRight || PressedDigitalAction(m_ActionMenuRight), VK_RIGHT, s_right, s_rightMs, "right");
+
+    float turnY = 0.f;
+    vr::InputAnalogActionData_t turn{};
+    if (GetAnalogActionData(m_ActionTurn, turn))
+        turnY = turn.y;
+    static DWORD s_wheelMs;
+    if (fabsf(turnY) > 0.35f && nowMs - s_wheelMs >= 70u)
+    {
+        short wheel = (turnY > 0.f) ? WHEEL_DELTA : -WHEEL_DELTA;
+        if (fabsf(turnY) > 0.85f)
+            wheel = static_cast<short>(wheel * 2);
+        const int cx = m_MenuCursorValid ? m_MenuCursorX : 640;
+        const int cy = m_MenuCursorValid ? m_MenuCursorY : 360;
+        PostMessageA(hwnd, WM_MOUSEWHEEL, MAKEWPARAM(0, wheel), MAKELPARAM(cx, cy));
+        s_wheelMs = nowMs;
+        static int s_wheelLog;
+        if (s_wheelLog < 8)
+        {
+            Game::logMsg("Menu wheel stickY=%.2f delta=%d", turnY, (int)wheel);
+            ++s_wheelLog;
+        }
+    }
+
+    const bool select = PressedDigitalAction(m_ActionMenuSelect);
+    if (select && !s_ok)
+    {
+        QueueKeyToHwnd(hwnd, VK_RETURN);
+        Game::logMsg("Menu confirm A/MenuSelect");
+    }
+    s_ok = select;
+
+    const bool back = PressedDigitalAction(m_ActionMenuBack) || PressedDigitalAction(m_ActionPause);
+    if (back && !s_back)
+    {
+        QueueKeyToHwnd(hwnd, VK_ESCAPE);
+        Game::logMsg("Menu back B/Pause");
+    }
+    s_back = back;
 }
 
 void VR::QueueGameUiToggle(bool currentlyPaused)
@@ -3425,36 +3778,123 @@ void VR::FlushPendingGameUi()
         Game::logMsg("Pause ClientCmd(%s) slot 7 fallback ok=%d", cmd, ok ? 1 : 0);
     }
     if (ok)
+    {
         m_GameUiVisible = (op == 1);
+        if (op == 1)
+            m_GameUiActivateMs = GetTickCount();
+    }
+}
+
+void VR::NoteEngineVGui(void* engineVgui)
+{
+    if (engineVgui)
+        m_EngineVGuiFromPaint = engineVgui;
+}
+
+bool VR::EngineGameUiVisible() const
+{
+    void* p = nullptr;
+    if (m_Game && m_Game->m_EngineVGui)
+        p = m_Game->m_EngineVGui;
+    if (!p)
+        p = m_EngineVGuiFromPaint;
+    return SehIsGameUIVisible(p);
+}
+
+void VR::SyncGameUiFromEngine()
+{
+    if (!m_GameplayEligible)
+        return;
+    void* p = nullptr;
+    if (m_Game && m_Game->m_EngineVGui)
+        p = m_Game->m_EngineVGui;
+    if (!p)
+        p = m_EngineVGuiFromPaint;
+    if (!p)
+        return;
+    const bool vis = SehIsGameUIVisible(p);
+    if (vis)
+    {
+        if (!m_GameUiVisible)
+            Game::logMsg("GameUI visible (engine IsGameUIVisible)");
+        m_GameUiVisible = true;
+        return;
+    }
+    if (!m_GameUiVisible)
+        return;
+    const DWORD now = GetTickCount();
+    if (m_GameUiActivateMs != 0 && now - m_GameUiActivateMs < 750u)
+        return;
+    m_GameUiVisible = false;
+    m_GameUiActivateMs = 0;
+    Game::logMsg("GameUI dismissed (engine hide); leaving 2D panel");
 }
 
 bool VR::PauseUiActive() const
 {
     if (m_GameUiVisible)
         return true;
-    return m_Game && SehIsPaused(m_Game->m_EngineClient);
+    return EngineGameUiVisible();
+}
+
+bool VR::Want2dMenuPanel() const
+{
+    if (!m_IsVREnabled)
+        return false;
+    if (!m_GameplayEligible)
+        return true;
+    return PauseUiActive();
+}
+
+void VR::LatchMenuPanelIfNeeded()
+{
+    if (!Want2dMenuPanel())
+    {
+        if (m_MenuPanelPoseValid)
+        {
+            m_MenuPanelPoseValid = false;
+            Game::logMsg("Menu panel pose unlocked (back to live HMD)");
+        }
+        return;
+    }
+    if (m_MenuPanelPoseValid)
+        return;
+    if (!m_OpenXrLastHmdPose.valid || !m_HmdPoseValid)
+        return;
+    m_MenuPanelPose = m_OpenXrLastHmdPose;
+    m_MenuPanelPose.reserved0 = 0;
+    m_MenuPanelPose.reserved1 |= L4D2VR_OPENXR_POSE_FLAG_MONO;
+    LevelOpenXrPoseToYaw(m_MenuPanelPose);
+    const Vector va = GetViewAngle();
+    QAngle::AngleVectors(QAngle(0.f, va.y, 0.f), &m_MenuPanelFwd, &m_MenuPanelRight, &m_MenuPanelUp);
+    m_MenuPanelPoseValid = true;
+    Game::logMsg("Menu panel pose latched (level yaw, scale=%.2f)", bmvr::g_MenuPanelScale);
 }
 
 void VR::ApplyMenuCursor()
 {
-    if (!m_Game || !m_ControllerPoseValid || !m_HmdPoseValid)
+    if (!m_Game || !m_HmdPoseValid)
         return;
-    if (!GameWindowIsForeground())
-    {
-        static int s_unfocused;
-        if (s_unfocused < 4)
-        {
-            Game::logMsg("VR cursor inject skipped (bms.exe not foreground)");
-            ++s_unfocused;
-        }
+    const bool menuMap = !m_GameplayEligible;
+    const bool pauseUi = PauseUiActive();
+    if (!menuMap && !pauseUi && !m_GameUiVisible)
         return;
-    }
 
-    int vx = 0;
-    int vy = 0;
-    int hudW = 0;
-    int hudH = 0;
-    bool haveOverlayHit = false;
+    int hudW = static_cast<int>(m_FrameCopyWidth ? m_FrameCopyWidth : KnownWindowWidth());
+    int hudH = static_cast<int>(m_FrameCopyHeight ? m_FrameCopyHeight : KnownWindowHeight());
+    if (hudW < 320)
+        hudW = 1280;
+    if (hudH < 180)
+        hudH = 720;
+
+    float panelScale = bmvr::g_MenuPanelScale;
+    if (!(panelScale > 0.2f && panelScale <= 1.f))
+        panelScale = 0.70f;
+
+    bool haveHit = false;
+    float rawX = 0.f;
+    float rawY = 0.f;
+
     if (m_HudOverlayReady && m_Overlay && m_HUDTopHandle != vr::k_ulOverlayHandleInvalid
         && m_Compositor && m_RightControllerTrackingValid)
     {
@@ -3474,8 +3914,8 @@ void VR::ApplyMenuCursor()
         if (m_Overlay->ComputeOverlayIntersection(m_HUDTopHandle, &params, &results)
             == vr::VROverlayError_None)
         {
-            hudW = m_HUDTexture ? m_HUDTexture->GetActualWidth() : static_cast<int>(KnownWindowWidth());
-            hudH = m_HUDTexture ? m_HUDTexture->GetActualHeight() : static_cast<int>(KnownWindowHeight());
+            hudW = m_HUDTexture ? m_HUDTexture->GetActualWidth() : hudW;
+            hudH = m_HUDTexture ? m_HUDTexture->GetActualHeight() : hudH;
             if (hudW < 320)
                 hudW = 1280;
             if (hudH < 180)
@@ -3486,52 +3926,221 @@ void VR::ApplyMenuCursor()
             if (u > 1.f) u = 1.f;
             if (v < 0.f) v = 0.f;
             if (v > 1.f) v = 1.f;
-            vx = static_cast<int>(u * static_cast<float>(hudW));
-            vy = static_cast<int>(v * static_cast<float>(hudH));
-            haveOverlayHit = true;
+            rawX = u * static_cast<float>(hudW);
+            rawY = v * static_cast<float>(hudH);
+            haveHit = true;
+        }
+    }
+
+    // Map the right-controller aim onto the (possibly room-fixed) 2D panel.
+    if (!haveHit && m_ControllerPoseValid && m_Fov > 10.f && m_Aspect > 0.2f)
+    {
+        Vector fwd, right, up;
+        if (m_MenuPanelPoseValid)
+        {
+            fwd = m_MenuPanelFwd;
+            right = m_MenuPanelRight;
+            up = m_MenuPanelUp;
         }
         else
+            GetViewBasis(&fwd, &right, &up);
+        Vector aim{};
         {
-            static int s_miss;
-            if (s_miss < 4)
+            std::lock_guard<std::recursive_mutex> lock(m_ControllerMutex);
+            QAngle::AngleVectors(m_PhysicalRightAngAbs, &aim, nullptr, nullptr);
+        }
+        if (VectorNormalize(aim) > 0.01f)
+        {
+            const float z = aim.Dot(fwd);
+            if (z > 0.12f)
             {
-                Game::logMsg("VR overlay intersection missed; not injecting 0,0 cursor");
-                ++s_miss;
+                const float tanHalfX = tanf(m_Fov * 0.5f * 3.14159265f / 180.f);
+                const float tanHalfY = (m_Aspect > 0.2f) ? (tanHalfX / m_Aspect) : tanHalfX;
+                const float nx = (aim.Dot(right) / z) / tanHalfX;
+                const float ny = (aim.Dot(up) / z) / tanHalfY;
+                if (fabsf(nx) <= panelScale * 1.04f && fabsf(ny) <= panelScale * 1.04f)
+                {
+                    rawX = (nx / panelScale * 0.5f + 0.5f) * static_cast<float>(hudW);
+                    rawY = (-ny / panelScale * 0.5f + 0.5f) * static_cast<float>(hudH);
+                    if (rawX < 0.f) rawX = 0.f;
+                    if (rawY < 0.f) rawY = 0.f;
+                    if (rawX > static_cast<float>(hudW - 1)) rawX = static_cast<float>(hudW - 1);
+                    if (rawY > static_cast<float>(hudH - 1)) rawY = static_cast<float>(hudH - 1);
+                    haveHit = true;
+                }
             }
         }
     }
 
-    if (!haveOverlayHit)
-        return;
-    if (!m_GameUiVisible)
+    const double nowMs = []() {
+        static double s_toMs = 0.0;
+        if (s_toMs == 0.0)
+        {
+            LARGE_INTEGER f{};
+            QueryPerformanceFrequency(&f);
+            s_toMs = f.QuadPart ? 1000.0 / static_cast<double>(f.QuadPart) : 0.0;
+        }
+        LARGE_INTEGER t{};
+        QueryPerformanceCounter(&t);
+        return static_cast<double>(t.QuadPart) * s_toMs;
+    }();
+    float dt = 0.016f;
+    if (m_MenuCursorSmoothMs > 0.0)
+        dt = static_cast<float>((nowMs - m_MenuCursorSmoothMs) * 0.001);
+    if (dt < 0.001f)
+        dt = 0.001f;
+    if (dt > 0.08f)
+        dt = 0.08f;
+    m_MenuCursorSmoothMs = nowMs;
+
+    if (haveHit)
     {
-        // Gameplay HUD overlay is not a mouse target. Never inject.
-        return;
+        if (!m_MenuCursorSmoothValid)
+        {
+            m_MenuCursorSmoothX = rawX;
+            m_MenuCursorSmoothY = rawY;
+            m_MenuCursorSmoothValid = true;
+        }
+        else
+        {
+            const float dx = rawX - m_MenuCursorSmoothX;
+            const float dy = rawY - m_MenuCursorSmoothY;
+            const float speed = sqrtf(dx * dx + dy * dy) / dt;
+            float tau = bmvr::g_MenuCursorSmoothSec;
+            if (!(tau >= 0.02f && tau <= 0.6f))
+                tau = 0.18f;
+            // Fast flicks cut lag; small tremor stays filtered.
+            tau /= (1.f + speed / 2800.f);
+            if (tau < 0.04f)
+                tau = 0.04f;
+            const float a = 1.f - expf(-dt / tau);
+            m_MenuCursorSmoothX += a * dx;
+            m_MenuCursorSmoothY += a * dy;
+        }
+        m_MenuCursorValid = true;
     }
 
-    if (m_Game->m_VguiInput)
-        SehSetCursorPos(m_Game->m_VguiInput, vx, vy);
+    if (!m_MenuCursorValid)
+        return;
 
+    int wx = static_cast<int>(m_MenuCursorSmoothX + 0.5f);
+    int wy = static_cast<int>(m_MenuCursorSmoothY + 0.5f);
+    if (wx < 0) wx = 0;
+    if (wy < 0) wy = 0;
+    if (wx >= hudW) wx = hudW - 1;
+    if (wy >= hudH) wy = hudH - 1;
+    m_MenuCursorX = wx;
+    m_MenuCursorY = wy;
+
+    // ProcessInput runs on the DXVK Present thread. VGUI IInput
+    // (SetCursorPos / InternalCursorMoved / InternalMousePressed) is not
+    // safe there: 2026-09-03 died on the first controller-tracking Update
+    // after Menu compositor (~700 Presents, last line controller poses L=1).
+    // HWND messages are processed on the game thread. Do not call IInput here.
     HWND hwnd = FindGameHwnd();
-    const int wx = vx;
-    const int wy = vy;
-    if (hwnd)
-        PostMessageA(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(wx, wy));
-
-    const bool click = PressedDigitalAction(m_ActionPrimaryAttack)
-        || PressedDigitalAction(m_ActionMenuSelect);
-    if (click && !m_MenuTriggerWasDown && hwnd)
+    if (hwnd && haveHit)
     {
-        PostMessageA(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(wx, wy));
-        PostMessageA(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(wx, wy));
+        static DWORD s_lastMoveMs;
+        const DWORD nowTick = GetTickCount();
+        if (s_lastMoveMs == 0 || nowTick - s_lastMoveMs >= 8)
+        {
+            POINT pt{ wx, wy };
+            ClientToScreen(hwnd, &pt);
+            SetCursorPos(pt.x, pt.y);
+            PostMessageA(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(wx, wy));
+            s_lastMoveMs = nowTick;
+            static int s_moveLog;
+            if (s_moveLog < 3)
+            {
+                Game::logMsg("Menu cursor HWND %d,%d menuMap=%d pause=%d smooth=%.2f",
+                    wx, wy, menuMap ? 1 : 0, pauseUi ? 1 : 0, bmvr::g_MenuCursorSmoothSec);
+                ++s_moveLog;
+            }
+        }
+    }
+
+    const bool click = PressedDigitalAction(m_ActionPrimaryAttack);
+    if (click && !m_MenuTriggerWasDown)
+    {
+        if (hwnd)
+        {
+            const DWORD nowClick = GetTickCount();
+            const int dx = wx - m_MenuClickX;
+            const int dy = wy - m_MenuClickY;
+            const DWORD dblMs = GetDoubleClickTime();
+            const bool dbl = m_MenuClickMs != 0
+                && (nowClick - m_MenuClickMs) <= (dblMs ? dblMs : 500u)
+                && (dx * dx + dy * dy) <= 36 * 36;
+            if (dbl)
+            {
+                PostMessageA(hwnd, WM_LBUTTONDBLCLK, MK_LBUTTON, MAKELPARAM(wx, wy));
+                PostMessageA(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(wx, wy));
+                m_MenuClickMs = 0;
+                Game::logMsg("VR menu double-click at %d,%d", wx, wy);
+            }
+            else
+            {
+                PostMessageA(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(wx, wy));
+                PostMessageA(hwnd, WM_LBUTTONUP, 0, MAKELPARAM(wx, wy));
+                m_MenuClickMs = nowClick;
+                m_MenuClickX = wx;
+                m_MenuClickY = wy;
+            }
+        }
         static int s_clickLog;
         if (s_clickLog < 8)
         {
-            Game::logMsg("VR menu click at %d,%d overlayHit=1", wx, wy);
+            Game::logMsg("VR menu click at %d,%d menuMap=%d pause=%d",
+                wx, wy, menuMap ? 1 : 0, pauseUi ? 1 : 0);
             ++s_clickLog;
         }
     }
     m_MenuTriggerWasDown = click;
+}
+
+void VR::DrawMenuCursorOnSurface(IDirect3DDevice9* device, IDirect3DSurface9* surf)
+{
+    if (!device || !surf || !m_MenuCursorValid)
+        return;
+    D3DSURFACE_DESC desc{};
+    if (FAILED(surf->GetDesc(&desc)) || desc.Width < 64 || desc.Height < 64)
+        return;
+    const int w = static_cast<int>(desc.Width);
+    const int h = static_cast<int>(desc.Height);
+    const int x = m_MenuCursorX;
+    const int y = m_MenuCursorY;
+    if (x < 0 || y < 0 || x >= w || y >= h)
+        return;
+
+    auto fill = [&](int x0, int y0, int x1, int y1, D3DCOLOR c) {
+        if (x0 < 0) x0 = 0;
+        if (y0 < 0) y0 = 0;
+        if (x1 > w) x1 = w;
+        if (y1 > h) y1 = h;
+        if (x1 <= x0 || y1 <= y0)
+            return;
+        RECT r{ x0, y0, x1, y1 };
+        device->ColorFill(surf, &r, c);
+    };
+
+    // Classic mouse arrow, hotspot at the tip. Sized for 1440p then scaled
+    // down with the panel so it stays readable in the HMD.
+    const int body = (std::max)(22, h / 28);
+    const D3DCOLOR outline = D3DCOLOR_ARGB(255, 0, 0, 0);
+    // HEV orange in Black Mesa; Calhoun blue in Blue Shift.
+    const D3DCOLOR fillCol = bmvr::IsBlueShift()
+        ? D3DCOLOR_ARGB(255, 64, 168, 255)
+        : D3DCOLOR_ARGB(255, 255, 120, 16);
+    for (int row = 0; row < body; ++row)
+    {
+        const int span = (row < body * 3 / 4) ? (row + 1) : (std::max)(3, body - row);
+        fill(x - 2, y + row - 1, x + span + 2, y + row + 2, outline);
+    }
+    for (int row = 0; row < body; ++row)
+    {
+        const int span = (row < body * 3 / 4) ? (row + 1) : (std::max)(3, body - row);
+        fill(x, y + row, x + span, y + row + 1, fillCol);
+    }
 }
 
 void VR::UpdateCrowbarMelee()
@@ -3547,6 +4156,8 @@ void VR::UpdateCrowbarMelee()
 
     QAngle curAng{};
     Vector curPos{};
+    Vector vmFwd{};
+    Vector vmUp{};
     float speedMs = 0.f;
     bool crowbar = false;
     {
@@ -3555,6 +4166,8 @@ void VR::UpdateCrowbarMelee()
             || m_LastViewmodelModel.find("wrench") != std::string::npos;
         curAng = m_PhysicalRightTrackingValid ? m_PhysicalRightAngAbs : m_RightControllerAngAbs;
         curPos = m_PhysicalRightTrackingValid ? m_PhysicalRightPosAbs : m_RightControllerPosAbs;
+        vmFwd = m_ViewmodelForward;
+        vmUp = m_ViewmodelUp;
         speedMs = m_RightControllerSpeedMs;
     }
     if (!crowbar)
@@ -3663,29 +4276,39 @@ void VR::UpdateCrowbarMelee()
         m_MeleeHitEntity = nullptr;
         m_MeleeNextSwingMs = now + kSwingCooldownMs;
         m_MeleeAttackUntilMs = now + kAttackPulseMs;
-        // Grip origin, not motion*N (that lifted upward slashes). Direction is
-        // the swing, preferring the more downward of swing vs where the bar
-        // points, so a smash can hit the floor. Upward pitch is capped so the
-        // hull cannot climb back to the ceiling.
-        Vector blade{};
-        QAngle::AngleVectors(curAng, &blade, nullptr, nullptr);
+        // Strike point is on the visible bar, not the controller grip. The
+        // crowbar sits above the tracking origin (oz) and is pitched along
+        // viewmodel forward (~-24.5 deg). Tracing from the grip along the
+        // swing, then flattening pitch to -12, put sparks below the mesh.
+        Vector blade = vmFwd;
         if (VectorNormalize(blade) <= 0.01f)
-            blade = motion;
-        Vector dir = motion;
-        if (VectorNormalize(dir) <= 0.01f)
-            dir = blade;
-        if (blade.z < dir.z)
-            dir.z = blade.z;
-        if (dir.z > 0.18f)
-            dir.z = 0.18f;
+        {
+            QAngle::AngleVectors(curAng, &blade, nullptr, nullptr);
+            if (VectorNormalize(blade) <= 0.01f)
+                blade = motion;
+        }
+        Vector dir = blade;
+        Vector swing = motion;
+        if (VectorNormalize(swing) <= 0.01f)
+            swing = blade;
+        // Overhead smash: the swing is going into the floor harder than the
+        // bar points, so follow the swing. Do not flatten a normal slash.
+        if (swing.z < -0.35f && swing.z < dir.z)
+            dir.z = swing.z;
         if (VectorNormalize(dir) <= 0.01f)
             dir = Vector(1.f, 0.f, 0.f);
-        m_MeleeTraceOrigin = hand;
+        constexpr float kStrikeAlongHu = 22.f;
+        constexpr float kStrikeUpHu = 8.f;
+        m_MeleeTraceOrigin = hand + blade * kStrikeAlongHu;
+        Vector up = vmUp;
+        if (VectorNormalize(up) > 0.01f)
+            m_MeleeTraceOrigin = m_MeleeTraceOrigin + up * kStrikeUpHu;
         QAngle::VectorAngles(dir, m_MeleeBladeAngles);
         if (m_MeleeBladeAngles.x > 180.f) m_MeleeBladeAngles.x -= 360.f;
         if (m_MeleeBladeAngles.x < -180.f) m_MeleeBladeAngles.x += 360.f;
-        // Source: +pitch looks down. Allow a full smash; keep a little up.
-        if (m_MeleeBladeAngles.x < -12.f) m_MeleeBladeAngles.x = -12.f;
+        // Source: +pitch looks down. Allow the viewmodel crowbar pitch; only
+        // clamp wild flicks so a slash cannot become a ceiling ray.
+        if (m_MeleeBladeAngles.x < -35.f) m_MeleeBladeAngles.x = -35.f;
         if (m_MeleeBladeAngles.x > 89.f) m_MeleeBladeAngles.x = 89.f;
         m_MeleeBladeAngles.z = 0.f;
         m_MeleeBladeAnglesValid = true;
@@ -3709,8 +4332,8 @@ void VR::UpdateCrowbarMelee()
             QAngle::AngleVectors(m_MeleeBladeAngles, &strike, nullptr, nullptr);
             if (VectorNormalize(strike) <= 0.01f)
                 strike = dir;
-            const Vector hullMins(-16.f, -16.f, -28.f);
-            const Vector hullMaxs(16.f, 16.f, 12.f);
+            const Vector hullMins(-16.f, -16.f, -16.f);
+            const Vector hullMaxs(16.f, 16.f, 16.f);
             const Vector end = m_MeleeTraceOrigin + strike * range;
             Ray_t ray;
             ray.Init(m_MeleeTraceOrigin, end, hullMins, hullMaxs);
@@ -3747,7 +4370,7 @@ bool VR::TryGetMeleeTraceOrigin(Vector& origin) const
 
 bool VR::TryGetMeleeAim(Vector& origin, QAngle& angles) const
 {
-    // Grip height. Pitch follows the swing (down to the floor, only a little up).
+    // Visible crowbar strike point. Pitch follows the bar (down to the floor).
     if (!m_PerformingMelee || !m_MeleeBladeAnglesValid)
         return false;
     origin = m_MeleeTraceOrigin;
@@ -3801,6 +4424,84 @@ void VR::UpdateAimCrosshair()
     // geometry the glove pass does depth-test against.
     m_AimCrosshairWorld = tr.endpos - dir * 1.5f;
     m_AimCrosshairValid = true;
+}
+
+bool VR::TryGetAimCrosshairWorld(Vector& out) const
+{
+    if (!m_AimCrosshairValid)
+        return false;
+    out = m_AimCrosshairWorld;
+    return true;
+}
+
+void VR::UpdateRpgLaserPoint()
+{
+    if (!m_GameplayEligible || m_EmptyHands || m_WeaponMenuOpen || !m_Game || PauseUiActive())
+    {
+        m_RpgLaserPointValid = false;
+        return;
+    }
+
+    bool on = m_RpgLaserLatched;
+    C_BaseEntity* weap = m_Game->GetActiveWeaponEntity();
+    const char* weapModel = weap ? m_Game->GetEntityModelName(weap) : nullptr;
+    if (weap && IsRpgWeaponModel(weapModel))
+    {
+        unsigned char laserOn = 0;
+        const int onOff = m_Game->RpgLaserOnOffset();
+        __try
+        {
+            laserOn = *reinterpret_cast<unsigned char*>(
+                reinterpret_cast<char*>(weap) + onOff);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            laserOn = 0;
+        }
+        if (laserOn)
+            on = true;
+        m_RpgLaserActive = on;
+    }
+    else if (!m_RpgLaserLatched)
+        m_RpgLaserActive = false;
+    if (!on)
+    {
+        m_RpgLaserPointValid = false;
+        return;
+    }
+
+    Vector start{};
+    Vector end{};
+    if (!TryGetVrBeamSegment(start, end))
+    {
+        m_RpgLaserPointValid = false;
+        return;
+    }
+    Vector dir = end - start;
+    if (VectorNormalize(dir) > 0.01f)
+        end = end - dir * 1.5f;
+    NoteRpgLaserWorld(end);
+}
+
+void VR::NoteRpgLaserWorld(const Vector& world)
+{
+    m_RpgLaserWorld = world;
+    m_RpgLaserPointValid = true;
+}
+
+bool VR::TryGetRpgLaserWorld(Vector& out) const
+{
+    if (m_RpgLaserPointValid)
+    {
+        out = m_RpgLaserWorld;
+        return true;
+    }
+    if (RpgLaserActive() && m_CachedBeamFrame >= 0)
+    {
+        out = m_CachedBeamEnd;
+        return out.LengthSqr() > 1.f;
+    }
+    return false;
 }
 
 // Wrist-HUD styling: amber ticks around an open centre, each backed by a dark
@@ -4258,12 +4959,12 @@ void VR::TryCompositorPostPresentHandoff(DWORD nowMs, DWORD poseAgeMs)
     }
 }
 
-void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
+bool VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye, bool drawOverlays, bool drawGloves)
 {
     if (!eyeSurf || !m_IsVREnabled || !IsGameplayEligible() || !m_HmdPoseValid || !g_D3DVR9)
-        return;
+        return false;
     if (!(m_Fov > 10.f) || !m_HmdOriginLatched)
-        return;
+        return false;
 
     bool leftOk = false;
     bool rightOk = false;
@@ -4295,7 +4996,7 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
         body = m_HasStereoBodyOrigin ? m_StereoBodyOrigin : m_SetupOrigin;
     }
     if (!leftOk && !rightOk)
-        return;
+        return false;
 
     auto toWorld = [&](const Vector& tracking) {
         return ControllerTrackingToWorld(body, tracking);
@@ -4309,7 +5010,7 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
 
     IDirect3DDevice9* device = nullptr;
     if (FAILED(g_D3DVR9->GetD3DDevice(&device)) || !device)
-        return;
+        return false;
 
     if (bmvr::g_VrHandsGlovesEnabled)
         g_VrGloves.WarmupGpu(device);
@@ -4319,17 +5020,20 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
     if (FAILED(eyeSurf->GetDesc(&desc)) || desc.Width < 64 || desc.Height < 64)
     {
         device->Release();
-        return;
+        return false;
     }
     w = desc.Width;
     h = desc.Height;
-    const float aspect = (h > 0) ? (static_cast<float>(w) / static_cast<float>(h)) : m_Aspect;
+    // gbmatch paints an HMD frustum into 16:9 pixels. Use the HMD aspect so
+    // glove projection matches the anamorphic scene that squash-blits to the eye.
+    const float pixelAspect = (h > 0) ? (static_cast<float>(w) / static_cast<float>(h)) : m_Aspect;
+    const float aspect = (bmvr::UseGbMatchViewLock() && m_Aspect > 0.1f) ? m_Aspect : pixelAspect;
     const float projFov = HorizontalFovForAspect(aspect);
     const float tanHalf = tanf(projFov * 0.5f * 3.14159265f / 180.f);
     if (!(tanHalf > 0.01f))
     {
         device->Release();
-        return;
+        return false;
     }
 
     auto project = [&](const Vector& world, float& sx, float& sy) -> bool {
@@ -4361,22 +5065,26 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
         if (oldDepth)
             oldDepth->Release();
         device->Release();
-        return;
+        return false;
     }
 
-    IDirect3DSurface9* gloveDepth = nullptr;
-    if (stereoEye == 1)
-        gloveDepth = m_D9LeftEyeDepthSurface;
-    else if (stereoEye == 2)
-        gloveDepth = m_D9RightEyeDepthSurface;
-    if (gloveDepth)
-    {
+    auto depthMatchesColor = [&](IDirect3DSurface9* depth) -> bool {
+        if (!depth)
+            return false;
         D3DSURFACE_DESC depthDesc{};
-        if (FAILED(gloveDepth->GetDesc(&depthDesc))
-            || depthDesc.MultiSampleType != desc.MultiSampleType
-            || depthDesc.Width != desc.Width || depthDesc.Height != desc.Height)
-            gloveDepth = nullptr;
-    }
+        if (FAILED(depth->GetDesc(&depthDesc)))
+            return false;
+        return depthDesc.MultiSampleType == desc.MultiSampleType
+            && depthDesc.Width == desc.Width && depthDesc.Height == desc.Height;
+    };
+
+    IDirect3DSurface9* gloveDepth = nullptr;
+    if (depthMatchesColor(oldDepth))
+        gloveDepth = oldDepth;
+    else if (stereoEye == 1 && depthMatchesColor(m_D9LeftEyeDepthSurface))
+        gloveDepth = m_D9LeftEyeDepthSurface;
+    else if (stereoEye == 2 && depthMatchesColor(m_D9RightEyeDepthSurface))
+        gloveDepth = m_D9RightEyeDepthSurface;
     if (gloveDepth)
         device->SetDepthStencilSurface(gloveDepth);
     else if (stereoEye != 0)
@@ -4390,11 +5098,9 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
     eyeVp.MinZ = 0.f;
     eyeVp.MaxZ = 1.f;
     device->SetViewport(&eyeVp);
-    if (gloveDepth)
-        device->Clear(0, nullptr, D3DCLEAR_ZBUFFER, 0, 1.f, 0);
 
     bool drewGloves = false;
-    if (bmvr::g_VrHandsGlovesEnabled && (m_HasHevSuit || g_VrGloves.HasBareHands()))
+    if (drawGloves && bmvr::g_VrHandsGlovesEnabled && (m_HasHevSuit || g_VrGloves.HasBareHands()))
     {
         const Vector viewAngles = GetViewAngle();
         drewGloves = g_VrGloves.DrawForEye(
@@ -4414,11 +5120,20 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
             leftAng,
             rightOk,
             toWorld(rightPos),
-            rightAng);
+            rightAng,
+            m_StereoZNear,
+            m_StereoZFar);
+        static int s_gloveDepthLog;
+        if (s_gloveDepthLog < 4)
+        {
+            Game::logMsg("VR gloves scene eye=%d %ux%u depth=%d light+zNear=%.2f zFar=%.0f",
+                stereoEye, w, h, gloveDepth ? 1 : 0, m_StereoZNear, m_StereoZFar);
+            ++s_gloveDepthLog;
+        }
     }
 
-    const bool drawBoxes = bmvr::g_VrHandsDebugBoxes && m_HasHevSuit;
-    if (bmvr::g_VrHandsGlovesEnabled && (m_HasHevSuit || g_VrGloves.HasBareHands()) && !drewGloves)
+    const bool drawBoxes = drawOverlays && bmvr::g_VrHandsDebugBoxes && m_HasHevSuit;
+    if (drawGloves && bmvr::g_VrHandsGlovesEnabled && (m_HasHevSuit || g_VrGloves.HasBareHands()) && !drewGloves)
     {
         static int s_gloveFallbackLog;
         if (s_gloveFallbackLog < 3)
@@ -4446,12 +5161,12 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
         else
             device->SetDepthStencilSurface(nullptr);
     };
-    if (!drawBoxes && !(bmvr::g_HandHud && m_Game && m_HasHevSuit) && !WeaponMenuOpen()
-        && !AimCrosshairVisible())
+    if (!drawOverlays || (!drawBoxes && !(bmvr::g_HandHud && m_Game && m_HasHevSuit) && !WeaponMenuOpen()
+        && !AimCrosshairVisible()))
     {
         restoreTargets();
         device->Release();
-        return;
+        return drewGloves;
     }
 
     device->SetDepthStencilSurface(nullptr);
@@ -4602,6 +5317,7 @@ void VR::DrawIndependentHandMarkers(IDirect3DSurface9* eyeSurf, int stereoEye)
     }
     restoreTargets();
     device->Release();
+    return drewGloves;
 }
 
 namespace
@@ -4832,9 +5548,18 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
     const float smallIconS = iconS * 0.66f;
     const float gap = 7.f * s;
 
-    const D3DCOLOR amber = D3DCOLOR_RGBA(255, 176, 0, 235);
-    const D3DCOLOR amberDim = D3DCOLOR_RGBA(255, 176, 0, 170);
-    const D3DCOLOR amberBack = D3DCOLOR_RGBA(255, 176, 0, 55);
+    // HEV amber in Black Mesa; Calhoun blue in Blue Shift (same RGB as the
+    // pause cursor and weapon wheel). Low-health stays red.
+    const bool blueShift = bmvr::IsBlueShift();
+    const D3DCOLOR theme = blueShift
+        ? D3DCOLOR_RGBA(64, 168, 255, 235)
+        : D3DCOLOR_RGBA(255, 176, 0, 235);
+    const D3DCOLOR themeDim = blueShift
+        ? D3DCOLOR_RGBA(64, 168, 255, 170)
+        : D3DCOLOR_RGBA(255, 176, 0, 170);
+    const D3DCOLOR themeBack = blueShift
+        ? D3DCOLOR_RGBA(64, 168, 255, 55)
+        : D3DCOLOR_RGBA(255, 176, 0, 55);
     const D3DCOLOR red = D3DCOLOR_RGBA(255, 48, 32, 240);
     const D3DCOLOR redBack = D3DCOLOR_RGBA(255, 48, 32, 60);
     // Black Mesa's own HUD warns below 25 (scripts/hudlayout.res warnIfLessThan).
@@ -4858,16 +5583,16 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
         {
             const bool low = health <= kLowHealth;
             drawValueIcon(px, py - glyphH - gap * 0.5f, cell, fieldW, glyphH, iconS,
-                health, low ? red : amber, low ? redBack : amberBack,
+                health, low ? red : theme, low ? redBack : themeBack,
                 bmvr::AcquireHudIcon(device, "hud_health_overlay.vtf"));
             if (armor >= 0 && armor <= 200)
                 drawValueIcon(px, py + gap * 0.5f, cell, fieldW, glyphH, iconS,
-                    armor, amber, amberBack,
+                    armor, theme, themeBack,
                     bmvr::AcquireHudIcon(device, "hud_hev_overlay.vtf"));
         }
     }
 
-    const bool hasAmmoHud = rightOk
+    const bool hasAmmoHud = rightOk && !m_EmptyHands
         && ((clip >= 0 && clip <= 999) || (reserve >= 0 && reserve <= 999)
             || (secondary >= 0 && secondary <= 999));
     if (hasAmmoHud)
@@ -4888,7 +5613,7 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
             const int primary = showClip ? clip : reserve;
             if (primary >= 0 && primary <= 999)
                 drawValueIcon(px, py - glyphH - gap * 0.5f, cell, fieldW, glyphH, iconS,
-                    primary, amber, amberBack, ammoIcon);
+                    primary, theme, themeBack, ammoIcon);
 
             // Reserve and secondary share the lower row at reduced size. Only
             // the big primary counter gets the dim "000" field; these two read
@@ -4906,12 +5631,12 @@ void VR::DrawHandHud(IDirect3DDevice9* device, int stereoEye, UINT w, UINT h,
             if (showRes)
             {
                 drawValueIcon(cursor, y1, smallCell, smallFieldW, smallGlyphH, smallIconS,
-                    reserve, amberDim, 0, ammoIcon);
+                    reserve, themeDim, 0, ammoIcon);
                 cursor += cellW + gap * 2.f;
             }
             if (showSec)
                 drawValueIcon(cursor, y1, smallCell, smallFieldW, smallGlyphH, smallIconS,
-                    secondary, amberDim, 0,
+                    secondary, themeDim, 0,
                     bmvr::AcquireHudIcon(device, bmvr::SecondaryAmmoIconVtf(model, nullptr)));
         }
     }
@@ -4938,6 +5663,44 @@ void VR::DrawIndependentHandsOnDesktop()
     DrawIndependentHandMarkers(bb, 0);
     bb->Release();
     device->Release();
+}
+
+bool VR::DrawVrGlovesIntoBlitSource(int stereoEye)
+{
+    if (!bmvr::g_VrHandsGlovesEnabled || !g_D3DVR9)
+        return false;
+    IDirect3DDevice9* device = nullptr;
+    if (FAILED(g_D3DVR9->GetD3DDevice(&device)) || !device)
+        return false;
+    IDirect3DSurface9* bb = nullptr;
+    if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb)
+    {
+        device->Release();
+        return false;
+    }
+    const bool drew = DrawIndependentHandMarkers(bb, stereoEye, false, true);
+    bb->Release();
+    device->Release();
+    if (drew)
+        m_VrGlovesDrawnIntoScene = true;
+    return drew;
+}
+
+void VR::NoteSceneCubemap(IDirect3DBaseTexture9* texture)
+{
+    if (!texture || m_SceneCubemap == texture)
+        return;
+    IDirect3DBaseTexture9* previous = m_SceneCubemap;
+    m_SceneCubemap = texture;
+    m_SceneCubemap->AddRef();
+    if (previous)
+        previous->Release();
+    static int s_cubeLog;
+    if (s_cubeLog < 4)
+    {
+        Game::logMsg("Latched scene cubemap for VR gloves");
+        ++s_cubeLog;
+    }
 }
 
 void VR::NoteViewmodelModel(const char* modelName)
@@ -5036,15 +5799,15 @@ void VR::ApplyTwoHandShotgunAim()
     const float scale = m_VRScale > 1.f ? m_VRScale : 39.37f;
     const Vector forend = m_RightControllerPosAbs + m_ViewmodelForward * (0.28f * scale);
     const float dist = (m_LeftControllerPosAbs - forend).Length();
-    const float enterR = 0.18f * scale;
-    const float stayR = 0.32f * scale;
+    const float enterR = 0.06f * scale;
+    const float stayR = 0.10f * scale;
     // Distance alone kept two-hand mode latched when the off-hand just dropped
     // to the player's side: the barrel then tracked the lowered hand and the
     // shotgun looked like it was lowering itself. Also require the off-hand to
     // stay ahead of the gun hand along the barrel.
     const float aheadHu = (m_LeftControllerPosAbs - m_RightControllerPosAbs).Dot(m_ViewmodelForward);
-    const float enterAhead = 0.12f * scale;
-    const float stayAhead = 0.06f * scale;
+    const float enterAhead = 0.22f * scale;
+    const float stayAhead = 0.14f * scale;
     const bool was = m_TwoHandShotgunActive;
     if (m_TwoHandShotgunActive)
         m_TwoHandShotgunActive = dist < stayR && aheadHu > stayAhead;
@@ -5062,7 +5825,7 @@ void VR::ApplyTwoHandShotgunAim()
     Vector two = front - m_RightControllerPosAbs;
     if (VectorNormalize(two) <= 0.01f)
         return;
-    const float strength = 0.85f;
+    const float strength = 0.55f;
     Vector blended = m_ViewmodelForward * (1.f - strength) + two * strength;
     if (VectorNormalize(blended) <= 0.01f)
         return;
@@ -5598,13 +6361,11 @@ void VR::ApplyVrQualityOfLifeCvars()
     seti("nr_allow_hammer_nerfs_4ways", 0);
     seti("nr_gbuffer_for_refraction_enabled", 0);
     seti("r_WaterDrawRefraction", 0);
-    // Planar water used the HMD camera inside ViewDrawScene (not a nested
-    // RenderView). Aux GetScreenSize skip was not enough. Cheap water instead
-    // of a view-locked ghost world. BM new-renderer planar glass uses
-    // nr_gbuffer_for_reflection_enabled (client.dll string 0x10454168).
-    // G-buffer refraction samples the color buffer (world-space gun included)
-    // back onto deferred geometry only — skybox and the forward viewmodel stay
-    // clean. That is the transparent warped double on walls at eye-sized RTs.
+    // Cheap water. User-verified 2026-09-04: full water
+    // (reflection + entity reflect + expensive + gbuffer reflection) was the
+    // 47→32 FPS regression vs GitHub. Planar water uses the HMD camera inside
+    // each eye ViewDrawScene, not a nested RenderView. Do not retry. Keep
+    // nr_gbuffer_for_refraction off (wall color-buffer stamps).
     seti("r_WaterDrawReflection", 0);
     seti("r_waterforcereflectentities", 0);
     seti("r_waterforceexpensive", 0);
@@ -5826,6 +6587,38 @@ void VR::NoteEngineScopeFov(float engineFov)
     }
 }
 
+void VR::NoteStereoClipPlanes(float zNear, float zFar)
+{
+    if (zNear > 0.01f && zFar > zNear + 1.f)
+    {
+        m_StereoZNear = zNear;
+        m_StereoZFar = zFar;
+    }
+}
+
+void VR::NoteFlashlightState(const Vector& origin, const Vector& forward)
+{
+    if (!std::isfinite(origin.x) || !std::isfinite(forward.x))
+        return;
+    if (origin.LengthSqr() < 1.f || forward.LengthSqr() < 0.01f)
+        return;
+    m_FlashlightOrigin = origin;
+    m_FlashlightForward = forward;
+    const float len = m_FlashlightForward.Length();
+    if (len > 0.001f)
+        m_FlashlightForward = m_FlashlightForward * (1.f / len);
+    m_FlashlightLive = true;
+}
+
+bool VR::CopyFlashlightState(Vector& origin, Vector& forward) const
+{
+    if (!m_FlashlightLive)
+        return false;
+    origin = m_FlashlightOrigin;
+    forward = m_FlashlightForward;
+    return true;
+}
+
 float VR::WorldRenderFov() const
 {
     if (!m_ScopeZoomActive)
@@ -5853,6 +6646,7 @@ float VR::HorizontalFovForAspect(float targetAspect) const
 
 void VR::BeginStereoFramePose()
 {
+    m_VrGlovesDrawnIntoScene = false;
     if (m_OpenXrHelperBridgeActive)
         ConsumeOpenXrTracking();
     UpdateTracking();
@@ -5868,6 +6662,7 @@ void VR::BeginStereoFramePose()
         m_StereoFrameRightCtrlPos = m_PhysicalRightPosAbs;
     }
     m_StereoFramePoseActive = true;
+    UpdateScopeZoomSmooth();
     if (m_OpenXrHelperBridgeActive)
     {
         m_OpenXrStereoRenderPose = m_OpenXrLastHmdPose;
@@ -6183,6 +6978,11 @@ void VR::ReleaseVRRenderTargetsForDeviceReset()
     ReleaseT(m_D9LeftEyeSubmitSurface);
     ReleaseT(m_D9RightEyeSubmitSurface);
     g_VrGloves.OnDeviceLost();
+    if (m_SceneCubemap)
+    {
+        m_SceneCubemap->Release();
+        m_SceneCubemap = nullptr;
+    }
     ReleaseT(m_D9LeftEyeDepthSurface);
     ReleaseT(m_D9RightEyeDepthSurface);
     ReleaseT(m_D9LeftEyeTexture);
@@ -6317,6 +7117,7 @@ bool VR::EnsureFrameCopySurface(IDirect3DDevice9* device, uint32_t width, uint32
     m_D9FrameColorSurface = surf;
     m_FrameCopyWidth = width;
     m_FrameCopyHeight = height;
+    m_FrameCopyLatched = false;
     Game::logMsg("Frame copy RT ready %ux%u", width, height);
     return true;
 }
@@ -6452,7 +7253,17 @@ bool VR::EnsurePrivateEyeSurfaces(IDirect3DDevice9* device)
     bool rightOk = createEye(Texture_RightEye, &m_D9RightEyeTexture, &m_D9RightEyeSurface, m_VKRightEye);
     const bool depthOk = createDepth(Texture_LeftEye, &m_D9LeftEyeDepthSurface)
         && createDepth(Texture_RightEye, &m_D9RightEyeDepthSurface);
-    EnsureFrameCopySurface(device, w, h);
+    // Capture stays at HWND size. Growing this to the eye wiped the 2560x1440
+    // GameUI copy and left OpenXR publishing an empty 3168 RT (HMD black).
+    UINT copyW = KnownWindowWidth();
+    UINT copyH = KnownWindowHeight();
+    if (copyW < 640 || copyH < 360)
+    {
+        copyW = w;
+        copyH = h;
+    }
+    if (!m_D9FrameColorSurface)
+        EnsureFrameCopySurface(device, copyW, copyH);
 
     bool submitOk = !UseVrMsaa();
     if (UseVrMsaa())
@@ -6986,7 +7797,10 @@ void VR::CreateVRTextures()
     RefreshBackBufferTexture(true);
     EnsurePrivateEyeSurfaces(device);
     device->Release();
-    EnsureHudOverlay();
+    // Menu 2D capture does not need bmvrHUD. CreateNamedRT during the
+    // no-map GameUI was a Pre-LevelInit crash suspect.
+    if (m_GameplayEligible)
+        EnsureHudOverlay();
 }
 
 void VR::BeginStereoEyeBlit(IDirect3DSurface9* dst)
@@ -6994,6 +7808,7 @@ void VR::BeginStereoEyeBlit(IDirect3DSurface9* dst)
     m_StereoEyeBlitDest = dst;
     m_StereoEyeBlitActive = dst != nullptr;
     m_StereoEyeBlitOk = false;
+    m_FlashlightLive = false;
     if (dst == m_D9LeftEyeSurface)
         m_LeftEyeMsaaHasScene = false;
     else if (dst == m_D9RightEyeSurface)
@@ -7323,22 +8138,17 @@ bool VR::BlitCurrentGameColorTo(IDirect3DSurface9* dst, bool flushGpu)
 
 void VR::CaptureFrameBeforePresent()
 {
-    const bool paused = m_Game && SehIsPaused(m_Game->m_EngineClient);
-    // Direct-eye Submit skips this capture. While paused the ESC menu is
-    // painted onto the backbuffer after the stereo blit, so copy that crop
-    // into both eyes (L4D2VR desktop HUD / menu overlay).
-    if (m_DirectEyeSubmit && paused && m_D9LeftEyeSurface && m_D9RightEyeSurface)
-    {
-        BlitHmdViewFromBackbuffer(m_D9LeftEyeSurface);
-        BlitHmdViewFromBackbuffer(m_D9RightEyeSurface);
-        m_RenderedNewFrame.store(true, std::memory_order_release);
-        return;
-    }
-    if (m_DirectEyeSubmit)
-        return;
     if (!m_IsVREnabled || !g_D3DVR9)
         return;
     if (!ShouldCompositorSubmit())
+        return;
+
+    const bool panel2d = Want2dMenuPanel();
+    // Stereo eyes skip this capture. Menu and pause use the HWND backbuffer
+    // (GameUI is not in the eye RTs). Do not blit the BB into the eyes here:
+    // OpenXR then letterboxed a stale frame copy over that and the HMD stayed
+    // on the world / black while desktop showed pause GameUI.
+    if (m_DirectEyeSubmit && !panel2d)
         return;
 
     if (m_FrameCopyLatched && m_D9FrameColorSurface)
@@ -7356,12 +8166,17 @@ void VR::CaptureFrameBeforePresent()
 
     UINT probeW = 0, probeH = 0;
     const bool rtUsable = ResolveSurfaceSize(rt0, probeW, probeH) && probeW >= 640 && probeH >= 360;
+    const bool rtIsEye = rt0 && (
+        rt0 == m_D9LeftEyeSurface || rt0 == m_D9RightEyeSurface
+        || rt0 == m_D9LeftEyeSubmitSurface || rt0 == m_D9RightEyeSubmitSurface);
 
     IDirect3DSurface9* bb = nullptr;
-    if (!rtUsable)
-        device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
+    device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb);
 
-    IDirect3DSurface9* srcSurf = rtUsable ? rt0 : bb;
+    // GameUI lives on the HWND backbuffer. RT0 after CreateVRTextures can be
+    // an empty HMD-sized eye — copying that published black even with Submit.
+    const bool preferBb = panel2d || rtIsEye;
+    IDirect3DSurface9* srcSurf = (preferBb && bb) ? bb : (rtUsable ? rt0 : bb);
 
     UINT rtW = 0, rtH = 0;
     D3DSURFACE_DESC rtDesc{};
@@ -7427,9 +8242,15 @@ void VR::CaptureFrameBeforePresent()
             static int s_preLog;
             if (s_preLog < 6)
             {
-                Game::logMsg("PrePresent capture %s %ux%u from src=%ux%u hr=0x%08X",
-                    name, cropW, cropH, rtW, rtH, (unsigned)hr);
+                Game::logMsg("PrePresent capture %s %ux%u from src=%ux%u hr=0x%08X panel2d=%d",
+                    name, cropW, cropH, rtW, rtH, (unsigned)hr, panel2d ? 1 : 0);
                 ++s_preLog;
+            }
+            static int s_pause2dLog;
+            if (panel2d && m_GameplayEligible && s_pause2dLog < 4)
+            {
+                Game::logMsg("Pause 2D panel capture %s %ux%u", name, cropW, cropH);
+                ++s_pause2dLog;
             }
         }
         else
@@ -7524,7 +8345,8 @@ void VR::SubmitVRTextures()
         m_OpenXrLastPublishMs = nowMs;
         LogOpenXrPublishRate();
         const bool paused = m_Game && SehIsPaused(m_Game->m_EngineClient);
-        const bool stereoLayer = m_DirectEyeSubmit && !paused;
+        const bool panel2d = Want2dMenuPanel();
+        const bool stereoLayer = m_DirectEyeSubmit && !panel2d;
         // OpenVR copies PrePresent capture into both eyes here. The helper
         // only reads the private eye RTs, so menu / pass-through frames were
         // submitted empty (Link desktop in one layer, black stereo in another).
@@ -7533,23 +8355,42 @@ void VR::SubmitVRTextures()
             IDirect3DDevice9* copyDev = nullptr;
             if (SUCCEEDED(g_D3DVR9->GetD3DDevice(&copyDev)) && copyDev)
             {
-                copyDev->StretchRect(m_D9FrameColorSurface, nullptr, m_D9LeftEyeSurface, nullptr, D3DTEXF_LINEAR);
+                m_CaptureReentry = true;
+                DrawMenuCursorOnSurface(copyDev, m_D9FrameColorSurface);
+                const bool leftOk = CopySurfaceLetterboxed(copyDev, m_D9FrameColorSurface, m_D9LeftEyeSurface,
+                    bmvr::g_MenuPanelScale);
+                bool rightOk = true;
                 if (m_D9RightEyeSurface)
-                    copyDev->StretchRect(m_D9FrameColorSurface, nullptr, m_D9RightEyeSurface, nullptr, D3DTEXF_LINEAR);
+                    rightOk = CopySurfaceLetterboxed(copyDev, m_D9FrameColorSurface, m_D9RightEyeSurface,
+                        bmvr::g_MenuPanelScale);
+                m_CaptureReentry = false;
                 copyDev->Release();
                 static int s_monoCopyLog;
-                if (s_monoCopyLog < 3)
+                if (s_monoCopyLog < 4)
                 {
-                    Game::logMsg("OpenXR mono capture copied to both eyes paused=%d direct=%d",
-                        paused ? 1 : 0, m_DirectEyeSubmit ? 1 : 0);
+                    Game::logMsg("OpenXR mono capture letterboxed %ux%u -> eyes scale=%.2f pause2d=%d paused=%d ok=%d/%d",
+                        m_FrameCopyWidth, m_FrameCopyHeight, bmvr::g_MenuPanelScale,
+                        panel2d ? 1 : 0, paused ? 1 : 0,
+                        leftOk ? 1 : 0, rightOk ? 1 : 0);
                     ++s_monoCopyLog;
                 }
+                static int s_pauseCopyLog;
+                if (panel2d && m_GameplayEligible && s_pauseCopyLog < 4)
+                {
+                    Game::logMsg("Pause 2D letterboxed %ux%u scale=%.2f ok=%d/%d",
+                        m_FrameCopyWidth, m_FrameCopyHeight, bmvr::g_MenuPanelScale,
+                        leftOk ? 1 : 0, rightOk ? 1 : 0);
+                    ++s_pauseCopyLog;
+                }
+                m_FrameCopyLatched = false;
             }
         }
         if (!PrepareOpenXrEyeSurfacesForRead())
             return;
         if (stereoLayer && m_OpenXrStereoRenderPoseValid)
             L4D2VR_PublishOpenXrGameRenderPose(m_OpenXrStereoRenderPose);
+        else if (panel2d && m_MenuPanelPoseValid)
+            L4D2VR_PublishOpenXrGameRenderPose(m_MenuPanelPose);
         else if (m_OpenXrLastHmdPose.valid)
         {
             L4D2VROpenXrPoseDesc monoPose = m_OpenXrLastHmdPose;
@@ -7560,7 +8401,7 @@ void VR::SubmitVRTextures()
         const uint32_t frameId = m_OpenXrSubmitFrameId.fetch_add(1, std::memory_order_acq_rel);
         PublishOpenXrResolvedEyeTextures(frameId);
         ++m_OpenXrPublishes;
-        if (m_HudOverlayReady && m_D9HUDSurface
+        if (!panel2d && m_HudOverlayReady && m_D9HUDSurface
             && m_HudPaintedThisFrame.load(std::memory_order_acquire)
             && PauseUiActive())
         {
@@ -7575,6 +8416,7 @@ void VR::SubmitVRTextures()
             m_HasSubmittedSceneFrame.store(true, std::memory_order_release);
             ++m_SubmitCount;
             m_RenderedNewFrame.store(false, std::memory_order_release);
+            m_FrameCopyLatched = false;
             if (!m_LoggedFirstSubmit)
             {
                 m_LoggedFirstSubmit = true;
@@ -7603,7 +8445,9 @@ void VR::SubmitVRTextures()
     }
 
     const bool haveNewFrame = m_RenderedNewFrame.load(std::memory_order_acquire);
-    const bool directEyes = haveNewFrame && m_DirectEyeSubmit && m_D9LeftEyeSurface && m_D9RightEyeSurface;
+    const bool panel2d = Want2dMenuPanel();
+    const bool directEyes = haveNewFrame && m_DirectEyeSubmit && !panel2d
+        && m_D9LeftEyeSurface && m_D9RightEyeSurface;
     const bool haveFrame = haveNewFrame && m_D9FrameColorSurface;
     if (!directEyes && !haveFrame)
         return;
@@ -7665,18 +8509,17 @@ void VR::SubmitVRTextures()
             }
             else
             {
-                hrL = device->StretchRect(m_D9FrameColorSurface, nullptr, m_D9LeftEyeSurface, nullptr, D3DTEXF_LINEAR);
+                DrawMenuCursorOnSurface(device, m_D9FrameColorSurface);
+                hrL = CopySurfaceLetterboxed(device, m_D9FrameColorSurface, m_D9LeftEyeSurface,
+                    bmvr::g_MenuPanelScale) ? S_OK : E_FAIL;
                 hrR = m_D9RightEyeSurface
-                    ? device->StretchRect(m_D9FrameColorSurface, nullptr, m_D9RightEyeSurface, nullptr, D3DTEXF_LINEAR)
+                    ? (CopySurfaceLetterboxed(device, m_D9FrameColorSurface, m_D9RightEyeSurface,
+                        bmvr::g_MenuPanelScale) ? S_OK : E_FAIL)
                     : hrL;
                 if (SUCCEEDED(hrL))
                     NoteMsaaEyeScene(m_D9LeftEyeSurface, true);
-                else if (m_D9LeftEyeSubmitSurface)
-                    hrL = device->StretchRect(m_D9FrameColorSurface, nullptr, m_D9LeftEyeSubmitSurface, nullptr, D3DTEXF_LINEAR);
                 if (m_D9RightEyeSurface && SUCCEEDED(hrR))
                     NoteMsaaEyeScene(m_D9RightEyeSurface, true);
-                else if (m_D9RightEyeSubmitSurface)
-                    hrR = device->StretchRect(m_D9FrameColorSurface, nullptr, m_D9RightEyeSubmitSurface, nullptr, D3DTEXF_LINEAR);
             }
             m_CaptureReentry = false;
         }
@@ -7872,6 +8715,8 @@ void VR::UpdateTracking()
     RefreshIpdFromHmd();
     UpdateControllerTracking(hmd);
 
+    UpdateScopeZoomSmooth();
+
     if (m_GameplayEligible)
     {
         const bool openXrLatch = m_OpenXrHelperBridgeActive && m_HmdPoseValid;
@@ -7883,7 +8728,7 @@ void VR::UpdateTracking()
             m_HmdOriginLatched = true;
             m_PrevAppliedHmdYaw = m_HmdAngAbs.y;
             m_PrevAppliedHmdPitch = m_HmdAngAbs.x;
-            Game::logMsg("ResetPosition latch hmd=(%.1f,%.1f,%.1f) openxr=%d (engine eye + 6DOF, L4D2VR CameraAnchor)",
+            Game::logMsg("ResetPosition latch hmd=(%.1f,%.1f,%.1f) openxr=%d (engine eye + 6DOF)",
                 m_HmdPosAbs.x, m_HmdPosAbs.y, m_HmdPosAbs.z,
                 openXrLatch ? 1 : 0);
         }
@@ -7986,11 +8831,13 @@ void VR::Update()
         const uint32_t dt = s_fpsLogMs ? (nowMs - s_fpsLogMs) : 0;
         const uint32_t dn = m_PresentTick - s_fpsLogTick;
         const unsigned fps = (dt > 0) ? (dn * 1000u / dt) : 0;
-        Game::logMsg("present tick n=%u ~%ufps inGame=%d eligible=%d map=%s createdRT=%d namedRT=%d stereo=%d direct=%d blit=%ux%u poseWait=%u poseAge=%ums",
+        Game::logMsg("present tick n=%u ~%ufps inGame=%d eligible=%d map=%s createdRT=%d menuVR=%d submit=%d namedRT=%d stereo=%d direct=%d blit=%ux%u poseWait=%u poseAge=%ums",
             m_PresentTick, fps,
             inGame ? 1 : 0, m_GameplayEligible ? 1 : 0,
             m_CurrentMapName.c_str(),
             m_CreatedVRTextures.load(std::memory_order_acquire) ? 1 : 0,
+            bmvr::TryMenuCompositor() ? 1 : 0,
+            ShouldCompositorSubmit() ? 1 : 0,
             m_UsedNamedRenderTargets ? 1 : 0,
             m_StereoRenderViewActive ? 1 : 0,
             m_DirectEyeSubmit ? 1 : 0,
@@ -8027,6 +8874,8 @@ void VR::Update()
 
     if (!m_PosesWaitedThisFrame)
         UpdateTracking();
+    SyncGameUiFromEngine();
+    LatchMenuPanelIfNeeded();
     ProcessInput();
     m_PosesWaitedThisFrame = false;
 
@@ -8038,13 +8887,28 @@ void VR::Update()
     static int s_menuRisky;
     if (!m_GameplayEligible && s_menuRisky == 0)
     {
-        bmvr::BeginRisky(L"menu_vr");
-        s_menuRisky = 1;
-        Game::logMsg("Menu compositor begin map=%s", m_CurrentMapName.c_str());
+        Game::logMsg("Menu compositor begin map=%s presents=%u panelScale=%.2f cursorSmooth=%.2fs",
+            m_CurrentMapName.empty() ? "(none)" : m_CurrentMapName.c_str(),
+            m_PresentTick, bmvr::g_MenuPanelScale, bmvr::g_MenuCursorSmoothSec);
+        s_menuRisky = -1;
     }
 
     if (g_D3DVR9 && !m_CreatedVRTextures.load(std::memory_order_acquire))
+    {
+        if (!m_GameplayEligible && s_menuRisky <= 0)
+        {
+            bmvr::BeginRisky(L"menu_vr");
+            s_menuRisky = 1;
+        }
         CreateVRTextures();
+        if (m_CreatedVRTextures.load(std::memory_order_acquire) && s_menuRisky == 1)
+        {
+            bmvr::EndRisky(L"menu_vr");
+            s_menuRisky = 2;
+        }
+    }
+    else if (m_GameplayEligible)
+        EnsureHudOverlay();
 
     PrepareNamedStereoFromPresent();
 
@@ -8062,11 +8926,6 @@ void VR::Update()
         return;
     }
     SubmitVRTextures();
-    if (!m_GameplayEligible && s_menuRisky == 1 && m_SubmitCount >= 120)
-    {
-        bmvr::EndRisky(L"menu_vr");
-        s_menuRisky = 2;
-    }
     static int s_updLog;
     if (s_updLog < 3)
     {

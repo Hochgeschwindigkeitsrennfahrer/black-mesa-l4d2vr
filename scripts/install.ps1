@@ -60,6 +60,16 @@ Install-One $BinDir
 # 3) Next to bms.exe — L4D2VR-style, and AddDllDirectory(game root)
 Install-One $GameRoot
 
+# Quitting GameUI used to leave this armed; the next launch then disabled
+# compositor Submit and the HMD stayed black with a working desktop cursor.
+foreach ($dir in @($GameRoot, $BinDir, $DxvkDir)) {
+  $flag = Join-Path $dir "bmvr_in_menu_vr.flag"
+  if (Test-Path -LiteralPath $flag) {
+    Remove-Item -LiteralPath $flag -Force
+    Write-Host "Removed $flag"
+  }
+}
+
 $HelperSrc = Join-Path $Root "build\Release\openxr_helper64"
 $HelperDst = Join-Path $GameRoot "VR\openxr_helper64"
 if (Test-Path (Join-Path $HelperSrc "OpenXRHelper64.exe")) {
@@ -112,6 +122,9 @@ if (-not (Test-Path $CfgDst)) {
   $cfgText = [regex]::Replace($cfgText, '(?m)^VrHandsDebugBoxes=.*$', 'VrHandsDebugBoxes=false')
   if ($cfgText -notmatch '(?m)^HudDistance=') { $cfgText += "`r`nHudDistance=1.05`r`n" }
   if ($cfgText -notmatch '(?m)^HudSize=') { $cfgText += "`r`nHudSize=0.70`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^MenuPanelScale=.*$', 'MenuPanelScale=0.70')
+  if ($cfgText -notmatch '(?m)^MenuPanelScale=') { $cfgText += "`r`nMenuPanelScale=0.70`r`n" }
+  if ($cfgText -notmatch '(?m)^MenuCursorSmoothSec=') { $cfgText += "`r`nMenuCursorSmoothSec=0.18`r`n" }
   if ($cfgText -notmatch '(?m)^ViewmodelScale=') { $cfgText += "`r`nViewmodelScale=0.68`r`n" }
   if ($cfgText -notmatch '(?m)^CompositorPostPresentHandoff=') { $cfgText += "`r`nCompositorPostPresentHandoff=true`r`n" }
   if ($cfgText -notmatch '(?m)^VrHandsGlovesEnabled=') { $cfgText += "`r`nVrHandsGlovesEnabled=true`r`n" }
@@ -129,6 +142,7 @@ if (-not (Test-Path $CfgDst)) {
   if ($cfgText -notmatch '(?m)^VrHandHud=') { $cfgText += "`r`nVrHandHud=true`r`n" }
   if ($cfgText -notmatch '(?m)^VrCrosshair=') { $cfgText += "`r`nVrCrosshair=false`r`n" }
   if ($cfgText -notmatch '(?m)^ScopeZoomFovScale=') { $cfgText += "`r`nScopeZoomFovScale=0.28`r`n" }
+  if ($cfgText -notmatch '(?m)^ScopeZoomSmoothSec=') { $cfgText += "`r`nScopeZoomSmoothSec=0.16`r`n" }
   if ($cfgText -notmatch '(?m)^DesktopLeftoverRender=') { $cfgText += "`r`nDesktopLeftoverRender=false`r`n" }
   if ($cfgText -notmatch '(?m)^ForceOpenVis=') { $cfgText += "`r`nForceOpenVis=false`r`n" }
   if ($cfgText -notmatch '(?m)^StereoBlitGpuFlush=') { $cfgText += "`r`nStereoBlitGpuFlush=false`r`n" }
@@ -140,6 +154,7 @@ if (-not (Test-Path $CfgDst)) {
   $cfgText = [regex]::Replace($cfgText, '(?m)^OpenXRHelperUseGameRenderPoseForProjection=.*$', 'OpenXRHelperUseGameRenderPoseForProjection=true')
   # Do not overwrite a user false — that is the revert switch.
   if ($cfgText -notmatch '(?m)^WorldRenderAtEyeSize=') { $cfgText += "`r`nWorldRenderAtEyeSize=true`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^Roomscale1To1.*\r?\n', '')
   Set-Content -LiteralPath $CfgDst -Value $cfgText -Encoding ASCII -NoNewline
   Write-Host "Updated HudDistance/HudSize/ViewmodelScale/CompositorPostPresentHandoff/gloves/wrist HUD/OpenXR in $CfgDst"
   if ($cfgText -match '(?m)^WorldRenderAtEyeSize=true') {

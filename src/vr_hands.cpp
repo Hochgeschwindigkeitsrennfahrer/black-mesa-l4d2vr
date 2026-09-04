@@ -20,9 +20,8 @@
 
 namespace
 {
-    constexpr float kEyeZNear = 1.f;
+    constexpr float kEyeZNear = 7.f;
     constexpr float kEyeZFar = 28377.f;
-    constexpr float kSceneLightScale = 1.f;
 
     int FindNameIndex(const std::vector<std::string>& names, const std::string& name)
     {
@@ -223,6 +222,72 @@ namespace
             return false;
         return input->GetSkeletalSummaryData(action, vr::VRSummaryType_FromAnimation, &out)
             == vr::VRInputError_None;
+    }
+
+    Vector FlashlightBoostAt(const Vector& palm)
+    {
+        Vector add(0.f, 0.f, 0.f);
+        if (!g_Game || !g_Game->m_VR)
+            return add;
+        Vector origin{};
+        Vector forward{};
+        if (!g_Game->m_VR->CopyFlashlightState(origin, forward))
+            return add;
+        Vector delta = palm - origin;
+        const float dist = delta.Length();
+        if (!(dist > 1.f) || !(dist < 2500.f))
+            return add;
+        delta = delta * (1.f / dist);
+        const float spot = delta.Dot(forward);
+        if (spot < 0.35f)
+            return add;
+        const float cone = (spot - 0.35f) / 0.65f;
+        const float atten = 750.f / (750.f + dist);
+        const float beam = cone * atten * 0.85f;
+        add.x = beam;
+        add.y = beam;
+        add.z = beam * 0.82f;
+        return add;
+    }
+
+    Vector SamplePalmSceneLight(const Vector& palm, float& outEnvExposure)
+    {
+        // Diffuse uses a high floor so indoor gloves stay readable.
+        // Spec/cubemap uses raw luma so dark rooms do not stay chrome.
+        outEnvExposure = 0.45f;
+        Vector rgb(1.f, 1.f, 1.f);
+        if (g_Game && g_Game->TryGetLightForPoint(palm, rgb, false))
+        {
+            if (rgb.x > 1.5f || rgb.y > 1.5f || rgb.z > 1.5f)
+            {
+                rgb.x *= (1.f / 255.f);
+                rgb.y *= (1.f / 255.f);
+                rgb.z *= (1.f / 255.f);
+            }
+            rgb.x = std::max(0.f, rgb.x);
+            rgb.y = std::max(0.f, rgb.y);
+            rgb.z = std::max(0.f, rgb.z);
+            const float luma = 0.2126f * rgb.x + 0.7152f * rgb.y + 0.0722f * rgb.z;
+            outEnvExposure = std::clamp(luma, 0.03f, 1.35f);
+            const float safe = std::max(luma, 0.0001f);
+            const float lift = 0.18f + 0.92f * (luma / (luma + 0.22f));
+            const float tx = rgb.x / safe;
+            const float ty = rgb.y / safe;
+            const float tz = rgb.z / safe;
+            constexpr float kTint = 0.28f;
+            rgb.x = lift * (1.f - kTint + kTint * tx);
+            rgb.y = lift * (1.f - kTint + kTint * ty);
+            rgb.z = lift * (1.f - kTint + kTint * tz);
+        }
+        const Vector beam = FlashlightBoostAt(palm);
+        rgb.x += beam.x * 0.28f;
+        rgb.y += beam.y * 0.28f;
+        rgb.z += beam.z * 0.28f;
+        outEnvExposure = std::clamp(outEnvExposure + beam.x * 0.55f, 0.03f, 1.5f);
+        rgb.x = std::clamp(rgb.x, 0.06f, 1.28f);
+        rgb.y = std::clamp(rgb.y, 0.06f, 1.28f);
+        rgb.z = std::clamp(rgb.z, 0.06f, 1.28f);
+        return rgb;
     }
 }
 
@@ -496,15 +561,19 @@ bool BmVrGloves::DrawForEye(
     const QAngle& leftAngles,
     bool rightOk,
     const Vector& rightWorld,
-    const QAngle& rightAngles)
+    const QAngle& rightAngles,
+    float zNear,
+    float zFar)
 {
     (void)stereoEye;
     if (!device || !m_Impl || !m_Impl->EnsureAssets())
         return false;
 
     const float scale = std::clamp(modelScale, 0.2f, 2.0f);
+    const float nearPlane = (zNear > 0.01f) ? zNear : kEyeZNear;
+    const float farPlane = (zFar > nearPlane + 1.f) ? zFar : kEyeZFar;
     const VrHandMatrix4 projection = VrHandMath::BuildPerspective(
-        horizontalFovDegrees, aspectRatio, kEyeZNear, kEyeZFar);
+        horizontalFovDegrees, aspectRatio, nearPlane, farPlane);
     const VrHandMatrix4 camera = VrHandMath::BuildSourceView(eyeOrigin, viewAngles);
 
     bool drew = false;
@@ -604,6 +673,11 @@ bool BmVrGloves::DrawForEye(
             rotOffset);
         const VrHandMatrix4 wvp = VrHandMath::Multiply(projection, VrHandMath::Multiply(camera, world));
 
+        float envExposure = 0.45f;
+        const Vector sceneRgb = SamplePalmSceneLight(*origins[i], envExposure);
+        IDirect3DBaseTexture9* envCube = (g_Game && g_Game->m_VR)
+            ? g_Game->m_VR->SceneCubemap() : nullptr;
+
         std::string error;
         if (!m_Impl->renderer.Draw(
                 device,
@@ -613,7 +687,10 @@ bool BmVrGloves::DrawForEye(
                 world,
                 wvp,
                 stereoEye == 0 ? VrHandDrawPass::OverlayNoDepth : VrHandDrawPass::WorldDepth,
-                kSceneLightScale,
+                sceneRgb,
+                eyeOrigin,
+                envExposure,
+                envCube,
                 error))
         {
             if (!error.empty())
@@ -633,8 +710,9 @@ bool BmVrGloves::DrawForEye(
     if (drew && !m_Impl->loggedReady)
     {
         m_Impl->loggedReady = true;
-        Game::logMsg("VR gloves drew source=%s eye=%d fov=%.1f aspect=%.3f scale=%.2f",
-            source, stereoEye, horizontalFovDegrees, aspectRatio, scale);
+        Game::logMsg("VR gloves drew source=%s eye=%d fov=%.1f aspect=%.3f scale=%.2f cubemap=%d",
+            source, stereoEye, horizontalFovDegrees, aspectRatio, scale,
+            (g_Game && g_Game->m_VR && g_Game->m_VR->SceneCubemap()) ? 1 : 0);
     }
     return drew;
 }
