@@ -100,6 +100,17 @@ Layout follows the HEV HUD: a dim `000` behind each value so the unused leading
 digits stay visible, the value over it, then the icon. Health turns red at or
 below 25, matching `warnIfLessThan 25` in the game's own `scripts/hudlayout.res`.
 
+Positioning is controller-local, not HL2VR player.mdl / muzzle attachments.
+Those tilted the health panel into the HEV glove and sent ammo to a different
+place on every gun. Health/suit sit flat on the back of the off-hand (2.5
+units), shifted toward the wrist and lowered off the knuckles. Ammo is a
+2-unit sideways plate beside the gun-hand controller, facing inward.
+
+Drawing matches HL2VR VGUI screens: IgnoreZ (HUD after the glove mesh, depth
+off) so the hand cannot cover it, and `IsBackfacing` so ammo is one-sided —
+looking through the gun from the other side does not show mirrored digits.
+Icons and row layout are unchanged.
+
 `tools/list_vpk.py` lists any VPK's contents and is the quickest way to confirm
 an asset name before referencing it from code.
 

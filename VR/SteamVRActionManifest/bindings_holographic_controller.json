@@ -71,15 +71,6 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/Reload"
-                  }
-               },
-               "mode": "button",
-               "path": "/user/hand/left/input/grip"
-            },
-            {
-               "inputs": {
-                  "click": {
                      "output": "/actions/main/in/Flashlight"
                   }
                },
@@ -125,7 +116,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/Use"
+                     "output": "/actions/main/in/SecondaryAttack"
                   }
                },
                "mode": "button",
@@ -134,7 +125,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/ActivateVR"
+                     "output": "/actions/main/in/Reload"
                   }
                },
                "mode": "button",
@@ -184,7 +175,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/NextItem"
+                     "output": "/actions/main/in/Pause"
                   }
                },
                "mode": "button",
@@ -202,7 +193,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/SecondaryAttack"
+                     "output": "/actions/main/in/Use"
                   }
                },
                "mode": "button",
@@ -240,8 +231,8 @@
    },
    "category": "steamvr_input",
    "controller_type": "holographic_controller",
-   "description": "Windows Mixed Reality / Reverb G2 when SteamVR reports holographic_controller. Joystick layout matches Touch.",
-   "name": "Black Mesa VR WMR v3 Y-next X-prev",
+   "description": "Windows Mixed Reality / Reverb G2 when SteamVR reports holographic_controller. Left trigger use, B alt-fire, A reload, Y menu.",
+   "name": "Black Mesa VR WMR v4 use/sprint/reload",
    "options": {},
    "simulated_actions": []
 }

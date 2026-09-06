@@ -71,15 +71,6 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/Reload"
-                  }
-               },
-               "mode": "button",
-               "path": "/user/hand/left/input/grip"
-            },
-            {
-               "inputs": {
-                  "click": {
                      "output": "/actions/main/in/Flashlight"
                   }
                },
@@ -125,7 +116,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/Use"
+                     "output": "/actions/main/in/SecondaryAttack"
                   }
                },
                "mode": "button",
@@ -134,7 +125,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/ActivateVR"
+                     "output": "/actions/main/in/Reload"
                   }
                },
                "mode": "button",
@@ -184,7 +175,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/NextItem"
+                     "output": "/actions/main/in/Pause"
                   }
                },
                "mode": "button",
@@ -202,7 +193,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/SecondaryAttack"
+                     "output": "/actions/main/in/Use"
                   }
                },
                "mode": "button",
@@ -241,7 +232,7 @@
    "category": "steamvr_input",
    "controller_type": "oculus_touch",
    "description": "",
-   "name": "Black Mesa VR Touch v3 Y-next X-prev",
+   "name": "Black Mesa VR Touch v4 use/sprint/reload",
    "options": {},
    "simulated_actions": []
 }

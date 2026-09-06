@@ -76,12 +76,16 @@ typedef void(__thiscall* tGetBackBufferDimensions)(void* thisptr, int& width, in
 typedef void(__thiscall* tGetScreenSize)(void* thisptr, int& width, int& height);
 typedef float(__thiscall* tGetScreenAspectRatio)(void* thisptr);
 typedef ITexture*(__thiscall* tCreateNamedRTEx)(void* thisptr, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags);
+typedef void(__thiscall* tEndRTAlloc)(void* thisptr);
+typedef void(__thiscall* tDrawFilledRect)(void* thisptr, int x0, int y0, int x1, int y1);
+typedef void(__thiscall* tDrawTexturedRect)(void* thisptr, int x0, int y0, int x1, int y1);
 typedef float(__thiscall* tGetViewModelFOV)(void* thisptr);
 typedef void(__thiscall* tEndFrame)(void* thisptr);
 typedef void(__thiscall* tTraceRay)(void* thisptr, const Ray_t& ray, unsigned int fMask, CTraceFilter* filter, CGameTrace* pTrace);
 typedef void(__thiscall* tImpulseCommands)(void* thisptr);
 typedef void(__thiscall* tUpdateFlashlightState)(void* thisptr, void* flashlightState);
 typedef Vector*(__thiscall* tWeaponShootPosition)(void* thisptr, Vector* out);
+typedef void(__thiscall* tGrabSetTarget)(void* thisptr, Vector* pos, QAngle* ang);
 typedef void(__thiscall* tGetShootAngles)(void* thisptr, QAngle* out);
 typedef int(__thiscall* tGetAttachmentVec)(void* thisptr, int number, Vector* origin, QAngle* angles);
 typedef int(__thiscall* tGetAttachmentMatrix)(void* thisptr, int number, float* matrix);
@@ -132,6 +136,9 @@ public:
     static inline Hook<tGetScreenSize> hkGetScreenSize;
     static inline Hook<tGetScreenAspectRatio> hkGetScreenAspectRatio;
     static inline Hook<tCreateNamedRTEx> hkCreateNamedRTEx;
+    static inline Hook<tEndRTAlloc> hkEndRTAlloc;
+    static inline Hook<tDrawFilledRect> hkDrawFilledRect;
+    static inline Hook<tDrawTexturedRect> hkDrawTexturedRect;
     static inline Hook<tGetViewModelFOV> hkGetViewModelFOV;
     static inline Hook<tEndFrame> hkEndFrame;
     static inline Hook<tTraceRay> hkTraceRay;
@@ -139,6 +146,8 @@ public:
     static inline Hook<tUpdateFlashlightState> hkUpdateFlashlightState;
     static inline Hook<tWeaponShootPosition> hkClientWeaponShootPosition;
     static inline Hook<tWeaponShootPosition> hkServerWeaponShootPosition;
+    static inline Hook<tWeaponShootPosition> hkServerGrabHoldOrigin;
+    static inline Hook<tGrabSetTarget> hkGrabSetTarget;
     static inline Hook<tGetShootAngles> hkGetShootAngles;
     static inline Hook<tGetShootAngles> hkClientGetShootAngles;
     static inline Hook<tGetAttachmentVec> hkGetAttachmentVec;
@@ -189,6 +198,9 @@ public:
     static void __fastcall dGetScreenSize(void* ecx, void* edx, int& width, int& height);
     static float __fastcall dGetScreenAspectRatio(void* ecx, void* edx);
     static ITexture* __fastcall dCreateNamedRTEx(void* ecx, void* edx, const char* name, int w, int h, int sizeMode, int format, int depth, unsigned textureFlags, unsigned renderTargetFlags);
+    static void __fastcall dEndRTAlloc(void* ecx, void* edx);
+    static void __fastcall dDrawFilledRect(void* ecx, void* edx, int x0, int y0, int x1, int y1);
+    static void __fastcall dDrawTexturedRect(void* ecx, void* edx, int x0, int y0, int x1, int y1);
     static float __fastcall dGetViewModelFOV(void* ecx, void* edx);
     static void __fastcall dEndFrame(void* ecx, void* edx);
     static void __fastcall dTraceRay(void* ecx, void* edx, const Ray_t& ray, unsigned int fMask, CTraceFilter* filter, CGameTrace* pTrace);
@@ -196,6 +208,8 @@ public:
     static void __fastcall dUpdateFlashlightState(void* ecx, void* edx, void* flashlightState);
     static Vector* __fastcall dClientWeaponShootPosition(void* ecx, void* edx, Vector* out);
     static Vector* __fastcall dServerWeaponShootPosition(void* ecx, void* edx, Vector* out);
+    static Vector* __fastcall dServerGrabHoldOrigin(void* ecx, void* edx, Vector* out);
+    static void __fastcall dGrabSetTarget(void* ecx, void* edx, Vector* pos, QAngle* ang);
     static void __fastcall dGetShootAngles(void* ecx, void* edx, QAngle* out);
     static void __fastcall dClientGetShootAngles(void* ecx, void* edx, QAngle* out);
     static int __fastcall dGetAttachmentVec(void* ecx, void* edx, int number, Vector* origin, QAngle* angles);
@@ -222,6 +236,7 @@ public:
     static void EnsureServerFlashlightHook();
     static void EnsureClientFlashlightHook();
     static void EnsureWeaponShootOriginHooks();
-    static void EnsureWeaponVfxHooks();
+    // Returns true once every VFX hook target is resolved (installed or skipped).
+    static bool EnsureWeaponVfxHooks();
     static void RestoreViewmodelArmHides();
 };

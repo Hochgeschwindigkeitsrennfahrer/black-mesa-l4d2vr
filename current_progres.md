@@ -370,9 +370,46 @@ Do **not** retry:
 |---|---|---|
 | `r_WaterDrawRefraction/Reflection 1` + `r_waterforcereflectentities 1` + `r_waterforceexpensive 1` + `nr_gbuffer_for_reflection_enabled 1` | Planar water inside each stereo `ViewDrawScene` (~10 ms) | **no** |
 
-Keep all five at 0 (QoL + `VR/bmvr.cfg`). `nr_gbuffer_for_refraction_enabled` stays 0. Do not grow Water/Refract RTs to the eye. Xen/coast stays cheap/fog until a different water path exists.
+Do not retry that **full** set. `nr_gbuffer_for_refraction_enabled` stays 0. Do not grow Water/Refract RTs to the eye.
+
+**2026-09-06 (user):** `r_WaterDrawRefraction 1` alone costs no noticeable FPS and looks better. QoL + `VR/bmvr.cfg` default is refraction-only again (`waterrefract1`). Reflection / expensive / gbuffer reflection stay 0.
 
 
 
 
 
+
+## Pass 2026-09-06 performance (CPU / GPU sync)
+
+**Compiled + installed this pass** (`d3d9.dll` 2898944 bytes, all three locations; `OpenXrDeferredPublish` / `OpenXrSlotCoolingMs` added to the installed `VR\config.txt`). **Not HMD-verified.** Full list with rationale: `docs/performance-pass.md`; OpenXR publish redesign: `docs/openxr-eye-publish.md` §7.
+
+| Item | Change |
+|---|---|
+| OpenXR publish | No `WaitDeviceIdle` per publish. Eye copies fenced with `D3DQUERYTYPE_EVENT` + new fork `IDirect3DVR9::FlushCommands()`, published on a later Present when done. `OpenXrDeferredPublish=true` / `OpenXrSlotCoolingMs=4` in `VR/config.txt`. `false` restores the old path. |
+| OpenVR IPC | `TickCompositorFocus` 10 Hz, `PollSteamVrRecommendedSize` 4 Hz, FullFrame `FindTexture` probe 20 Hz. |
+| D3D per-frame | RT0 / backbuffer pointers tracked from hooks instead of `GetRenderTarget`/`GetBackBuffer`; capture-on-unbind gated; shader-constant hook copy-on-write; hand pass uses one recorded state block instead of `D3DSBT_ALL` per hand per eye; HUD glyphs batched. |
+| Hooks CPU | Viewmodel class flags (crowbar/mp5/rpg/gluon/shotgun/scoped) replace per-call `strstr`; RT-name class memo; sequence-label + idle-seq caches; `FindRpgLaserDot` rescan <= 4 Hz; sprite hooks early-out; `dTraceRay` passthrough removed; `Ensure*Hooks` done flags; cached `client.dll` handle. |
+| Hands | `HandRig` per GLB asset; curl palette + palm light cached per hand per Present. |
+| Win32 / I/O | HWND + client rect cached; `BeginRisky`/`EndRisky` touch the flag file only on state change; one `OutputDebugStringA` per log line. |
+
+Log tags: `OpenXR publish rate ... deferred= throttled= dropped= pending= maxPending=`.
+
+**HMD checklist:** gameplay looks the same as before; no ghosting/tearing on head turn (if so, set `OpenXrDeferredPublish=false` and compare); gloves animate and match lighting in both eyes; crowbar swing, RPG laser dot, gluon beam, MP5 offset unchanged; Present interval variance lower than the previous build.
+
+**HMD run 1 (user, 2026-09-06, WMR G2 90 Hz, RTX 4070 Ti):** higher fps than `false`, but tearing on head turns and judder while walking in low-fps areas; reprojection no longer hid drops. Log: `present=74-84/s published=67-72/s maxPending=2 dropped=1-3/s`. Diagnosis + fix (`docs/openxr-eye-publish.md` §7a), **compiled + installed, not HMD-verified**:
+
+| Item | Change |
+|---|---|
+| Run-ahead | `OpenXrMaxPending=1` (new key, 1-3). Present blocks on the previous copy's event (`WaitOldestOpenXrPending`, 250 ms timeout -> `WaitDeviceIdle`) before copying new eyes. Pose age <= 1 GPU frame, `dropped` should be 0. Rate log: `paceWait=/s avg= max=`. |
+| Slot reuse | Bridge **v14**: helper writes `helperConsumingFrameId` before and `helperConsumedFrameId` after its two `RenderEye` blits (queue idle). Game never rewrites a slot whose published frame id > consumed. Timer stays as margin; gate dropped if helper silent > 500 ms. Slots 3 -> 4. Rate log: `helperHold= helperFeedback= consumedLag=`. |
+| Helper queue | `VK_KHR/EXT_global_priority` HIGH on the helper's graphics queue, fallback to default on `NOT_PERMITTED`. Helper log: `Vulkan graphics queue global priority: ...`. |
+
+**HMD run 2 (user, still super stuttery, 2026-09-06):** `consumedLag=4-8`, HIGH rejected, compositor ~60 Hz in-world vs ~90 Hz in menu. Helper `vkQueueWaitIdle` twice before `xrEndFrame` missed vsync, so WMR could not reproject. Game `WaitOldestOpenXrPending` also stalled Present. **Compiled + installed, not HMD-verified** (`docs/openxr-eye-publish.md` §7b): helper blits without waiting (3 CBs + fence; EndFrame on time; consumed on fence); game skips a Present instead of blocking on the copy event.
+
+**HMD run 3 (user, even worse):** `present=61/s published=30/s helperHold=30/s`. One-in-flight backpressure + deferred publish skipped every other Present. Reverted 11 ms cap, consume hold, and 4 ms EndFrame wait.
+
+**HMD run 4 (user, still stuttery vs pre-pass):** `OpenXrDeferredPublish=true` never matched the old headset feel. Default is `false` again (game `WaitDeviceIdle` + helper `vkQueueWaitIdle` before `xrEndFrame`). CPU caches from this pass stay. See `docs/openxr-eye-publish.md` §7d.
+
+**HMD run 5 (user, 2026-09-06):** `OpenXrDeferredPublish=false` **definitely feels better** than `true`, even though `true` reports higher FPS. WMR motion smoothing / reprojection needs a regular finished pair on vsync; extra game frames that miss compositor cadence show up as stutter. Keep `false`.
+
+Do not claim full gameplay success.

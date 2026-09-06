@@ -71,20 +71,6 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/Reload"
-                  }
-               },
-               "mode": "button",
-               "parameters": {
-                  "force_input": "force",
-                  "click_activate_threshold": "0.45",
-                  "click_deactivate_threshold": "0.4"
-               },
-               "path": "/user/hand/left/input/grip"
-            },
-            {
-               "inputs": {
-                  "click": {
                      "output": "/actions/main/in/Flashlight"
                   }
                },
@@ -130,7 +116,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/Use"
+                     "output": "/actions/main/in/SecondaryAttack"
                   }
                },
                "mode": "button",
@@ -139,7 +125,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/ActivateVR"
+                     "output": "/actions/main/in/Reload"
                   }
                },
                "mode": "button",
@@ -189,7 +175,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/NextItem"
+                     "output": "/actions/main/in/Pause"
                   }
                },
                "mode": "button",
@@ -207,7 +193,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/SecondaryAttack"
+                     "output": "/actions/main/in/Use"
                   }
                },
                "mode": "button",
@@ -237,7 +223,7 @@
    "category": "steamvr_input",
    "controller_type": "knuckles",
    "description": "",
-   "name": "Black Mesa VR Knuckles v3 Y-next X-prev",
+   "name": "Black Mesa VR Knuckles v4 use/sprint/reload",
    "options": {},
    "simulated_actions": []
 }

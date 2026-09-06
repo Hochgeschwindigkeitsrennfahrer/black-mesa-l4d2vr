@@ -49,6 +49,12 @@ IDirect3DVR9 : public IUnknown {
   // render-target allocation.  Keep this at the end of the private interface
   // so existing method indices remain stable.
   virtual HRESULT STDMETHODCALLTYPE GetD3DDevice(IDirect3DDevice9** ppDevice) = 0;
+  // Hand every recorded D3D9 command to the CS thread for GPU submission
+  // without waiting for it (no CS drain, no device idle). Used by the OpenXR
+  // deferred eye publish so a D3DQUERYTYPE_EVENT issued after the eye copies
+  // is guaranteed to reach the GPU this frame. Appended last: method indices
+  // above stay stable.
+  virtual HRESULT STDMETHODCALLTYPE FlushCommands() = 0;
 };
 
 #ifdef _MSC_VER

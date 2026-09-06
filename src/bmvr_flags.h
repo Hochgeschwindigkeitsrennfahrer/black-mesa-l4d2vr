@@ -37,12 +37,13 @@ namespace bmvr
     // FullFrame never grew, so worldMatch stayed 0 and the viewport/view-lock
     // fixes never engaged. Retried behind WorldRenderAtEyeSize in config.txt.
     bool TryOffscreenWorldGrow();
-    // Grow gate for `_rt_FullFrameFB*`. Must not wait for LevelInit: FullFrame
-    // is created during map load before the client hook (bmvr_log 2026-09-01).
-    // Background/menu maps still skip. G-buffers use ComputeGrownWorldGbuffer.
+    // Grow gate for `_rt_FullFrameFB*`. FullFrame is created at SetMode, before
+    // Game hooks. Early CreateNamedRT (InstallEarlyFramebufferHook) must be
+    // live by then. Menu maps no longer block grow — New Game reused the
+    // background01 HWND RTs and left worldMatch=0 (G2, 2026-09-05).
     bool WorldRtGrowActive();
     // Peeked from GetLevelNameShort during CreateNamedRT / LevelInit.
-    // background* blocks FullFrame grow so menu maps stay on the HWND path.
+    // background* still blocks OffscreenWorldMatchesEyes (menu 2D path).
     void NoteEngineMapName(const char* map);
     // gbmatch keeps CViewSetup at HWND/G-buffer size unless FullFrame and
     // G-buffers actually allocated at offscreen eye size (native HMD pixels).
@@ -81,6 +82,11 @@ namespace bmvr
     // 2026-09-01).
     bool ComputeWorldRtOverrideSize(uint32_t& width, uint32_t& height);
     bool HaveHmdFramebufferSize(uint32_t& width, uint32_t& height);
+    // Cached game HWND (Valve001 / "Black Mesa"). Null while the window is
+    // missing; re-searched at most every 250 ms. Never call FindWindow per
+    // D3D call — see QueryWindowClientSize.
+    HWND GameWindow();
+    // Client size of GameWindow(), cached for a few ms. Thread-safe.
     bool QueryWindowClientSize(uint32_t& width, uint32_t& height);
     bool ApplyHmdAspectBackbuffer(uint32_t& width, uint32_t& height);
     void InstallEarlyFramebufferHook();
@@ -147,7 +153,7 @@ namespace bmvr
     // Debug boxes at each controller. Drawn if gloves are off, or if GLB draw
     // fails. Leave off once gloves are verified.
     extern bool g_VrHandsDebugBoxes;
-    // Wrist HUD (HL2VR-style): health+suit on the left wrist, ammo on the right.
+    // Wrist HUD: health+suit flat on the off-hand, ammo sideways beside the gun hand.
     extern bool g_HandHud;
     // World-space aim reticle at the controller firing ray. Off by default;
     // VrCrosshair=true in config.txt turns it on.
@@ -205,9 +211,35 @@ namespace bmvr
     // Old stereo vis workaround: r_portalsopenall + r_occlusion 0. Default
     // off — that pair draws the whole map and tanks open/complex areas.
     extern bool g_ForceOpenVis;
+    // Hidden-area mesh early-Z after D3DCLEAR_ZBUFFER. Verified miss
+    // 2026-09-05: OpenXR visibility-mask draw was a black overlay, no FPS
+    // gain. Persist-skipped (hl2vr_ham). HiddenAreaMesh=true does not retry.
+    extern bool g_HiddenAreaMesh;
+    // Dummy-draw materials after LevelInit. Verified miss 2026-09-05:
+    // DrawScreenSpaceRectangle null-called shaderapidx9 (C0000005 eip=0)
+    // and leftover hmd_offscreen dropped the next launch onto HWND gbmatch.
+    extern bool g_MaterialPredraw;
     // CPU-wait the GPU after the left-eye StretchRect. The HMD-fb blit path
     // always flushes regardless of this flag (shared FullFrame/BB hazard).
     extern bool g_StereoBlitGpuFlush;
+    // OpenXR helper eye publish: copy eyes into a slot, issue a GPU event and
+    // hand the slot over on a later Present once the event signalled, instead
+    // of vkDeviceWaitIdle on every publish (CPU/GPU serialisation). Default
+    // false: HMD runs 2026-09-06 showed deferred=true raises fps but breaks
+    // WMR motion smoothing, so framedrops feel like stutter. true keeps the
+    // throughput path for A/B.
+    extern bool g_OpenXrDeferredPublish;
+    // Minimum ms a publish slot rests after it stopped being the helper's
+    // visible slot before the game writes it again. Safety margin only: the
+    // real gate is the helper's consumed frame id (bridge v14).
+    extern float g_OpenXrSlotCoolingMs;
+    // Deferred publish run-ahead: how many eye copies may be in flight on the
+    // GPU before Present blocks on the oldest one. 1 = CPU at most one frame
+    // ahead of the GPU (pose paired with a frame is <= 1 GPU frame old when
+    // the helper gets it). 2-3 trade latency and reprojection quality for
+    // throughput (measured 2026-09-06: unbounded run-ahead sat at 2 pending
+    // frames on a 90Hz WMR headset at ~75fps and felt like judder). Range 1-3.
+    extern uint32_t g_OpenXrMaxPending;
     // World-space v_ models vs world props. Applied in DrawModelExecute around
     // the controller (not m_flModelScale at entity origin). Range 0.2–1.5.
     extern float g_ViewmodelScale;
@@ -218,6 +250,12 @@ namespace bmvr
     // 2D GameUI in the HMD: fraction of the full-width letterbox (1 = glued to
     // the view). ~0.70 is a closer monitor; lower = farther / smaller.
     extern float g_MenuPanelScale;
+    // HL2VR hlvr_menu_forward / overlay width, in metres. Defaults match the
+    // OpenXR helper 2D quad (0.65 m × 1.05 m, 2026-09-03). Do not copy
+    // HL2VR's 150 Source-unit (~3.8 m) distance — that was too far here.
+    extern float g_MenuForwardMeters;
+    extern float g_MenuWidthMeters;
+    extern float g_MenuHeightOffsetMeters;
     // Seconds of low-pass on the VR menu pointer (hand tremor).
     extern float g_MenuCursorSmoothSec;
 
@@ -242,6 +280,34 @@ namespace bmvr
     bool TryGbLeftSkip();
     bool TryDrawHud();
     bool TryDrawModelExecute();
+    // HL2VR: QueueCall WaitGetPoses onto ICallQueue. Sticky disables queued
+    // WGP only — sync WaitGetPoses on the calling thread stays on.
+    bool TryHl2vrQueuedWgp();
+    // Write CViewSetup.m_eStereoEye LEFT/RIGHT (1/2). Never a pixel height.
+    bool TryHl2vrStereoEye();
+    // OpenVR GetHiddenAreaMesh early-Z after D3DCLEAR_ZBUFFER (3adc23b2).
+    // Persist-skipped: black overlay, 2026-09-05.
+    bool TryHl2vrHam();
+    // PixelVisibility_EndCurrentView once per stereo pair (26a5fe68).
+    // Persist-skipped: second-eye skip, one-eye 2D skybox miss, 2026-09-05.
+    bool TryHl2vrPixelVis();
+    // CVRViewRender::DrawAllMaterials dummy draw after map load (aeaf3f03).
+    bool TryHl2vrPredraw();
+    // C_BaseVRPlayer::GetRenderBoundsWorldspace ±1000 (feb36883). Off —
+    // leftover cull-opt from 2026-09-05. Do not re-arm.
+    bool TryHl2vrPlayerCull();
+    // Do not zero CViewRender+0x744. That byte is m_rbTakeFreezeFrame
+    // (RenderView cmp + m_flFreezeFrameUntil at +0x748). Persist-skipped:
+    // empty freeze / white void, 2026-09-05.
+    bool TryStereoVisReset();
+    // Apply OpenXR/OpenVR controller poses into tracking (viewmodel + gloves).
+    bool TryCtrlPose();
+    // CalcViewModelView hard-lock to the aim controller.
+    bool TryCtrlVm();
+    // Draw GLB gloves / independent hand meshes into the eye.
+    bool TryVrGloves();
+    // 2D wrist HUD / weapon menu / debug boxes on the stereo eye (FVF overlay).
+    bool TryHandOverlay();
 
     extern uint32_t g_FullFrameActualWidth;
     extern uint32_t g_FullFrameActualHeight;

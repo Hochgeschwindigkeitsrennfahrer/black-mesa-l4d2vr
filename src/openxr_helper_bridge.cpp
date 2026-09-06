@@ -290,6 +290,8 @@ OpenXrHelperLaunchConfig L4D2VR_ReadOpenXrHelperLaunchConfig()
         config.swapGameEyeOrigins = ParseBool(value, config.swapGameEyeOrigins);
     if (const std::string value = get("OpenXRHelperDisableQuadOverlays"); !value.empty())
         config.disableQuadOverlays = ParseBool(value, config.disableQuadOverlays);
+    if (const std::string value = get("OpenXRHelperHandTracking"); !value.empty())
+        config.enableHandTracking = ParseBool(value, config.enableHandTracking);
     if (const std::string value = get("OpenXRHelperSubmitTestFrames"); !value.empty())
         config.submitTestFrames = ParseUint(value, config.submitTestFrames, 0, 1000000);
     if (const std::string value = get("OpenXRHelperWaitReadySeconds"); !value.empty())
@@ -411,6 +413,7 @@ bool L4D2VR_StartOpenXrHelper(const OpenXrHelperLaunchConfig& config)
         << L" --force-mono-projection-view " << config.forceMonoProjectionView
         << L" --flip-submit-y " << config.flipSubmitY
         << L" --disable-quad-overlays " << (config.disableQuadOverlays ? 1 : 0)
+        << L" --enable-hand-tracking " << (config.enableHandTracking ? 1 : 0)
         << L" --log " << QuoteArg(helperLog);
 
     std::wstring commandLineText = commandLine.str();
@@ -534,6 +537,20 @@ bool L4D2VR_ReadOpenXrHelperSubmittedFrames(uint32_t& submittedFrames)
     return true;
 }
 
+bool L4D2VR_ReadOpenXrHelperConsumedFrame(uint32_t& consuming, uint32_t& consumed, uint32_t& consumedCount)
+{
+    std::lock_guard<std::mutex> lock(g_OpenXrBridgeStateMutex);
+    const L4D2VROpenXrBridgeState* state = g_OpenXrBridgeState;
+    if (!state)
+        return false;
+
+    consuming = state->helperConsumingFrameId;
+    consumed = state->helperConsumedFrameId;
+    consumedCount = state->helperConsumedCount;
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return true;
+}
+
 bool L4D2VR_ReadOpenXrHmdPose(L4D2VROpenXrPoseDesc& pose, uint32_t* generation)
 {
     std::lock_guard<std::mutex> lock(g_OpenXrBridgeStateMutex);
@@ -579,6 +596,48 @@ bool L4D2VR_ReadOpenXrRuntimeViewConfig(L4D2VROpenXrRuntimeViewConfigDesc& confi
         if (gen0 == gen1 && !(gen1 & 1u) && snapshot.valid)
         {
             config = snapshot;
+            if (generation)
+                *generation = gen1;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool L4D2VR_PeekOpenXrVisibilityMaskGeneration(uint32_t* generation)
+{
+    std::lock_guard<std::mutex> lock(g_OpenXrBridgeStateMutex);
+    const L4D2VROpenXrBridgeState* state = g_OpenXrBridgeState;
+    if (!state || !generation)
+        return false;
+
+    const uint32_t gen = state->visibilityMaskGeneration;
+    if (gen == 0 || (gen & 1u))
+        return false;
+
+    *generation = gen;
+    return true;
+}
+
+bool L4D2VR_ReadOpenXrVisibilityMask(L4D2VROpenXrVisibilityMaskDesc& mask, uint32_t* generation)
+{
+    std::lock_guard<std::mutex> lock(g_OpenXrBridgeStateMutex);
+    const L4D2VROpenXrBridgeState* state = g_OpenXrBridgeState;
+    if (!state)
+        return false;
+
+    for (int attempt = 0; attempt < 3; ++attempt)
+    {
+        const uint32_t gen0 = state->visibilityMaskGeneration;
+        if (gen0 == 0 || (gen0 & 1u))
+            continue;
+
+        L4D2VROpenXrVisibilityMaskDesc snapshot = state->visibilityMask;
+        const uint32_t gen1 = state->visibilityMaskGeneration;
+        if (gen0 == gen1 && !(gen1 & 1u) && snapshot.valid)
+        {
+            mask = snapshot;
             if (generation)
                 *generation = gen1;
             return true;

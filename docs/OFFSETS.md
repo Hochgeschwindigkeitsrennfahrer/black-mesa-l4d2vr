@@ -8,6 +8,9 @@ Install: `C:\Program Files (x86)\Steam\steamapps\common\Black Mesa`
 | g_pClientMode | client.dll | `0x16AD56` | MATCH | `0x16AD56` |
 | CreateMove | client.dll | `0x110310` | MATCH | `0x110310` |
 | m_hMyWeapons | client.dll | `0xEE4` | MATCH | `DT_BaseCombatCharacter` RecvTable `FUN_100a3de0`, count `0x30`. `m_hActiveWeapon` at `0xFA4`. |
+| m_hUseEntity | client.dll | `0x1344` | MATCH | `DT_BasePlayer` RecvTable `FUN_100b6a00`. Held pickup / use target. |
+| Grab hold origin | server.dll | `0x77240` | MATCH | `CBasePlayer` vtable `+0x474` `FUN_10077240`. `CGrabController::UpdateObject` `FUN_10470da0` hold origin (not `Weapon_ShootPosition` `+0x23C`). Distance `2*radius+24`. |
+| Grab SetTargetPosition | server.dll | `0x470990` | MATCH | `CGrabController::SetTargetPosition` `FUN_10470990`. Final hold point after `2*radius+24`. |
 | CalcViewModelView | client.dll | `0x29D930` | MATCH | `0x29D930` |
 | AdjustEngineViewport | client.dll | `0x1102C0` | MATCH | `0x1102C0` |
 | LevelInit | client.dll | `0x110A80` | MATCH | `0x110A80` |

@@ -70,6 +70,9 @@ public:
     void* GetInterface(const char* dllname, const char* interfacename);
     C_BaseEntity* GetClientEntity(int entityIndex);
     C_BaseEntity* GetLocalPlayerEntity();
+    // Networked m_hUseEntity (DT_BasePlayer +0x1344). Null when not using /
+    // not holding a pickup.
+    C_BaseEntity* LocalPlayerUseEntity();
     C_BaseEntity* ResolveEntityFromHandle(uint32_t handle);
     C_BaseEntity* GetActiveWeaponEntity();
     C_BaseEntity* GetViewModelEntity();
@@ -95,6 +98,8 @@ public:
     bool WeaponHasNoAmmo(C_BaseEntity* weapon);
     const char* GetActiveWeaponModelName();
     const char* GetEntityModelName(C_BaseEntity* entity);
+    // Precache/load a client model by path. Null if the file is missing.
+    void* FindOrLoadModel(const char* name);
     const char* GetEntityNetworkName(int entityIndex);
     const char* GetEntityClientClassName(C_BaseEntity* entity);
     struct InventoryWeapon

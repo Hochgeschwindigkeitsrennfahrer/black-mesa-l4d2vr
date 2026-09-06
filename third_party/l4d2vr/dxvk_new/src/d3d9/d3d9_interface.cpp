@@ -408,6 +408,11 @@ namespace dxvk {
         if (helperConfig.enabled)
         {
           BootstrapOpenXrRecommendedSize(helperConfig);
+          // FullFrame is created during SetMode after this returns. Hook
+          // CreateNamedRT now so WorldRenderAtEyeSize can LITERAL-grow it.
+          // OpenVR already called InstallEarlyFramebufferHook below; OpenXR
+          // skipped that and left G2 world RTs at the HWND (worldMatch=0).
+          bmvr::InstallEarlyFramebufferHook();
           // OpenXR owns the SteamVR/OpenXR scene app. VR_Init(Scene) here after
           // a helper timeout started a second scene app, delayed load ~45s, and
           // the game closed at the main menu.

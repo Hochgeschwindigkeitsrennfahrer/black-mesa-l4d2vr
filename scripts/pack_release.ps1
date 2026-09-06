@@ -58,6 +58,12 @@ if (Test-Path $HandsSrc) {
   New-Item -ItemType Directory -Force -Path $HandsDst | Out-Null
   Copy-Item -Force (Join-Path $HandsSrc "*.glb") $HandsDst
 }
+$WheelSrc = Join-Path $VrSrc "weapon_wheel"
+if (Test-Path $WheelSrc) {
+  $WheelDst = Join-Path $VrDst "weapon_wheel"
+  New-Item -ItemType Directory -Force -Path $WheelDst | Out-Null
+  Copy-Item -Force (Join-Path $WheelSrc "*.vtf") $WheelDst
+}
 $HelperSrc = Join-Path $Root "build\Release\openxr_helper64"
 if (Test-Path (Join-Path $HelperSrc "OpenXRHelper64.exe")) {
   $HelperDst = Join-Path $VrDst "openxr_helper64"

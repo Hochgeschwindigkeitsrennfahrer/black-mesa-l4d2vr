@@ -85,6 +85,20 @@ public:
     // at +0x230. Bytes: 55 8B EC 8B 11 FF 75 08 FF 92 30 02 00 00.
     static constexpr int kCBasePlayer_Weapon_ShootPosition_Server = 0x11E490;
 
+    // server.dll CBasePlayer vtable +0x474 = FUN_10077240. CGrabController::
+    // UpdateObject (FUN_10470da0) uses this as the hold origin, not +0x23C.
+    // Bytes: 55 8B EC 83 EC 24 57 8B F9 8D 4D E8 6A 00 51 6A 00 8B 07 8B CF
+    // FF 90 4C 02 00 00. Hold distance is 2*radius + 24 (DAT_105db264).
+    static constexpr int kCBasePlayer_GrabHoldOrigin_Server = 0x77240;
+
+    // server.dll CGrabController::SetTargetPosition FUN_10470990.
+    // UpdateObject writes the hold point here after 2*radius+24. Bytes:
+    // 55 8B EC 8B 45 08 8B D1 D9 00 D9 5A 04. ret 8.
+    static constexpr int kCGrabController_SetTargetPosition = 0x470990;
+
+    // client.dll DT_BasePlayer RecvTable FUN_100b6a00: m_hUseEntity.
+    static constexpr int kCBasePlayer_hUseEntity = 0x1344;
+
     // server.dll CBlackMesaPlayer::GetShootAngles, vtable +0x240. Verified by
     // disassembling all 0x8C bytes at this RVA in the shipped server.dll: it
     // writes EyeAngles() (vtable +0x234) into the QAngle* stack arg, then adds
@@ -104,8 +118,11 @@ public:
 
     // IClientRenderable (entity+4) vtable: LookupAttachment +0x90, GetAttachment
     // origin/angles +0x98. Ghidra TAU Fire02 path (FUN_10234330).
+    // Source 2013 LookupAttachment is slot 35; BM is slot 36 (0x90/4). The extra
+    // method sits after GetRenderBoundsWorldspace (slot 21, +0x54).
     static constexpr int kIClientRenderable_LookupAttachment = 0x90;
     static constexpr int kIClientRenderable_GetAttachmentVec = 0x98;
+    static constexpr int kIClientRenderable_GetRenderBoundsWorldspace = 21;
 
     // client.dll CTauBeam first-person Fire02 particle path (FUN_10234330).
     // thiscall, 5 stack args, ret 0x14. Arg1 is six floats: start xyz + end xyz.
@@ -261,6 +278,11 @@ public:
     static constexpr int kIMatRenderContext_GetRenderTarget = 0x1C;
     static constexpr int kIMatRenderContext_PushRT6 = 0x23C;
     static constexpr int kIMatRenderContext_PopRT = 0x24C;
+    // IMatRenderContext::GetCallQueue. HL2VR/Source 2013 absolute slot 146.
+    // BM 6-arg PushRT is slot 143 vs Source 104 (~+39). Probe 146 and 185
+    // under SEH; do not call through the fake IMatRenderContext C++ vtable.
+    static constexpr int kIMatRenderContext_GetCallQueueSlotSource = 146;
+    static constexpr int kIMatRenderContext_GetCallQueueSlotBmShift = 185;
 
     // IMaterialSystem vtable is shifted vs L4D2 (GetBackBufferFormat returned a
     // pointer). Call these by RVA. BeginRT no-ops after startup unless
@@ -274,6 +296,10 @@ public:
     // 0x49600 which ends the shared prologue with `mov eax,[ecx]`.
     Offset CreateNamedRTEx{ "materialsystem.dll", 0x49660,
         "55 8B EC 83 B9 A0 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 0D" };
+    // CreateNamedRenderTargetTextureEx2 (Begin+Ex+End). Same args as Ex.
+    // Distinguishes from Ex at the `mov eax,[ecx]` vs `mov ecx,[imm]`.
+    Offset CreateNamedRTEx2{ "materialsystem.dll", 0x49600,
+        "55 8B EC 83 B9 A0 2A 00 00 00 75 14 68 ? ? ? ? FF 15 ? ? ? ? 83 C4 04 33 C0 5D C2 20 00 8B 01" };
     // CMaterialSystem vtable slot 30 (+0x78). Thunk: g_pShaderAPI +0x458.
     // Slot 31 (+0x7C) is NOT GetBackBufferFormat on BM (returns a pointer).
     Offset GetBackBufferDimensions{ "materialsystem.dll", 0x52d20,
@@ -315,6 +341,12 @@ public:
     static constexpr int kIMaterialSystem_FindTextureVt = 84; // +0x150
     // Dump slot 71 + 7 (same shift as FindTexture 77→84 / GetRenderContext 96→103).
     static constexpr int kIMaterialSystem_FindMaterialVt = 78; // +0x138
+    // FindMaterial 78, then First/Next/Invalid/Get/GetNum, FindTexture 84.
+    // No IsMaterialLoaded between FindMaterial and FirstMaterial (not dedicated).
+    static constexpr int kIMaterialSystem_FirstMaterialVt = 79;
+    static constexpr int kIMaterialSystem_NextMaterialVt = 80;
+    static constexpr int kIMaterialSystem_InvalidMaterialVt = 81;
+    static constexpr int kIMaterialSystem_GetMaterialVt = 82;
     static constexpr int kIMaterialSystem_SetRTFBOverrideVt = 142; // +0x238
     static constexpr int kIMaterialSystem_GetRTFBDimensionsVt = 143; // +0x23C
 

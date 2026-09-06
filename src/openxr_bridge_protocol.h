@@ -5,7 +5,11 @@
 #include <cstring>
 
 constexpr uint32_t L4D2VR_OPENXR_BRIDGE_MAGIC = 0x5258344Cu; // L4XR
-constexpr uint32_t L4D2VR_OPENXR_BRIDGE_VERSION = 12;
+constexpr uint32_t L4D2VR_OPENXR_BRIDGE_VERSION = 14;
+// 13: XR_KHR_visibility_mask hidden triangle list (NDC xy per eye).
+// 14: helperConsumingFrameId / helperConsumedFrameId (helper -> game blit
+//     progress; the game reuses a publish slot only once the helper's blit
+//     out of it has finished on the GPU).
 // L4D2VROpenXrRuntimeViewConfigDesc.reserved0: 0 = recommended size only
 // (CreateDevice), 1 = xrLocateViews FOV (InitOpenXR stereo fusion).
 constexpr uint32_t L4D2VR_OPENXR_RUNTIME_VIEW_SIZE_ONLY = 0;
@@ -238,6 +242,9 @@ struct L4D2VROpenXrOverlayDesc
 // reserved1 bits on L4D2VROpenXrPoseDesc. reserved0 is still the packed IPD
 // (0 means "unset" and must not be used for a real 0 mm IPD).
 constexpr uint32_t L4D2VR_OPENXR_POSE_FLAG_MONO = 1u << 0;
+// L4D2VROpenXrOverlayDesc.reserved1. HUD overlay uses texture alpha (HL2VR
+// IgnoreTextureAlpha=false). reserved0 stays the spatial-lock epoch.
+constexpr uint32_t L4D2VR_OPENXR_OVERLAY_FLAG_BLEND_ALPHA = 1u << 0;
 
 struct L4D2VROpenXrPoseDesc
 {
@@ -341,6 +348,28 @@ struct L4D2VROpenXrRuntimeViewConfigDesc
     L4D2VROpenXrRuntimeViewDesc views[L4D2VR_OPENXR_EYE_COUNT] = {};
 };
 
+// Hidden-area triangle list from XR_KHR_visibility_mask. Vertices are view
+// NDC (origin center, +X right, +Y up). vertexCount is a multiple of 3.
+constexpr uint32_t L4D2VR_OPENXR_VIS_MASK_MAX_VERTS = 3072;
+
+struct L4D2VROpenXrVisibilityMaskEyeDesc
+{
+    uint32_t valid = 0;
+    uint32_t vertexCount = 0;
+    uint32_t reserved0 = 0;
+    uint32_t reserved1 = 0;
+    float xy[L4D2VR_OPENXR_VIS_MASK_MAX_VERTS * 2] = {};
+};
+
+struct L4D2VROpenXrVisibilityMaskDesc
+{
+    uint32_t valid = 0;
+    uint32_t eyeCount = L4D2VR_OPENXR_EYE_COUNT;
+    uint32_t reserved0 = 0;
+    uint32_t reserved1 = 0;
+    L4D2VROpenXrVisibilityMaskEyeDesc eyes[L4D2VR_OPENXR_EYE_COUNT] = {};
+};
+
 struct L4D2VROpenXrBridgeState
 {
     uint32_t magic = L4D2VR_OPENXR_BRIDGE_MAGIC;
@@ -371,5 +400,17 @@ struct L4D2VROpenXrBridgeState
     uint32_t overlayFrameGeneration = 0;
     uint32_t overlayFrameId = 0;
     L4D2VROpenXrOverlayDesc overlays[L4D2VR_OPENXR_OVERLAY_COUNT] = {};
+    uint32_t visibilityMaskGeneration = 0;
+    L4D2VROpenXrVisibilityMaskDesc visibilityMask = {};
     char detail[256] = {};
+    // Helper -> game. sharedTextureFrameId the helper is blitting into its
+    // swapchain (written before the blit) and the one whose blit has finished
+    // (written after vkQueueWaitIdle). Single aligned words, release/acquire
+    // fenced. The frame id the helper reports is <= the frame of the pair it
+    // actually blitted (pair is re-read after the id), so gating a slot on
+    // helperConsumedFrameId >= slotFrameId is conservative.
+    uint32_t helperConsumingFrameId = 0;
+    uint32_t helperConsumedFrameId = 0;
+    uint32_t helperConsumedCount = 0;
+    uint32_t reservedTail0 = 0;
 };

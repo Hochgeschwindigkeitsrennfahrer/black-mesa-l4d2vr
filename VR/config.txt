@@ -32,14 +32,40 @@ RenderScale=1.0
 # true = proper 16:9 desktop at extra cost.
 DesktopLeftoverRender=false
 
-# Stereo vis: false (default) keeps PVS + r_occlusion. true restores the old
-# r_portalsopenall + r_occlusion 0 workaround if an eye latches skybox-only.
+# Stereo vis: false keeps PVS + r_occlusion + r_portalsopenall 0. true is
+# the old whole-map pair (occlusion off, portals open) — tanks FPS.
 ForceOpenVis=false
+
+# Hidden-area mesh early-Z. Off — OpenXR visibility-mask draw was a black
+# overlay on the world and did not improve FPS (2026-09-05). Do not retry.
+HiddenAreaMesh=false
+
+# Dummy-draw materials after a gameplay map load. Off — that path
+# null-called shaderapidx9 after the first stereo pair (2026-09-05).
+MaterialPredraw=false
 
 # CPU-wait GPU after the left-eye StretchRect from the shared backbuffer.
 # The stereo blit path always waits (same-image-both-eyes hazard). This key
 # is kept for the log / leftover fallback copy.
 StereoBlitGpuFlush=true
+
+# OpenXR helper path only. false: device idle + publish in the same Present
+# (pre-2026-09-06 pass). WMR motion smoothing can hide framedrops. true: D3D
+# event fence, no WaitDeviceIdle — higher fps, but the headset feels stuttery
+# because reprojection no longer gets a regular cadence. See
+# docs/performance-pass.md.
+OpenXrDeferredPublish=false
+# Extra ms a publish slot rests after the helper moved to a newer one. Safety
+# margin only: the helper now reports which frame it finished blitting and a
+# slot is never rewritten before that. 0-50.
+OpenXrSlotCoolingMs=4
+# How many eye copies may be in flight on the GPU before Present blocks on the
+# oldest one. 1 = CPU at most one frame ahead of the GPU: the pose sent with a
+# frame is at most one GPU frame old, reprojection has little to correct and
+# walking stays smooth in low-fps areas. 2-3 = more throughput, more latency
+# and judder (unbounded run-ahead measured at 2 frames on a 90Hz headset at
+# ~75fps: tearing while turning, stutter while walking). 1-3.
+OpenXrMaxPending=1
 
 # Portal 2 VR / L4D2VR right-stick look. Degrees per ms at full deflection.
 TurnSpeed=0.25
@@ -49,8 +75,9 @@ SnapTurnAngle=45.0
 # Fallback viewmodel pos if the per-weapon L4D2VR table has no match.
 # Per-weapon pos/ang (including crowbar 19.5,6,-13.5 / -24.5,-6.5,-6) are
 # applied in code. These are extra global tweaks on top.
-# Numpad (NumLock on): 4/6 Y, 8/2 Z, 7/9 X, Ctrl+those for angles,
-# 5 save to VR/viewmodel_offsets.txt, 0 reset this weapon, Shift = fine.
+# Numpad (NumLock on): 4/6 Y, 8/2 Z, 7/9 X (Source units on top of the
+# baked table). Ctrl+those = angles. 5 save to VR/viewmodel_offsets.txt,
+# 0 reset this weapon, Shift = fine. Ctrl+Numpad+/- still trims aim pitch.
 ViewmodelPosOffsetX=0.0
 ViewmodelPosOffsetY=0.0
 ViewmodelPosOffsetZ=0.0
@@ -96,6 +123,11 @@ OpenXRHelperFlipSubmitY=auto
 # auto = do not swap L/R images. SteamVR Quest fused without a swap; Link
 # duplication is not an L/R swap. true/false override.
 OpenXRHelperSwapProjectionEyes=auto
+
+# Articulated XR_EXT_hand_tracking (Quest/WMR bare-hand joints). Off by
+# default — that path is an unfinished remnant. Controller grip/aim + HEV
+# gloves stay on. Set true only to retry joint tracking.
+OpenXRHelperHandTracking=false
 
 # Compositor timing: true = L4D2VR app PostPresentHandoff (WaitGetPoses off the
 # Vulkan queue; ~90fps). false = runtime handoff (waiter WaitGetPoses ~110ms / ~20fps).

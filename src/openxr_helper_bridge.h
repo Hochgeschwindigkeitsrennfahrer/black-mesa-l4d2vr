@@ -13,6 +13,7 @@ struct OpenXrHelperLaunchConfig
     bool mirrorProjectionHorizontal = false;
     bool swapGameEyeOrigins = false;
     bool disableQuadOverlays = false;
+    bool enableHandTracking = false;
     bool disableProjectionLayer = false;
     bool useSymmetricProjectionFov = false;
     bool useGameRenderPoseForProjection = true;
@@ -31,8 +32,14 @@ bool L4D2VR_StartOpenXrHelper(const OpenXrHelperLaunchConfig& config);
 bool L4D2VR_OpenXrHelperBridgeIsStarted();
 bool L4D2VR_OpenXrHelperHasSubmittedFrame();
 bool L4D2VR_ReadOpenXrHelperSubmittedFrames(uint32_t& submittedFrames);
+// Helper blit progress (bridge v14): frame id being blitted and the last one
+// whose blit finished on the GPU, plus a count of finished blits. False when
+// the bridge is not mapped.
+bool L4D2VR_ReadOpenXrHelperConsumedFrame(uint32_t& consuming, uint32_t& consumed, uint32_t& consumedCount);
 bool L4D2VR_ReadOpenXrHmdPose(L4D2VROpenXrPoseDesc& pose, uint32_t* generation = nullptr);
 bool L4D2VR_ReadOpenXrRuntimeViewConfig(L4D2VROpenXrRuntimeViewConfigDesc& config, uint32_t* generation = nullptr);
+bool L4D2VR_PeekOpenXrVisibilityMaskGeneration(uint32_t* generation);
+bool L4D2VR_ReadOpenXrVisibilityMask(L4D2VROpenXrVisibilityMaskDesc& mask, uint32_t* generation = nullptr);
 bool L4D2VR_ReadOpenXrInputState(L4D2VROpenXrInputStateDesc& inputState, uint32_t* generation = nullptr);
 void L4D2VR_PublishOpenXrGameRenderPose(const L4D2VROpenXrPoseDesc& pose);
 void L4D2VR_PublishOpenXrHapticRequest(uint32_t handIndex, float durationSeconds, float frequency, float amplitude);

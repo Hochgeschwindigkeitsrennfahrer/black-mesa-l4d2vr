@@ -226,6 +226,14 @@ namespace dxvk {
       return D3D_OK;
     }
 
+    HRESULT STDMETHODCALLTYPE FlushCommands() {
+      // Same lock discipline as WaitDeviceIdle: the CS chunk is device-owned
+      // mutable state. Flush only; the CS thread submits asynchronously.
+      D3D9DeviceLock lock = m_device->LockDeviceExclusive();
+      m_device->Flush();
+      return D3D_OK;
+    }
+
   private:
 
     D3D9DeviceEx* m_device;

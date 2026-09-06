@@ -20,6 +20,33 @@ if ($running.Count -gt 0) {
   Start-Sleep -Seconds 2
 }
 
+# Killing bms.exe mid-stereo leaves bmvr_in_hmd_world.flag next to the DLL.
+# The next launch then skipped WorldRenderAtEyeSize (soft world + gun-nod).
+$flagDirs = @($GameRoot, $BinDir, $DxvkDir)
+$staleFlags = @(
+  'bmvr_in_hmd_world.flag',
+  'bmvr_in_hmd_offscreen.flag',
+  'bmvr_in_hl2vr_ham.flag',
+  'bmvr_in_hl2vr_pixelvis.flag',
+  'bmvr_in_hl2vr_predraw.flag',
+  'bmvr_in_hl2vr_playercull.flag',
+  'bmvr_in_hl2vr_proj.flag',
+  'bmvr_in_hl2vr_cproj.flag',
+  'bmvr_in_hl2vr_neye.flag',
+  'bmvr_in_stereo_vis.flag',
+  'bmvr_in_ctrl_vm.flag'
+)
+foreach ($dir in $flagDirs) {
+  if (-not (Test-Path $dir)) { continue }
+  foreach ($name in $staleFlags) {
+    $p = Join-Path $dir $name
+    if (Test-Path -LiteralPath $p) {
+      Remove-Item -LiteralPath $p -Force
+      Write-Host "Removed leftover $p"
+    }
+  }
+}
+
 if (-not (Test-Path $DxvkDir)) { throw "DXVK folder missing: $DxvkDir" }
 
 function Install-One([string]$DestDir) {
@@ -53,6 +80,39 @@ function Install-One([string]$DestDir) {
   Write-Host ("Installed {0} ({1} bytes)" -f $dest, $got)
 }
 
+# HL2VR physical crowbar (models + materials). Not vendored (~33MB of VTFs).
+function Install-Hl2vrCrowbar {
+  $hlvr = "C:\Program Files (x86)\Steam\steamapps\common\Half-Life 2 VR\hlvr"
+  $modelSrc = Join-Path $hlvr "models\weapons"
+  $matSrc = Join-Path $hlvr "materials\models\weapons\vr_crowbar"
+  $mdl = Join-Path $modelSrc "vr_crowbar.mdl"
+  if (-not (Test-Path -LiteralPath $mdl)) {
+    Write-Host "HL2VR vr_crowbar.mdl not found at $mdl - physical crowbar mesh skipped (swing logic still in the DLL)"
+    return
+  }
+  $bms = Join-Path $GameRoot "bms"
+  $modelDst = Join-Path $bms "models\weapons"
+  $matDst = Join-Path $bms "materials\models\weapons\vr_crowbar"
+  New-Item -ItemType Directory -Force -Path $modelDst | Out-Null
+  Copy-Item -Force (Join-Path $modelSrc "vr_crowbar.*") $modelDst
+  New-Item -ItemType Directory -Force -Path $matDst | Out-Null
+  Get-ChildItem -LiteralPath $matSrc -File | Copy-Item -Force -Destination $matDst
+  $legacySrc = Join-Path $matSrc "legacy"
+  if (Test-Path -LiteralPath $legacySrc) {
+    $legacyDst = Join-Path $matDst "legacy"
+    New-Item -ItemType Directory -Force -Path $legacyDst | Out-Null
+    Get-ChildItem -LiteralPath $legacySrc -File | Copy-Item -Force -Destination $legacyDst
+  }
+  $copiedMdl = Join-Path $modelDst "vr_crowbar.mdl"
+  if (-not (Test-Path -LiteralPath $copiedMdl)) {
+    throw "Failed to copy vr_crowbar.mdl to $modelDst"
+  }
+  $mdlBytes = (Get-Item -LiteralPath $copiedMdl).Length
+  Write-Host "Installed HL2VR vr_crowbar into $copiedMdl ($mdlBytes bytes)"
+}
+
+Install-Hl2vrCrowbar
+
 # 1) Launcher DXVK folder (AddDllDirectory / optional full-path LoadLibraryW)
 Install-One $DxvkDir
 # 2) bin\ — shaderapidx9 LoadLibrary("d3d9.dll") with USER_DIRS; bin is added before the game root
@@ -67,6 +127,27 @@ foreach ($dir in @($GameRoot, $BinDir, $DxvkDir)) {
   if (Test-Path -LiteralPath $flag) {
     Remove-Item -LiteralPath $flag -Force
     Write-Host "Removed $flag"
+  }
+}
+
+# Overlay death false-banned controller tracking (no hands / wrist HUD).
+foreach ($skip in @((Join-Path $GameRoot "bmvr_skip.txt"), (Join-Path $BinDir "bmvr_skip.txt"), (Join-Path $DxvkDir "bmvr_skip.txt"))) {
+  if (-not (Test-Path -LiteralPath $skip)) { continue }
+  $text = Get-Content -LiteralPath $skip -Raw
+  $new = [regex]::Replace($text, '(?m)^ctrl_pose\r?\n', '')
+  $new = [regex]::Replace($new, '(?m)^ctrl_vm\r?\n', '')
+  $new = [regex]::Replace($new, '(?m)^vr_gloves\r?\n', '')
+  $new = [regex]::Replace($new, '(?m)^hand_overlay\r?\n', '')
+  $new = [regex]::Replace($new, '(?m)^hl2vr_playercull\r?\n', '')
+  $new = [regex]::Replace($new, '(?m)^hl2vr_pixelvis\r?\n', '')
+  $new = [regex]::Replace($new, '(?m)^hl2vr_ham\r?\n', '')
+  $new = [regex]::Replace($new, '(?m)^hl2vr_proj\r?\n', '')
+  $new = [regex]::Replace($new, '(?m)^hl2vr_cproj\r?\n', '')
+  $new = [regex]::Replace($new, '(?m)^hl2vr_neye\r?\n', '')
+  $new = [regex]::Replace($new, '(?m)^hmd_world\r?\n', '')
+  if ($new -ne $text) {
+    Set-Content -LiteralPath $skip -Value $new -Encoding ASCII -NoNewline
+    Write-Host "Removed false-ban ctrl_pose/ctrl_vm/vr_gloves/hand_overlay/hl2vr_playercull/hl2vr_pixelvis/hl2vr_ham/hmd_world from $skip"
   }
 }
 
@@ -100,6 +181,13 @@ if (Test-Path $HandsSrc) {
   New-Item -ItemType Directory -Force -Path $HandsDst | Out-Null
   Copy-Item -Force (Join-Path $HandsSrc "*.glb") $HandsDst
   Write-Host "Installed hand GLBs to $HandsDst"
+}
+$WheelSrc = Join-Path $VrSrc "weapon_wheel"
+$WheelDst = Join-Path $VrDst "weapon_wheel"
+if (Test-Path $WheelSrc) {
+  New-Item -ItemType Directory -Force -Path $WheelDst | Out-Null
+  Copy-Item -Force (Join-Path $WheelSrc "*.vtf") $WheelDst
+  Write-Host "Installed HL2VR radial-menu textures to $WheelDst"
 }
 $OffSrc = Join-Path $VrSrc "viewmodel_offsets.txt"
 $OffDst = Join-Path $VrDst "viewmodel_offsets.txt"
@@ -145,24 +233,34 @@ if (-not (Test-Path $CfgDst)) {
   if ($cfgText -notmatch '(?m)^ScopeZoomSmoothSec=') { $cfgText += "`r`nScopeZoomSmoothSec=0.16`r`n" }
   if ($cfgText -notmatch '(?m)^DesktopLeftoverRender=') { $cfgText += "`r`nDesktopLeftoverRender=false`r`n" }
   if ($cfgText -notmatch '(?m)^ForceOpenVis=') { $cfgText += "`r`nForceOpenVis=false`r`n" }
+  if ($cfgText -notmatch '(?m)^HiddenAreaMesh=') { $cfgText += "`r`nHiddenAreaMesh=false`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^HiddenAreaMesh=.*$', 'HiddenAreaMesh=false')
+  if ($cfgText -notmatch '(?m)^MaterialPredraw=') { $cfgText += "`r`nMaterialPredraw=false`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^MaterialPredraw=.*$', 'MaterialPredraw=false')
   if ($cfgText -notmatch '(?m)^StereoBlitGpuFlush=') { $cfgText += "`r`nStereoBlitGpuFlush=false`r`n" }
+  # 2026-09-06: deferred publish raised fps but broke WMR smoothing. Force false.
+  if ($cfgText -notmatch '(?m)^OpenXrDeferredPublish=') { $cfgText += "`r`nOpenXrDeferredPublish=false`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^OpenXrDeferredPublish=.*$', 'OpenXrDeferredPublish=false')
+  if ($cfgText -notmatch '(?m)^OpenXrSlotCoolingMs=') { $cfgText += "`r`nOpenXrSlotCoolingMs=4`r`n" }
+  if ($cfgText -notmatch '(?m)^OpenXrMaxPending=') { $cfgText += "`r`nOpenXrMaxPending=1`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^VRRuntimeBackend=(hl2vr|openvrhl2vr|hl2vropenvr|steamvrhl2vr)\s*$', 'VRRuntimeBackend=openxr')
   if ($cfgText -notmatch '(?m)^VRRuntimeBackend=') { $cfgText += "`r`nVRRuntimeBackend=openxr`r`n" }
   if ($cfgText -notmatch '(?m)^OpenXRHelper=') { $cfgText += "`r`nOpenXRHelper=true`r`n" }
   if ($cfgText -notmatch '(?m)^OpenXRHelperSubmitTestFrames=') { $cfgText += "`r`nOpenXRHelperSubmitTestFrames=0`r`n" }
   if ($cfgText -notmatch '(?m)^OpenXRHelperWaitReadySeconds=') { $cfgText += "`r`nOpenXRHelperWaitReadySeconds=45`r`n" }
   if ($cfgText -notmatch '(?m)^OpenXRHelperUseGameRenderPoseForProjection=') { $cfgText += "`r`nOpenXRHelperUseGameRenderPoseForProjection=true`r`n" }
   $cfgText = [regex]::Replace($cfgText, '(?m)^OpenXRHelperUseGameRenderPoseForProjection=.*$', 'OpenXRHelperUseGameRenderPoseForProjection=true')
-  # Do not overwrite a user false — that is the revert switch.
+  if ($cfgText -notmatch '(?m)^OpenXRHelperHandTracking=') { $cfgText += "`r`nOpenXRHelperHandTracking=false`r`n" }
+  # GitHub default: world RTs at one eye. Do not overwrite a user false.
   if ($cfgText -notmatch '(?m)^WorldRenderAtEyeSize=') { $cfgText += "`r`nWorldRenderAtEyeSize=true`r`n" }
+  $cfgText = [regex]::Replace($cfgText, '(?m)^WorldRenderAtEyeSize=.*$', 'WorldRenderAtEyeSize=true')
   $cfgText = [regex]::Replace($cfgText, '(?m)^Roomscale1To1.*\r?\n', '')
   Set-Content -LiteralPath $CfgDst -Value $cfgText -Encoding ASCII -NoNewline
   Write-Host "Updated HudDistance/HudSize/ViewmodelScale/CompositorPostPresentHandoff/gloves/wrist HUD/OpenXR in $CfgDst"
-  if ($cfgText -match '(?m)^WorldRenderAtEyeSize=true') {
-    Write-Host "WorldRenderAtEyeSize=true (world at eye size). Set false in VR\config.txt and restart to revert."
-  }
+  Write-Host "WorldRenderAtEyeSize=true (world at eye size, same as github.com/.../black-mesa-vr)."
 }
 Write-Host "Installed SteamVR bindings to $ManifestDst"
-Write-Host "If SteamVR still has X=Flashlight or old jump/crouch, restore BMVR defaults (v3: Y=next, X=prev, right grip=flashlight)."
+Write-Host "If SteamVR still has old face-button bindings, restore BMVR defaults (v4: left trigger=use, B=alt-fire, A=reload, Y=menu)."
 
 $CfgGame = Join-Path $GameRoot "bms\cfg"
 if (-not (Test-Path $CfgGame)) { throw "Missing $CfgGame" }

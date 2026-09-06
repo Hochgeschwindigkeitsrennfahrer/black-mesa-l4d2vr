@@ -113,6 +113,7 @@ namespace
         bool swapProjectionViewOrder = false;
         bool mirrorProjectionHorizontal = false;
         bool disableQuadOverlays = false;
+        bool enableHandTracking = false;
         bool disableProjectionLayer = false;
         bool useSymmetricProjectionFov = false;
         bool useGameRenderPoseForProjection = false;
@@ -720,6 +721,12 @@ namespace
                 if (ParseUintArg(value, enabled))
                     options.disableQuadOverlays = enabled != 0;
             }
+            else if (const wchar_t* value = needsValue(L"--enable-hand-tracking"))
+            {
+                uint32_t enabled = 0;
+                if (ParseUintArg(value, enabled))
+                    options.enableHandTracking = enabled != 0;
+            }
             else if (const wchar_t* value = needsValue(L"--disable-projection-layer"))
             {
                 uint32_t enabled = 0;
@@ -1098,6 +1105,7 @@ namespace
         PFN_xrCreateHandTrackerEXT xrCreateHandTrackerEXT = nullptr;
         PFN_xrDestroyHandTrackerEXT xrDestroyHandTrackerEXT = nullptr;
         PFN_xrLocateHandJointsEXT xrLocateHandJointsEXT = nullptr;
+        PFN_xrGetVisibilityMaskKHR xrGetVisibilityMaskKHR = nullptr;
     };
 
     struct EyeSwapchain
@@ -1267,6 +1275,10 @@ namespace
         PFN_vkEndCommandBuffer vkEndCommandBuffer = nullptr;
         PFN_vkQueueSubmit vkQueueSubmit = nullptr;
         PFN_vkQueueWaitIdle vkQueueWaitIdle = nullptr;
+        PFN_vkCreateFence vkCreateFence = nullptr;
+        PFN_vkDestroyFence vkDestroyFence = nullptr;
+        PFN_vkWaitForFences vkWaitForFences = nullptr;
+        PFN_vkResetFences vkResetFences = nullptr;
         PFN_vkCreateImage vkCreateImage = nullptr;
         PFN_vkDestroyImage vkDestroyImage = nullptr;
         PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements = nullptr;
@@ -1573,6 +1585,17 @@ namespace
             m_State->heartbeatTickMs = GetTickCount64();
         }
 
+        void PublishVisibilityMask(const L4D2VROpenXrVisibilityMaskDesc& mask)
+        {
+            if (!m_State)
+                return;
+
+            ++m_State->visibilityMaskGeneration;
+            m_State->visibilityMask = mask;
+            ++m_State->visibilityMaskGeneration;
+            m_State->heartbeatTickMs = GetTickCount64();
+        }
+
         void PublishInputState(const L4D2VROpenXrInputStateDesc& inputState)
         {
             if (!m_State || !inputState.valid)
@@ -1582,6 +1605,30 @@ namespace
             m_State->inputState = inputState;
             ++m_State->inputStateGeneration;
             m_State->heartbeatTickMs = GetTickCount64();
+        }
+
+        // Blit progress for the game's publish-slot reuse. The game must not
+        // overwrite a slot until the blit out of it has finished on the GPU;
+        // a timer on its side cannot know that when our queue is stuck behind
+        // the game's own work (tearing in GPU-bound areas, 2026-09-06).
+        void NoteConsumingFrame(uint32_t frameId)
+        {
+            if (!m_State)
+                return;
+            m_State->helperConsumingFrameId = frameId;
+            std::atomic_thread_fence(std::memory_order_release);
+        }
+
+        void NoteConsumedFrame(uint32_t frameId)
+        {
+            if (!m_State)
+                return;
+            // Written after both eye blits have vkQueueWaitIdle'd: the
+            // swapchain has the pixels and the shared images can be rewritten.
+            std::atomic_thread_fence(std::memory_order_release);
+            m_State->helperConsumedFrameId = frameId;
+            ++m_State->helperConsumedCount;
+            std::atomic_thread_fence(std::memory_order_release);
         }
 
         bool ReadHapticRequest(uint32_t handIndex, L4D2VROpenXrHapticRequestDesc& request) const
@@ -1946,6 +1993,135 @@ namespace
         }
     }
 
+    void LoadOpenXrOptionalVisibilityMaskFunctions(XrDispatch& xr, XrInstance instance, Logger& log, bool visibilityMaskEnabled)
+    {
+        if (!visibilityMaskEnabled)
+            return;
+
+        if (!TryLoadXrFunction(xr.xrGetInstanceProcAddr, instance, "xrGetVisibilityMaskKHR", xr.xrGetVisibilityMaskKHR))
+        {
+            xr.xrGetVisibilityMaskKHR = nullptr;
+            log.Print("XR_KHR_visibility_mask enabled but xrGetVisibilityMaskKHR was unavailable");
+        }
+    }
+
+    bool FetchHiddenVisibilityMaskEye(
+        XrDispatch& xr,
+        XrSession session,
+        uint32_t viewIndex,
+        L4D2VROpenXrVisibilityMaskEyeDesc& out,
+        Logger& log)
+    {
+        out = {};
+        if (!xr.xrGetVisibilityMaskKHR || session == XR_NULL_HANDLE)
+            return false;
+
+        XrVisibilityMaskKHR mask{ XR_TYPE_VISIBILITY_MASK_KHR };
+        XrResult result = xr.xrGetVisibilityMaskKHR(
+            session,
+            XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+            viewIndex,
+            XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR,
+            &mask);
+        if (XR_FAILED(result))
+        {
+            log.Print(
+                "xrGetVisibilityMaskKHR(view=%u count) failed: %s (%d)",
+                viewIndex,
+                XrResultName(result),
+                static_cast<int>(result));
+            return false;
+        }
+        if (mask.vertexCountOutput == 0)
+            return false;
+
+        std::vector<XrVector2f> vertices(mask.vertexCountOutput);
+        std::vector<uint32_t> indices(mask.indexCountOutput);
+        mask.vertexCapacityInput = mask.vertexCountOutput;
+        mask.indexCapacityInput = mask.indexCountOutput;
+        mask.vertices = vertices.data();
+        mask.indices = indices.empty() ? nullptr : indices.data();
+
+        result = xr.xrGetVisibilityMaskKHR(
+            session,
+            XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+            viewIndex,
+            XR_VISIBILITY_MASK_TYPE_HIDDEN_TRIANGLE_MESH_KHR,
+            &mask);
+        if (XR_FAILED(result))
+        {
+            log.Print(
+                "xrGetVisibilityMaskKHR(view=%u data) failed: %s (%d)",
+                viewIndex,
+                XrResultName(result),
+                static_cast<int>(result));
+            return false;
+        }
+
+        uint32_t outCount = 0;
+        const auto appendVert = [&](const XrVector2f& v)
+        {
+            if (outCount >= L4D2VR_OPENXR_VIS_MASK_MAX_VERTS)
+                return false;
+            out.xy[outCount * 2] = v.x;
+            out.xy[outCount * 2 + 1] = v.y;
+            ++outCount;
+            return true;
+        };
+
+        if (mask.indexCountOutput >= 3 && !indices.empty())
+        {
+            const uint32_t triCount = mask.indexCountOutput / 3u;
+            for (uint32_t t = 0; t < triCount; ++t)
+            {
+                const uint32_t i0 = indices[t * 3u];
+                const uint32_t i1 = indices[t * 3u + 1u];
+                const uint32_t i2 = indices[t * 3u + 2u];
+                if (i0 >= mask.vertexCountOutput || i1 >= mask.vertexCountOutput || i2 >= mask.vertexCountOutput)
+                    continue;
+                if (outCount + 3u > L4D2VR_OPENXR_VIS_MASK_MAX_VERTS)
+                    break;
+                appendVert(vertices[i0]);
+                appendVert(vertices[i1]);
+                appendVert(vertices[i2]);
+            }
+        }
+        else
+        {
+            const uint32_t usable = mask.vertexCountOutput - (mask.vertexCountOutput % 3u);
+            for (uint32_t i = 0; i < usable; ++i)
+            {
+                if (!appendVert(vertices[i]))
+                    break;
+            }
+        }
+
+        out.vertexCount = outCount - (outCount % 3u);
+        out.valid = out.vertexCount >= 3u ? 1u : 0u;
+        log.Print(
+            "XR_KHR_visibility_mask view=%u vertsIn=%u idx=%u published=%u",
+            viewIndex,
+            mask.vertexCountOutput,
+            mask.indexCountOutput,
+            out.vertexCount);
+        return out.valid != 0;
+    }
+
+    bool FetchHiddenVisibilityMask(
+        XrDispatch& xr,
+        XrSession session,
+        L4D2VROpenXrVisibilityMaskDesc& out,
+        Logger& log)
+    {
+        out = {};
+        out.eyeCount = L4D2VR_OPENXR_EYE_COUNT;
+        bool any = false;
+        for (uint32_t view = 0; view < L4D2VR_OPENXR_EYE_COUNT; ++view)
+            any |= FetchHiddenVisibilityMaskEye(xr, session, view, out.eyes[view], log);
+        out.valid = any ? 1u : 0u;
+        return any;
+    }
+
     class OpenXrInputBridge
     {
     public:
@@ -1991,7 +2167,7 @@ namespace
         }
 
         static const std::array<BooleanActionDef, 31>& BooleanDefs();
-        static const std::array<BooleanActionDef, 3>& ExtraBooleanDefs();
+        static const std::array<BooleanActionDef, 4>& ExtraBooleanDefs();
         static const std::array<FloatDigitalActionDef, 4>& FloatDigitalDefs();
         static const std::array<AnalogActionDef, 2>& AnalogDefs();
 
@@ -4344,7 +4520,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         {{
             { L4D2VROpenXrActionId::ActivateVR, "activate_vr", "Activate VR" },
             { L4D2VROpenXrActionId::Jump, "jump", "Jump" },
-            { L4D2VROpenXrActionId::Use, "use", "Use" },
+            { L4D2VROpenXrActionId::SecondaryAttack, "secondary_attack", "Secondary Attack" },
             { L4D2VROpenXrActionId::Teleport, "teleport", "Teleport" },
             { L4D2VROpenXrActionId::NextItem, "next_item", "Next Item" },
             { L4D2VROpenXrActionId::PrevItem, "prev_item", "Previous Item" },
@@ -4377,13 +4553,15 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         return defs;
     }
 
-    const std::array<OpenXrInputBridge::BooleanActionDef, 3>& OpenXrInputBridge::ExtraBooleanDefs()
+    const std::array<OpenXrInputBridge::BooleanActionDef, 4>& OpenXrInputBridge::ExtraBooleanDefs()
     {
-        static const std::array<BooleanActionDef, 3> defs =
+        static const std::array<BooleanActionDef, 4> defs =
         {{
             { L4D2VROpenXrActionId::CustomAction3, "custom_action_3", "Custom Action 3" },
             { L4D2VROpenXrActionId::CustomAction4, "custom_action_4", "Custom Action 4" },
             { L4D2VROpenXrActionId::CustomAction5, "custom_action_5", "Custom Action 5" },
+            // Face-button reload (A). Left grip is not Reload.
+            { L4D2VROpenXrActionId::Reload, "reload_button", "Reload Button" },
         }};
         return defs;
     }
@@ -4393,7 +4571,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         static const std::array<FloatDigitalActionDef, 4> defs =
         {{
             { L4D2VROpenXrActionId::PrimaryAttack, "primary_attack", "Primary Attack", 0.45f },
-            { L4D2VROpenXrActionId::SecondaryAttack, "secondary_attack", "Secondary Attack", 0.45f },
+            { L4D2VROpenXrActionId::Use, "use", "Use", 0.45f },
             { L4D2VROpenXrActionId::Reload, "reload", "Reload", 0.45f },
             { L4D2VROpenXrActionId::Flashlight, "flashlight_value", "Flashlight Grip", 0.55f },
         }};
@@ -4651,35 +4829,32 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::InventoryQuickSwitch)], (rightStick + "/click").c_str());
 
         AddBinding(b, m_FloatDigitalActions[Index(L4D2VROpenXrActionId::PrimaryAttack)], "/user/hand/right/input/trigger/value");
-        AddBinding(b, m_FloatDigitalActions[Index(L4D2VROpenXrActionId::SecondaryAttack)], "/user/hand/left/input/trigger/value");
+        AddBinding(b, m_FloatDigitalActions[Index(L4D2VROpenXrActionId::Use)], "/user/hand/left/input/trigger/value");
     }
 
     void OpenXrInputBridge::AddGripValueBindings(
         std::vector<XrActionSuggestedBinding>& b,
         const char* gripValueName)
     {
-        const std::string leftGripValue = std::string("/user/hand/left/input/") + gripValueName;
         const std::string rightGripValue = std::string("/user/hand/right/input/") + gripValueName;
-        AddBinding(b, m_FloatDigitalActions[Index(L4D2VROpenXrActionId::Reload)], leftGripValue.c_str());
         AddBinding(b, m_FloatDigitalActions[Index(L4D2VROpenXrActionId::Flashlight)], rightGripValue.c_str());
     }
 
     void OpenXrInputBridge::AddTouchFaceButtonBindings(std::vector<XrActionSuggestedBinding>& b)
     {
-        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::Use)], "/user/hand/right/input/b/click");
-        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::ActivateVR)], "/user/hand/right/input/a/click");
+        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::SecondaryAttack)], "/user/hand/right/input/b/click");
+        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::Reload)], "/user/hand/right/input/a/click");
         AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::MenuSelect)], "/user/hand/right/input/a/click");
         AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::MenuBack)], "/user/hand/right/input/b/click");
         AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::PrevItem)], "/user/hand/left/input/x/click");
-        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::NextItem)], "/user/hand/left/input/y/click");
+        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::Pause)], "/user/hand/left/input/y/click");
         AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::Pause)], "/user/hand/left/input/menu/click");
     }
 
     void OpenXrInputBridge::AddIndexFaceButtonBindings(std::vector<XrActionSuggestedBinding>& b)
     {
-        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::Use)], "/user/hand/right/input/b/click");
-        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::ActivateVR)], "/user/hand/right/input/a/click");
-        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::Jump)], "/user/hand/right/input/a/click");
+        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::SecondaryAttack)], "/user/hand/right/input/b/click");
+        AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::Reload)], "/user/hand/right/input/a/click");
         AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::MenuSelect)], "/user/hand/right/input/a/click");
         AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::MenuBack)], "/user/hand/right/input/b/click");
         AddBinding(b, m_BooleanActions[Index(L4D2VROpenXrActionId::Scoreboard)], "/user/hand/left/input/a/click");
@@ -5020,12 +5195,15 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             {
                 const float value = std::clamp(state.currentState, 0.0f, 1.0f);
                 const bool down = value >= def.threshold;
-                outState.digitalActions[i].active = 1;
-                outState.digitalActions[i].state = down ? 1u : 0u;
-                outState.digitalActions[i].changed =
-                    ((m_FloatDigitalInitialized[i] && m_FloatDigitalDown[i] != down) ||
-                        state.changedSinceLastSync) ? 1u : 0u;
-                outState.digitalActions[i].lastChangeTime = static_cast<int64_t>(state.lastChangeTime);
+                L4D2VROpenXrDigitalActionDesc& digital = outState.digitalActions[i];
+                const bool prevDown = digital.active && digital.state != 0;
+                const bool combined = prevDown || down;
+                digital.active = 1;
+                digital.state = combined ? 1u : 0u;
+                digital.changed =
+                    ((m_FloatDigitalInitialized[i] && m_FloatDigitalDown[i] != combined) ||
+                        state.changedSinceLastSync || prevDown != combined) ? 1u : 0u;
+                digital.lastChangeTime = static_cast<int64_t>(state.lastChangeTime);
                 // Also expose the undigitised value. Only Walk and Turn are
                 // declared analog, so these slots were unused, and the game
                 // needs the continuous trigger/grip pull to animate fingers:
@@ -5037,7 +5215,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 outState.analogActions[i].y = 0.0f;
                 m_FloatDigitalActive[i] = true;
                 m_FloatDigitalValues[i] = value;
-                m_FloatDigitalDown[i] = down;
+                m_FloatDigitalDown[i] = combined;
                 m_FloatDigitalInitialized[i] = true;
             }
         }
@@ -5137,7 +5315,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
         synthesizeHand(
             L4D2VR_OPENXR_HAND_LEFT,
-            L4D2VROpenXrActionId::SecondaryAttack,
+            L4D2VROpenXrActionId::Use,
             L4D2VROpenXrActionId::Reload);
         synthesizeHand(
             L4D2VR_OPENXR_HAND_RIGHT,
@@ -5392,6 +5570,7 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         {
             m_FlipSubmitYOption = options.flipSubmitY;
             m_SwapProjectionEyesOption = options.swapProjectionEyes;
+            m_WantHandTracking = options.enableHandTracking;
             m_Bridge.Open(options.mappingName, m_Log);
             m_ParentProcess = OpenParentProcess(options.parentPid);
 
@@ -5529,12 +5708,15 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
             bool hasVulkan = false;
             bool hasHandTracking = false;
+            bool hasVisibilityMask = false;
             for (const XrExtensionProperties& extension : extensions)
             {
                 if (std::strcmp(extension.extensionName, XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) == 0)
                     hasVulkan = true;
                 if (std::strcmp(extension.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0)
                     hasHandTracking = true;
+                if (std::strcmp(extension.extensionName, XR_KHR_VISIBILITY_MASK_EXTENSION_NAME) == 0)
+                    hasVisibilityMask = true;
             }
 
             if (!hasVulkan)
@@ -5545,10 +5727,23 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
 
             std::vector<const char*> enabledExtensions;
             enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
-            if (hasHandTracking)
+            if (hasHandTracking && m_WantHandTracking)
             {
                 enabledExtensions.push_back(XR_EXT_HAND_TRACKING_EXTENSION_NAME);
                 m_HandTrackingExtensionEnabled = true;
+            }
+            else if (hasHandTracking)
+            {
+                m_Log.Print("OpenXR hand tracking extension present but disabled (OpenXRHelperHandTracking=false)");
+            }
+            if (hasVisibilityMask)
+            {
+                enabledExtensions.push_back(XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
+                m_VisibilityMaskExtensionEnabled = true;
+            }
+            else
+            {
+                m_Log.Print("%s is not supported by the active runtime", XR_KHR_VISIBILITY_MASK_EXTENSION_NAME);
             }
 
             XrInstanceCreateInfo createInfo{ XR_TYPE_INSTANCE_CREATE_INFO };
@@ -5564,9 +5759,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             if (!Succeeded(m_Log, "xrCreateInstance(Vulkan)", result) || m_Instance == XR_NULL_HANDLE)
                 return false;
 
-            m_Log.Print("Created OpenXR instance with %s handTracking=%u",
+            m_Log.Print("Created OpenXR instance with %s handTracking=%u visibilityMask=%u",
                 XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
-                m_HandTrackingExtensionEnabled ? 1u : 0u);
+                m_HandTrackingExtensionEnabled ? 1u : 0u,
+                m_VisibilityMaskExtensionEnabled ? 1u : 0u);
             m_Bridge.Update(L4D2VROpenXrBridgeStatus::InstanceCreated, 0, 0, "OpenXR instance created");
             return true;
         }
@@ -5603,7 +5799,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 LoadXrFunction(m_Xr.xrGetInstanceProcAddr, m_Instance, "xrGetVulkanGraphicsRequirementsKHR", m_Xr.xrGetVulkanGraphicsRequirementsKHR, m_Log) &&
                 LoadOpenXrInputFunctions(m_Xr, m_Instance, m_Log);
             if (loaded)
+            {
                 LoadOpenXrOptionalHandTrackingFunctions(m_Xr, m_Instance, m_Log, m_HandTrackingExtensionEnabled);
+                LoadOpenXrOptionalVisibilityMaskFunctions(m_Xr, m_Instance, m_Log, m_VisibilityMaskExtensionEnabled);
+            }
             return loaded;
         }
 
@@ -6063,14 +6262,31 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 AddUniqueName(enabledDeviceExtensions, VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
             if (HasName(availableDeviceExtensions, VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME))
                 AddUniqueName(enabledDeviceExtensions, VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
+            // Our two eye blits per display frame share the GPU with the game's
+            // queue. Without a priority they execute behind whatever the game
+            // has queued (one to two frames when GPU-bound), so the blit lands
+            // late for xrEndFrame and the game cannot reuse the slot in time.
+            // HIGH does not need admin rights (REALTIME would). KHR and EXT
+            // share the sType / enum values.
+            const char* globalPriorityExt = nullptr;
+            if (HasName(availableDeviceExtensions, VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME))
+                globalPriorityExt = VK_KHR_GLOBAL_PRIORITY_EXTENSION_NAME;
+            else if (HasName(availableDeviceExtensions, VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME))
+                globalPriorityExt = VK_EXT_GLOBAL_PRIORITY_EXTENSION_NAME;
+            if (globalPriorityExt)
+                AddUniqueName(enabledDeviceExtensions, globalPriorityExt);
 
             const std::vector<const char*> deviceExtensionNames = MakeNamePointers(enabledDeviceExtensions);
             const float queuePriority = 1.0f;
+
+            VkDeviceQueueGlobalPriorityCreateInfoKHR globalPriorityInfo{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_GLOBAL_PRIORITY_CREATE_INFO_KHR };
+            globalPriorityInfo.globalPriority = VK_QUEUE_GLOBAL_PRIORITY_HIGH_KHR;
 
             VkDeviceQueueCreateInfo queueInfo{ VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO };
             queueInfo.queueFamilyIndex = m_GraphicsQueueFamily;
             queueInfo.queueCount = 1;
             queueInfo.pQueuePriorities = &queuePriority;
+            queueInfo.pNext = globalPriorityExt ? &globalPriorityInfo : nullptr;
 
             VkDeviceCreateInfo deviceInfo{ VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO };
             deviceInfo.queueCreateInfoCount = 1;
@@ -6079,11 +6295,25 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             deviceInfo.ppEnabledExtensionNames = deviceExtensionNames.empty() ? nullptr : deviceExtensionNames.data();
 
             vkResult = m_Vk.vkCreateDevice(m_PhysicalDevice, &deviceInfo, nullptr, &m_VkDevice);
+            bool highPriorityQueue = globalPriorityExt != nullptr;
+            if (globalPriorityExt && (vkResult != VK_SUCCESS || m_VkDevice == VK_NULL_HANDLE))
+            {
+                // VK_ERROR_NOT_PERMITTED (or a driver that rejects the chain):
+                // fall back to a normal-priority queue rather than no device.
+                m_Log.Print("vkCreateDevice with %s HIGH failed: %s (%d); retrying without queue priority",
+                    globalPriorityExt, VkResultName(vkResult), static_cast<int>(vkResult));
+                m_VkDevice = VK_NULL_HANDLE;
+                queueInfo.pNext = nullptr;
+                highPriorityQueue = false;
+                vkResult = m_Vk.vkCreateDevice(m_PhysicalDevice, &deviceInfo, nullptr, &m_VkDevice);
+            }
             if (vkResult != VK_SUCCESS || m_VkDevice == VK_NULL_HANDLE)
             {
                 m_Log.Print("vkCreateDevice failed: %s (%d)", VkResultName(vkResult), static_cast<int>(vkResult));
                 return false;
             }
+            m_Log.Print("Vulkan graphics queue global priority: %s",
+                highPriorityQueue ? "HIGH" : (globalPriorityExt ? "default (HIGH rejected)" : "default (extension unavailable)"));
 
             if (!LoadVkDevice("vkDestroyDevice", m_Vk.vkDestroyDevice) ||
                 !LoadVkDevice("vkGetDeviceQueue", m_Vk.vkGetDeviceQueue) ||
@@ -6096,6 +6326,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 !LoadVkDevice("vkEndCommandBuffer", m_Vk.vkEndCommandBuffer) ||
                 !LoadVkDevice("vkQueueSubmit", m_Vk.vkQueueSubmit) ||
                 !LoadVkDevice("vkQueueWaitIdle", m_Vk.vkQueueWaitIdle) ||
+                !LoadVkDevice("vkCreateFence", m_Vk.vkCreateFence) ||
+                !LoadVkDevice("vkDestroyFence", m_Vk.vkDestroyFence) ||
+                !LoadVkDevice("vkWaitForFences", m_Vk.vkWaitForFences) ||
+                !LoadVkDevice("vkResetFences", m_Vk.vkResetFences) ||
                 !LoadVkDevice("vkCreateImage", m_Vk.vkCreateImage) ||
                 !LoadVkDevice("vkDestroyImage", m_Vk.vkDestroyImage) ||
                 !LoadVkDevice("vkGetImageMemoryRequirements", m_Vk.vkGetImageMemoryRequirements) ||
@@ -6167,18 +6401,30 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             VkCommandBufferAllocateInfo allocInfo{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
             allocInfo.commandPool = m_CommandPool;
             allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocInfo.commandBufferCount = 1;
-            vkResult = m_Vk.vkAllocateCommandBuffers(m_VkDevice, &allocInfo, &m_CommandBuffer);
-            if (vkResult != VK_SUCCESS || m_CommandBuffer == VK_NULL_HANDLE)
+            allocInfo.commandBufferCount = kHelperCommandBufferCount;
+            vkResult = m_Vk.vkAllocateCommandBuffers(m_VkDevice, &allocInfo, m_CommandBuffers);
+            if (vkResult != VK_SUCCESS)
             {
                 m_Log.Print("vkAllocateCommandBuffers failed: %s (%d)", VkResultName(vkResult), static_cast<int>(vkResult));
                 return false;
             }
+            m_CommandBuffer = m_CommandBuffers[0];
+
+            VkFenceCreateInfo fenceInfo{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+            vkResult = m_Vk.vkCreateFence(m_VkDevice, &fenceInfo, nullptr, &m_BlitFence);
+            if (vkResult != VK_SUCCESS || m_BlitFence == VK_NULL_HANDLE)
+            {
+                m_Log.Print("vkCreateFence failed: %s (%d); helper will WaitIdle before xrEndFrame",
+                    VkResultName(vkResult), static_cast<int>(vkResult));
+                m_BlitFence = VK_NULL_HANDLE;
+            }
 
             m_Log.Print(
-                "Created Vulkan device queueFamily=%u extensions=%zu",
+                "Created Vulkan device queueFamily=%u extensions=%zu commandBuffers=%u blitFence=%u",
                 m_GraphicsQueueFamily,
-                enabledDeviceExtensions.size());
+                enabledDeviceExtensions.size(),
+                kHelperCommandBufferCount,
+                m_BlitFence != VK_NULL_HANDLE ? 1u : 0u);
             return true;
         }
 
@@ -6631,6 +6877,29 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             return true;
         }
 
+        void RefreshVisibilityMask()
+        {
+            if (!m_VisibilityMaskExtensionEnabled || !m_Xr.xrGetVisibilityMaskKHR
+                || m_Session == XR_NULL_HANDLE || !m_SessionRunning)
+            {
+                if (!m_VisibilityMaskLogged)
+                {
+                    m_VisibilityMaskLogged = true;
+                    m_Log.Print("XR_KHR_visibility_mask not available; hidden-area mesh will not be published");
+                }
+                return;
+            }
+
+            L4D2VROpenXrVisibilityMaskDesc desc{};
+            FetchHiddenVisibilityMask(m_Xr, m_Session, desc, m_Log);
+            desc.valid = 1u;
+            m_Bridge.PublishVisibilityMask(desc);
+            m_Log.Print(
+                "XR_KHR_visibility_mask published Lverts=%u Rverts=%u",
+                desc.eyes[L4D2VR_OPENXR_EYE_LEFT].vertexCount,
+                desc.eyes[L4D2VR_OPENXR_EYE_RIGHT].vertexCount);
+        }
+
         bool PollEvents(bool& shouldExit)
         {
             XrEventDataBuffer event{ XR_TYPE_EVENT_DATA_BUFFER };
@@ -6663,6 +6932,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                         if (!Succeeded(m_Log, "xrBeginSession", m_Xr.xrBeginSession(m_Session, &beginInfo)))
                             return false;
                         m_SessionRunning = true;
+                        if (m_VisibilityMaskExtensionEnabled)
+                            m_VisibilityMaskDirty = true;
                         m_Log.Print("OpenXR Vulkan session running");
                         m_Bridge.Update(L4D2VROpenXrBridgeStatus::SessionRunning, 0, 0, "OpenXR Vulkan session running");
                     }
@@ -6680,6 +6951,11 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     }
                     break;
                 }
+
+                case XR_TYPE_EVENT_DATA_VISIBILITY_MASK_CHANGED_KHR:
+                    m_Log.Print("OpenXR visibility mask changed");
+                    m_VisibilityMaskDirty = true;
+                    break;
 
                 default:
                     break;
@@ -7066,8 +7342,27 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             return frameId == 0 || (frameId & 0x80000000u) != 0;
         }
 
+        static bool DebugImageDumpEnabled()
+        {
+            static const bool enabled = []() {
+                char env[16] = {};
+                const DWORD n = GetEnvironmentVariableA("L4D2VR_DUMP_OPENXR_EYES", env, sizeof(env));
+                return n > 0 && n < sizeof(env) &&
+                    (env[0] == '1' || env[0] == 't' || env[0] == 'T' || env[0] == 'y' || env[0] == 'Y');
+            }();
+            return enabled;
+        }
+
         bool ShouldDumpOpenXrDebugImages(uint32_t eyeIndex, uint32_t frameIndex, uint32_t sharedFrameId)
         {
+            // Off by default. Each dump writes four uncompressed HMD BMPs (~24MB
+            // each) into VR\openxr_helper64\openxr_eye_debug and never deletes
+            // them, so helper restarts accumulated ~16GB on the install.
+            // Set L4D2VR_DUMP_OPENXR_EYES=1 to capture one left/right
+            // source+swapchain pair after 30s of real game frames.
+            if (!DebugImageDumpEnabled())
+                return false;
+
             if (m_DebugImageDumpCompleted)
                 return false;
 
@@ -7755,6 +8050,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             if (m_UseShaderBlit && !UpdateOverlayBlitDescriptorSet(overlayIndex))
                 return false;
 
+            m_CommandBuffer = m_CommandBuffers[2];
+
             XrSwapchainImageAcquireInfo acquireInfo{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
             uint32_t imageIndex = 0;
             XrResult xrResult = m_Xr.xrAcquireSwapchainImage(swapchain.handle, &acquireInfo, &imageIndex);
@@ -7851,12 +8148,14 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         struct OverlaySpatialLock
         {
             bool valid = false;
+            uint32_t epoch = 0;
             XrPosef pose{ XrQuaternionf{ 0.0f, 0.0f, 0.0f, 1.0f }, XrVector3f{ 0.0f, 0.0f, -3.0f } };
         };
 
         bool OverlayUsesSpatialLock(uint32_t overlayIndex) const
         {
-            return overlayIndex == L4D2VR_OPENXR_OVERLAY_MAIN_MENU;
+            return overlayIndex == L4D2VR_OPENXR_OVERLAY_MAIN_MENU
+                || overlayIndex == L4D2VR_OPENXR_OVERLAY_HUD;
         }
 
         void ResetOverlaySpatialLock(uint32_t overlayIndex, const char* reason)
@@ -7942,13 +8241,15 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 return pose;
 
             OverlaySpatialLock& lock = m_OverlaySpatialLocks[overlayIndex];
-            if (!lock.valid)
+            if (!lock.valid || lock.epoch != overlay.reserved0)
             {
                 lock.valid = true;
+                lock.epoch = overlay.reserved0;
                 lock.pose = pose;
                 m_Log.Print(
-                    "[OpenXR][OverlayLayer] captured spatial lock overlay=%s posePos=(%.4f %.4f %.4f) poseQuat=(%.4f %.4f %.4f %.4f)",
+                    "[OpenXR][OverlayLayer] captured spatial lock overlay=%s epoch=%u posePos=(%.4f %.4f %.4f) poseQuat=(%.4f %.4f %.4f %.4f)",
                     OverlayName(overlayIndex),
+                    overlay.reserved0,
                     pose.position.x,
                     pose.position.y,
                     pose.position.z,
@@ -8091,8 +8392,61 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
             return CmdRenderShaderBlitWithDescriptor(swapchain, imageIndex, source, m_BlitDescriptorSets[descriptorIndex], false, false);
         }
 
+        bool PollBlitFence(uint64_t timeoutNs = 0)
+        {
+            if (!m_BlitFenceOutstanding)
+                return true;
+            if (m_BlitFence == VK_NULL_HANDLE || !m_Vk.vkWaitForFences)
+            {
+                m_BlitFenceOutstanding = false;
+                return true;
+            }
+            const VkResult vkResult = m_Vk.vkWaitForFences(m_VkDevice, 1, &m_BlitFence, VK_TRUE, timeoutNs);
+            if (vkResult == VK_TIMEOUT)
+                return false;
+            if (vkResult != VK_SUCCESS)
+            {
+                m_Log.Print("vkWaitForFences failed: %s (%d)", VkResultName(vkResult), static_cast<int>(vkResult));
+                return false;
+            }
+            if (m_Vk.vkResetFences)
+                m_Vk.vkResetFences(m_VkDevice, 1, &m_BlitFence);
+            m_BlitFenceOutstanding = false;
+            if (m_BlitFenceFrameId != 0)
+            {
+                m_Bridge.NoteConsumedFrame(m_BlitFenceFrameId);
+                m_BlitFenceFrameId = 0;
+            }
+            return true;
+        }
+
+        bool SignalBlitFence(uint32_t consumedFrameId)
+        {
+            if (m_BlitFence == VK_NULL_HANDLE || !m_Vk.vkQueueSubmit)
+            {
+                if (m_Vk.vkQueueWaitIdle)
+                    m_Vk.vkQueueWaitIdle(m_GraphicsQueue);
+                if (consumedFrameId != 0)
+                    m_Bridge.NoteConsumedFrame(consumedFrameId);
+                return true;
+            }
+            VkSubmitInfo submitInfo{ VK_STRUCTURE_TYPE_SUBMIT_INFO };
+            const VkResult vkResult = m_Vk.vkQueueSubmit(m_GraphicsQueue, 1, &submitInfo, m_BlitFence);
+            if (vkResult != VK_SUCCESS)
+            {
+                m_Log.Print("vkQueueSubmit(blit fence) failed: %s (%d)", VkResultName(vkResult), static_cast<int>(vkResult));
+                return false;
+            }
+            m_BlitFenceOutstanding = true;
+            m_BlitFenceFrameId = consumedFrameId;
+            return true;
+        }
+
         bool RenderEye(uint32_t eyeIndex, uint32_t frameIndex, uint32_t sharedFrameId, bool waitForQueueIdle = true)
         {
+            if (eyeIndex >= L4D2VR_OPENXR_EYE_COUNT)
+                return false;
+            m_CommandBuffer = m_CommandBuffers[eyeIndex];
             VulkanEyeSwapchain& eye = m_Eyes[eyeIndex];
             XrSwapchainImageAcquireInfo acquireInfo{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
             uint32_t imageIndex = 0;
@@ -8497,6 +8851,11 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                     Sleep(10);
                     continue;
                 }
+                if (m_VisibilityMaskDirty)
+                {
+                    RefreshVisibilityMask();
+                    m_VisibilityMaskDirty = false;
+                }
                 const bool sharedTexturesReady = !requireSharedTextures || m_Bridge.SharedTexturesReady();
                 if (requireSharedTextures && !sharedTexturesReady)
                 {
@@ -8640,11 +8999,13 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                             // published slot, so they stay the same game frame.
                             if (requireSharedTextures && !ImportSharedGameTexturesIfNeeded())
                                 return 28;
+                            m_Bridge.NoteConsumingFrame(sharedTextureFrameId);
                             for (uint32_t eye = 0; eye < 2; ++eye)
                             {
                                 if (!RenderEye(eye, submittedFrames, sharedTextureFrameId))
                                     return 25;
                             }
+                            m_Bridge.NoteConsumedFrame(sharedTextureFrameId);
 
                             eyeSwapchainsHaveContent = true;
                             if (requireSharedTextures)
@@ -9003,7 +9364,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                                         XrCompositionLayerQuad& overlayLayer = overlayLayers[overlayLayerCount++];
                                         overlayLayer.layerFlags =
                                             (overlayIndex == L4D2VR_OPENXR_OVERLAY_HUD)
-                                                ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+                                                ? (XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+                                                    | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT)
                                                 : 0;
                                         overlayLayer.space = m_AppSpace;
                                         overlayLayer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -9268,9 +9630,9 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                             ? "OpenXR Vulkan 2D menu quad submitted"
                             : "OpenXR Vulkan frame submitted without projection layer"));
                     if (submittedFrames == 1 || (submittedFrames % 60) == 0)
-                        m_Log.Print("Submitted OpenXR Vulkan frame %u layers=%u projection=%u overlays=%u mono2dQuad=%u",
+                        m_Log.Print("Submitted OpenXR Vulkan frame %u layers=%u projection=%u overlays=%u mono2dQuad=%u blitSkip=%u fenceBusy=%u",
                             submittedFrames, layerCount, submitProjectionLayer ? 1u : 0u, overlayLayerCount,
-                            addedMono2dQuad ? 1u : 0u);
+                            addedMono2dQuad ? 1u : 0u, m_BlitSkips, m_BlitFenceOutstanding ? 1u : 0u);
                 }
                 if (options.targetFrames > 0 && submittedFrames >= options.targetFrames)
                     break;
@@ -9337,6 +9699,8 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
                 m_Vk.vkDestroySampler(m_VkDevice, m_BlitSampler, nullptr);
             if (m_BlitDescriptorSetLayout != VK_NULL_HANDLE && m_Vk.vkDestroyDescriptorSetLayout)
                 m_Vk.vkDestroyDescriptorSetLayout(m_VkDevice, m_BlitDescriptorSetLayout, nullptr);
+            if (m_BlitFence != VK_NULL_HANDLE && m_Vk.vkDestroyFence)
+                m_Vk.vkDestroyFence(m_VkDevice, m_BlitFence, nullptr);
             if (m_CommandPool != VK_NULL_HANDLE && m_Vk.vkDestroyCommandPool)
                 m_Vk.vkDestroyCommandPool(m_VkDevice, m_CommandPool, nullptr);
             if (m_AppSpace != XR_NULL_HANDLE && m_Xr.xrDestroySpace)
@@ -9372,6 +9736,10 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         OpenXrInputBridge m_InputBridge;
         bool m_SessionRunning = false;
         bool m_HandTrackingExtensionEnabled = false;
+        bool m_WantHandTracking = false;
+        bool m_VisibilityMaskExtensionEnabled = false;
+        bool m_VisibilityMaskDirty = false;
+        bool m_VisibilityMaskLogged = false;
         VkFormat m_SelectedSwapchainFormat = VK_FORMAT_UNDEFINED;
         VkInstance m_VkInstance = VK_NULL_HANDLE;
         VkPhysicalDevice m_PhysicalDevice = VK_NULL_HANDLE;
@@ -9380,7 +9748,13 @@ float4 main(float4 position : SV_Position, float2 uv : TEXCOORD0) : SV_Target
         uint32_t m_GraphicsQueueFamily = UINT32_MAX;
         VkPhysicalDeviceMemoryProperties m_MemoryProperties{};
         VkCommandPool m_CommandPool = VK_NULL_HANDLE;
+        static constexpr uint32_t kHelperCommandBufferCount = 3;
+        VkCommandBuffer m_CommandBuffers[kHelperCommandBufferCount]{};
         VkCommandBuffer m_CommandBuffer = VK_NULL_HANDLE;
+        VkFence m_BlitFence = VK_NULL_HANDLE;
+        bool m_BlitFenceOutstanding = false;
+        uint32_t m_BlitFenceFrameId = 0;
+        uint32_t m_BlitSkips = 0;
         bool m_UseShaderBlit = false;
         int m_FlipSubmitYOption = -1;
         bool m_FlipSubmitY = false;
@@ -9441,6 +9815,7 @@ int wmain(int argc, wchar_t** argv)
         ForceMonoProjectionEyeName(options.forceMonoProjectionView),
         options.forceMonoProjectionView);
     log.Print("OpenXR quad overlays: %s", options.disableQuadOverlays ? "disabled" : "enabled");
+    log.Print("OpenXR EXT_hand_tracking: %s", options.enableHandTracking ? "enabled" : "disabled");
     log.Print("OpenXR submit Y-flip option: %s", FlipSubmitYOptionName(options.flipSubmitY));
 
     OpenXrVulkanSubmitProbe probe(log);

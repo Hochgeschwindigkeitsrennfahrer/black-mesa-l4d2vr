@@ -113,6 +113,9 @@ Hooks::Hooks(Game* game)
     enableIfReady(hkGetScreenSize, "GetScreenSize");
     enableIfReady(hkGetScreenAspectRatio, "GetScreenAspectRatio");
     enableIfReady(hkCreateNamedRTEx, "CreateNamedRTEx");
+    enableIfReady(hkEndRTAlloc, "EndRTAlloc");
+    enableIfReady(hkDrawFilledRect, "DrawFilledRect");
+    enableIfReady(hkDrawTexturedRect, "DrawTexturedRect");
     enableIfReady(hkAdjustEngineViewport, "AdjustEngineViewport");
     enableIfReady(hkDrawModelExecute, "DrawModelExecute");
     enableIfReady(hkVgui_Paint, "VGui_Paint");
@@ -171,6 +174,38 @@ int Hooks::initSourceHooks()
         hkGetScreenAspectRatio.createHook((LPVOID)o.GetScreenAspectRatio.address, &dGetScreenAspectRatio);
     if (o.CreateNamedRTEx.valid)
         hkCreateNamedRTEx.createHook((LPVOID)o.CreateNamedRTEx.address, &dCreateNamedRTEx);
+    if (o.EndRTAlloc.valid)
+        hkEndRTAlloc.createHook((LPVOID)o.EndRTAlloc.address, &dEndRTAlloc);
+    // vguimatsurface.dll VGUI_Surface030: CMatSystemSurface vtable slot 15
+    // DrawFilledRect / 37 DrawTexturedRect (both ret 0x10). File offsets
+    // 0x3D880 / 0x40D20 in the Steam BM module.
+    if (m_Game)
+    {
+        void* surf = m_Game->GetInterface("vguimatsurface.dll", "VGUI_Surface030");
+        if (!surf)
+            surf = m_Game->GetInterface("vguimatsurface.dll", "VGUI_Surface031");
+        if (surf)
+        {
+            void** vt = nullptr;
+            __try
+            {
+                vt = *reinterpret_cast<void***>(surf);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                vt = nullptr;
+            }
+            if (vt)
+            {
+                if (hkDrawFilledRect.createHook(vt[15], &dDrawFilledRect) != 0)
+                    Game::logMsg("DrawFilledRect createHook failed");
+                if (hkDrawTexturedRect.createHook(vt[37], &dDrawTexturedRect) != 0)
+                    Game::logMsg("DrawTexturedRect createHook failed");
+            }
+        }
+        else
+            Game::logMsg("VGUI_Surface030/031 missing; pause dimmer skip unavailable");
+    }
     if (o.VGui_Paint.valid && bmvr::TryVguiPaint())
         hkVgui_Paint.createHook((LPVOID)o.VGui_Paint.address, &dVGui_Paint);
     else if (o.VGui_Paint.valid)
@@ -209,16 +244,12 @@ int Hooks::initSourceHooks()
     else
         Game::logMsg("EndFrame hook skipped (IMaterialSystem dump slot 37 unverified on BM)");
 
-    if (bmvr::TryMeleeTrace() && m_Game->m_EngineTrace)
-    {
-        void** vt = nullptr;
-        __try { vt = *reinterpret_cast<void***>(m_Game->m_EngineTrace); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { vt = nullptr; }
-        if (vt && vt[5])
-            hkTraceRay.createHook(vt[5], &dTraceRay);
-        else
-            Game::logMsg("TraceRay hook skipped (no EngineTrace vtbl[5])");
-    }
+    // IEngineTrace::TraceRay is not hooked. dTraceRay has been a pure
+    // pass-through since the melee rewrite moved to UpdateCrowbarMelee
+    // (47777b5); the detour only added a trampoline to every client trace
+    // (AI, physics, bullets — thousands per frame). Melee traces call
+    // m_EngineTrace->TraceRay directly and never needed hkTraceRay.fOriginal.
+    (void)&dTraceRay;
 
     EnsureClientFlashlightHook();
     EnsureWeaponShootOriginHooks();
@@ -244,7 +275,12 @@ namespace
         int w;
         int h;
         bool aux;
+        // RtStackTopIsWorldScene() result, fixed at push time. It used to
+        // re-run ~15 strstr on the stack-top name from every GetScreenSize /
+        // GetBackBufferDimensions call.
+        bool world;
     };
+    bool IsOffscreenWorldRtName(const char* name);
     thread_local RtStackEntry g_RtStack[kRtStackMax]{};
     thread_local int g_RtStackDepth = 0;
     thread_local int g_AuxRtDepth = 0;
@@ -298,7 +334,39 @@ namespace
         return g_AuxRtDepth > 0;
     }
 
-    void NotePushRt(const char* name, int w, int h)
+    // Name-derived RT classes, memoized per name pointer. ITexture::GetName
+    // returns the texture's own name buffer, so the pointer is stable for the
+    // texture's lifetime; the stored copy is compared too so a recycled
+    // allocation after a level change cannot return a stale class. Without
+    // this every PushRenderTargetAndViewport (dozens per eye) ran ~50 strstr.
+    struct RtNameClass
+    {
+        bool aux = false;
+        bool world = false;
+        bool hud = false;
+    };
+
+    RtNameClass ClassifyRtName(const char* name)
+    {
+        RtNameClass out{};
+        if (!name || !name[0] || name[0] == '?')
+            return out;
+        struct Entry { const char* ptr; char name[64]; RtNameClass cls; };
+        thread_local Entry cache[128]{};
+        const uintptr_t p = reinterpret_cast<uintptr_t>(name);
+        Entry& e = cache[static_cast<unsigned>((p >> 3) ^ (p >> 11)) & 127u];
+        if (e.ptr == name && std::strncmp(e.name, name, sizeof(e.name) - 1) == 0)
+            return e.cls;
+        out.aux = TextureNameIsAuxSceneRt(name);
+        out.world = IsOffscreenWorldRtName(name);
+        out.hud = TextureNameIsHudRt(name);
+        e.ptr = name;
+        strncpy_s(e.name, name, _TRUNCATE);
+        e.cls = out;
+        return out;
+    }
+
+    void NotePushRt(const char* name, int w, int h, const RtNameClass* cls = nullptr)
     {
         if (g_RtStackDepth >= kRtStackMax)
             return;
@@ -306,12 +374,21 @@ namespace
         e.w = w;
         e.h = h;
         e.name[0] = 0;
-        if (name && name[0] && name[0] != '?')
+        const bool named = name && name[0] && name[0] != '?';
+        if (named)
             strncpy_s(e.name, name, _TRUNCATE);
         else
             strncpy_s(e.name, "backbuffer", _TRUNCATE);
         const bool smallVp = (w > 0 && h > 0 && (w < 640 || h < 360));
-        e.aux = smallVp || TextureNameIsAuxSceneRt(e.name);
+        RtNameClass local{};
+        if (named && !cls)
+        {
+            local = ClassifyRtName(name);
+            cls = &local;
+        }
+        e.aux = smallVp || (named && cls->aux);
+        // "backbuffer"/"null" count as the world scene (RtStackTopIsWorldScene).
+        e.world = !named || (std::strcmp(e.name, "null") == 0) || cls->world;
         if (e.aux)
             ++g_AuxRtDepth;
         if (g_CostActive && name)
@@ -670,10 +747,18 @@ namespace
         return has("draw") || has("holster") || has("deploy") || has("pickup") || has("admire");
     }
 
+    unsigned char* g_LastViewmodelIdleHdr = nullptr;
+
     int FindIdleSequence(unsigned char* hdr)
     {
         if (!hdr)
             return -1;
+        // Per studiohdr result. The scan lowercases and strstr-classifies
+        // every sequence label (up to 64) and ran twice per CalcViewModelView
+        // while the crowbar was held. Reset on viewmodel change in
+        // ApplyViewmodelStudioWork.
+        if (hdr == g_LastViewmodelIdleHdr)
+            return g_LastViewmodelIdleSeq;
         int numSeq = 0;
         __try
         {
@@ -715,6 +800,10 @@ namespace
                 best = i;
             }
         }
+        // Seq before hdr: a reader that sees the matching hdr then also sees
+        // the seq that belongs to it (main thread vs render-thread reset).
+        g_LastViewmodelIdleSeq = best;
+        g_LastViewmodelIdleHdr = hdr;
         return best;
     }
 
@@ -740,22 +829,8 @@ namespace
         }
     }
 
-    bool ViewmodelNameHas(const char* model, const char* token)
-    {
-        return model && token && std::strstr(model, token) != nullptr;
-    }
-
-    bool IsCrowbarViewmodel(const char* model)
-    {
-        return ViewmodelNameHas(model, "crowbar") || ViewmodelNameHas(model, "Crowbar")
-            || ViewmodelNameHas(model, "wrench") || ViewmodelNameHas(model, "Wrench");
-    }
-
-    bool IsMp5Viewmodel(const char* model)
-    {
-        return ViewmodelNameHas(model, "mp5") || ViewmodelNameHas(model, "MP5")
-            || ViewmodelNameHas(model, "smg") || ViewmodelNameHas(model, "mp5k");
-    }
+    // Crowbar / MP5 viewmodel tests moved to VR::ClassifyViewmodel
+    // (kVmFlagCrowbar / kVmFlagMp5); callers read the atomic flags.
 
     void ZeroPlayerViewRecoil(void* player)
     {
@@ -836,14 +911,29 @@ namespace
         }
         const char* label = StudioSequenceLabel(hdr, seq);
         const bool melee = Hooks::m_VR->IsPerformingMelee();
-        const bool isAction = SequenceLabelLooksLikeWeaponAction(label);
-        const bool isLoco = SequenceLabelLooksLikeLocomotionOnly(label);
-        const char* model = nullptr;
-        if (Hooks::m_Game)
-            model = Hooks::m_Game->GetEntityModelName(static_cast<C_BaseEntity*>(viewmodel));
-        if (!model || !model[0])
-            model = Hooks::m_VR->m_LastViewmodelModel.c_str();
-        const bool crowbar = IsCrowbarViewmodel(model);
+        // Labels live inside the studiohdr, so the pointer identifies the
+        // sequence; classify once per sequence change instead of three
+        // lowercase passes + ~30 strstr on every CalcViewModelView.
+        struct LabelClass { const char* label; char text[16]; bool action; bool loco; bool equip; };
+        static LabelClass s_lc{};
+        if (!label || label != s_lc.label
+            || std::strncmp(s_lc.text, label, sizeof(s_lc.text) - 1) != 0)
+        {
+            s_lc.label = label;
+            s_lc.text[0] = 0;
+            if (label)
+                strncpy_s(s_lc.text, label, _TRUNCATE);
+            s_lc.action = SequenceLabelLooksLikeWeaponAction(label);
+            s_lc.loco = SequenceLabelLooksLikeLocomotionOnly(label);
+            s_lc.equip = SequenceLabelLooksLikeEquipOnly(label);
+        }
+        const bool isAction = s_lc.action;
+        const bool isLoco = s_lc.loco;
+        // Lock-free class flag from the weapon model dCalcViewModelView just
+        // classified; replaces a model-info lookup + four strstr per call (this
+        // runs twice per CalcViewModelView) and an unlocked read of the
+        // std::string m_LastViewmodelModel that ProcessInput rewrites.
+        const bool crowbar = Hooks::m_VR->ViewmodelIsCrowbar();
 
         auto restoreRate = [&]() {
             __try
@@ -869,7 +959,7 @@ namespace
         // Never freeze MP5 (or any other gun) fire/reload/draw here.
         if (crowbar)
         {
-            if (SequenceLabelLooksLikeEquipOnly(label))
+            if (s_lc.equip)
                 restoreRate();
             else
                 ForceViewmodelIdlePose(viewmodel, hdr);
@@ -1367,6 +1457,8 @@ namespace
         if (modelName && modelName[0] && _stricmp(s_lastVm, modelName) != 0)
         {
             strncpy_s(s_lastVm, modelName, _TRUNCATE);
+            // hdr first so no reader matches a header whose seq is being reset.
+            g_LastViewmodelIdleHdr = nullptr;
             g_LastViewmodelIdleSeq = -1;
         }
         const HideArmsResult hide = InspectAndHideArmBodypart(state, body, hideArms);
@@ -1498,11 +1590,22 @@ namespace
         }
     }
 
+    // client.dll is loaded once by the engine and stays until shutdown.
+    // GetModuleHandleA takes the loader lock and walks the module list;
+    // resolve it once for the per-frame callers below.
+    HMODULE ClientModule()
+    {
+        static HMODULE s_client = nullptr;
+        if (!s_client)
+            s_client = GetModuleHandleA("client.dll");
+        return s_client;
+    }
+
     void CallSetAbsOriginAngles(void* ent, const float* origin, const float* angles)
     {
         if (!ent || !origin || !angles)
             return;
-        HMODULE client = GetModuleHandleA("client.dll");
+        HMODULE client = ClientModule();
         if (!client)
             return;
         using SetVecFn = void(__thiscall*)(void*, const float*);
@@ -1693,26 +1796,51 @@ namespace
         return (pos - closest).LengthSqr() < (40.f * 40.f);
     }
 
+    // GetActiveWeaponModelName is local player -> weapon handle -> entity list
+    // -> model info per call, and these predicates run per sprite quad / beam
+    // segment (GluonFxLive from dSpriteQuad). Resolve once per Present.
+    struct HeldWeaponCache
+    {
+        uint32_t tick = 0xffffffffu;
+        bool rpg = false;
+        bool gluon = false;
+    };
+    // thread_local: sprite/beam hooks run on the render thread while
+    // CreateMove-side callers run on the main thread; one cheap resolve per
+    // thread per Present beats a lock here.
+    thread_local HeldWeaponCache g_HeldWeapon;
+
+    const HeldWeaponCache& RefreshHeldWeaponCache()
+    {
+        const uint32_t tick = Hooks::m_VR ? Hooks::m_VR->m_PresentTick : 0u;
+        if (g_HeldWeapon.tick != tick)
+        {
+            g_HeldWeapon.tick = tick;
+            const char* active = Hooks::m_Game ? Hooks::m_Game->GetActiveWeaponModelName() : nullptr;
+            g_HeldWeapon.rpg = VR::IsRpgWeaponModel(active);
+            g_HeldWeapon.gluon = VR::IsGluonWeaponModel(active);
+        }
+        return g_HeldWeapon;
+    }
+
     bool RpgWeaponHeld()
     {
         if (!Hooks::m_VR || !Hooks::m_VR->m_IsVREnabled)
             return false;
         if (Hooks::m_VR->RpgLaserActive() || Hooks::m_VR->RpgLaserLatched())
             return true;
-        if (VR::IsRpgWeaponModel(Hooks::m_VR->m_LastViewmodelModel.c_str()))
+        if (Hooks::m_VR->ViewmodelIsRpg())
             return true;
-        return Hooks::m_Game
-            && VR::IsRpgWeaponModel(Hooks::m_Game->GetActiveWeaponModelName());
+        return RefreshHeldWeaponCache().rpg;
     }
 
     bool GluonWeaponHeld()
     {
         if (!Hooks::m_VR || !Hooks::m_VR->m_IsVREnabled)
             return false;
-        if (VR::IsGluonWeaponModel(Hooks::m_VR->m_LastViewmodelModel.c_str()))
+        if (Hooks::m_VR->ViewmodelIsGluon())
             return true;
-        return Hooks::m_Game
-            && VR::IsGluonWeaponModel(Hooks::m_Game->GetActiveWeaponModelName());
+        return RefreshHeldWeaponCache().gluon;
     }
 
     void NoteGluonFx()
@@ -1873,7 +2001,7 @@ namespace
     {
         if (!Hooks::m_VR || !Hooks::m_VR->m_IsVREnabled)
             return;
-        HMODULE client = GetModuleHandleA("client.dll");
+        HMODULE client = ClientModule();
         if (!client)
             return;
         static const char* const kNames[] = {
@@ -2028,34 +2156,72 @@ namespace
         ++s_skip;
     }
 
+    // Entity index the cached dot was found at, and the last full scan tick.
+    int g_rpgLaserDotIndex = 0;
+    DWORD g_rpgLaserDotScanMs = 0;
+
     C_BaseEntity* FindRpgLaserDot()
     {
-        if (!Hooks::m_Game)
+        if (!Hooks::m_Game || !Hooks::m_Game->m_ClientEntityList)
             return nullptr;
-        C_BaseEntity* dot = Hooks::m_Game->FindEntityByNetworkNameContains("EnvLaserDot");
-        if (!dot)
-            dot = Hooks::m_Game->FindEntityByNetworkNameContains("laserdot");
-        if (!dot)
-            dot = Hooks::m_Game->FindEntityByNetworkNameContains("laser_dot");
-        if (dot)
+        // Called from applyL4d2VrHead, i.e. per eye per frame while the laser
+        // is on. The old path was three full entity-list scans (lowercasing
+        // every network name) plus a fourth by class/model, every call.
+        // Re-validate the cached entity at its index first; rescan at most
+        // every 250 ms when it is gone.
+        if (g_rpgLaserDotEnt && g_rpgLaserDotIndex > 0)
         {
-            g_rpgLaserDotEnt = dot;
-            return dot;
+            C_BaseEntity* at = Hooks::m_Game->GetClientEntity(g_rpgLaserDotIndex);
+            if (at && SameClientEntity(at, g_rpgLaserDotEnt) && EntityLooksLikeLaserDot(at))
+                return g_rpgLaserDotEnt;
+            g_rpgLaserDotEnt = nullptr;
+            g_rpgLaserDotIndex = 0;
         }
-        if (!Hooks::m_Game->m_ClientEntityList)
+        const DWORD nowMs = GetTickCount();
+        if (g_rpgLaserDotScanMs != 0 && nowMs - g_rpgLaserDotScanMs < 250)
             return nullptr;
+        g_rpgLaserDotScanMs = nowMs ? nowMs : 1;
+
+        // One pass: network name (EnvLaserDot / laserdot / laser_dot), then
+        // class / model as the old fallback scan did.
         const int hi = Hooks::m_Game->m_ClientEntityList->GetHighestEntityIndex();
+        C_BaseEntity* fallback = nullptr;
+        int fallbackIdx = 0;
         for (int e = 1; e <= hi; ++e)
         {
-            C_BaseEntity* ent = Hooks::m_Game->GetClientEntity(e);
-            if (EntityLooksLikeLaserDot(ent))
+            const char* net = Hooks::m_Game->GetEntityNetworkName(e);
+            if (net && net[0])
             {
-                g_rpgLaserDotEnt = ent;
-                return ent;
+                char lower[80]{};
+                size_t i = 0;
+                for (; i + 1 < sizeof(lower) && net[i]; ++i)
+                    lower[i] = static_cast<char>(tolower(static_cast<unsigned char>(net[i])));
+                lower[i] = 0;
+                if (std::strstr(lower, "envlaserdot") || std::strstr(lower, "laserdot")
+                    || std::strstr(lower, "laser_dot"))
+                {
+                    C_BaseEntity* dot = Hooks::m_Game->GetClientEntity(e);
+                    if (dot)
+                    {
+                        g_rpgLaserDotEnt = dot;
+                        g_rpgLaserDotIndex = e;
+                        return dot;
+                    }
+                }
+            }
+            if (!fallback)
+            {
+                C_BaseEntity* ent = Hooks::m_Game->GetClientEntity(e);
+                if (EntityLooksLikeLaserDot(ent))
+                {
+                    fallback = ent;
+                    fallbackIdx = e;
+                }
             }
         }
-        g_rpgLaserDotEnt = nullptr;
-        return nullptr;
+        g_rpgLaserDotEnt = fallback;
+        g_rpgLaserDotIndex = fallbackIdx;
+        return fallback;
     }
 
     void SnapRpgLaserDot()
@@ -2366,12 +2532,7 @@ namespace
     {
         if (g_RtStackDepth <= 0)
             return false;
-        const char* name = g_RtStack[g_RtStackDepth - 1].name;
-        if (!name || !name[0])
-            return false;
-        if (std::strcmp(name, "backbuffer") == 0 || std::strcmp(name, "null") == 0)
-            return true;
-        return IsOffscreenWorldRtName(name);
+        return g_RtStack[g_RtStackDepth - 1].world;
     }
 
     bool OffscreenStereoSizeLie(int& width, int& height)
@@ -2436,20 +2597,10 @@ namespace
             return;
         if (Hooks::m_VR->HudPaintActive())
         {
+            // Pause GameUI is laid out at HWND size, same as the laser UV map.
+            // HEV inset was for in-eye HUD, not this overlay.
             int hx = 0, hy = 0, hw = 0, hh = 0;
-            int fbW = static_cast<int>(Hooks::m_VR->m_RenderWidth);
-            int fbH = static_cast<int>(Hooks::m_VR->m_RenderHeight);
-            uint32_t hmdW = 0, hmdH = 0;
-            if (bmvr::HaveHmdFramebufferSize(hmdW, hmdH))
-            {
-                fbW = static_cast<int>(hmdW);
-                fbH = static_cast<int>(hmdH);
-            }
-            if (fbW < 640)
-                fbW = (width > 0) ? width : 1280;
-            if (fbH < 360)
-                fbH = (height > 0) ? height : 720;
-            if (Hooks::m_VR->ComputeHudInset(fbW, fbH, hx, hy, hw, hh))
+            if (Hooks::m_VR->ForceHudOverlayViewport(hx, hy, hw, hh))
             {
                 x = hx;
                 y = hy;
@@ -2511,6 +2662,34 @@ namespace
             return false;
         return std::abs(w - static_cast<int>(winW)) <= 32
             && std::abs(h - static_cast<int>(winH)) <= 32;
+    }
+
+    // GameUI pause dimmer is a fullscreen DrawFilledRect / DrawTexturedRect
+    // (vguimatsurface CMatSystemSurface slots 15 / 37). Skip it during extra
+    // paint so the overlay is menu chrome only.
+    bool SkipPauseOverlayFullscreenRect(int x0, int y0, int x1, int y1)
+    {
+        if (!Hooks::m_VR || !Hooks::m_VR->HudPaintActive())
+            return false;
+        UINT hw = 0, hh = 0;
+        if (!Hooks::m_VR->HudOverlayPixelSize(hw, hh) || hw < 640 || hh < 360)
+            return false;
+        int rw = x1 - x0;
+        int rh = y1 - y0;
+        if (rw < 0)
+            rw = -rw;
+        if (rh < 0)
+            rh = -rh;
+        if (rw * 10 < static_cast<int>(hw) * 8 || rh * 10 < static_cast<int>(hh) * 8)
+            return false;
+        static int s_skip;
+        if (s_skip < 8)
+        {
+            Game::logMsg("Pause overlay skip fullscreen VGUI %d,%d %dx%d hud=%ux%u",
+                x0, y0, rw, rh, hw, hh);
+            ++s_skip;
+        }
+        return true;
     }
 
     bool StereoEyeWorldActive()
@@ -2672,50 +2851,52 @@ namespace
         VR* vr = Hooks::m_VR;
         if (!vr || !Hooks::hkVgui_Paint.fOriginal)
             return;
-        if (!vr->HudOverlayReady() || !vr->m_HUDTexture)
-            return;
-        // Extra paint is engine VGUI only. Forcing UIPANELS|INGAMEPANELS|CURSOR
-        // every gameplay frame (log: mode=0x7 pause=0) copies GameUI onto a
-        // cleared-transparent SteamVR quad. That is the transparent pause menu
-        // in the HMD. HEV HUD is client DRAWHUD, not this path.
-        if (!vr->PauseUiActive())
+        // Extra paint is engine VGUI only. Forcing UIPANELS|CURSOR during
+        // in-game GameUI copies menu chrome onto a cleared-transparent overlay.
+        // HEV HUD is client DRAWHUD, not this path.
+        if (!vr->WantPauseWorldOverlay())
             return;
         if (vr->HudPaintedThisFrame())
             return;
 
-        ITexture* hud = vr->m_HUDTexture;
-        const int tw = hud->GetActualWidth();
-        const int th = hud->GetActualHeight();
-        if (tw < 640 || th < 360)
+        vr->EnsureHudOverlay();
+        if (!vr->HudOverlayReady() || !vr->m_D9HUDSurface)
             return;
 
-        int x = 0, y = 0, w = tw, h = th;
-        vr->ComputeHudInset(tw, th, x, y, w, h);
+        UINT tw = 0, th = 0;
+        if (!vr->HudOverlayPixelSize(tw, th))
+            return;
 
         MatCtxScope scope;
-        if (!scope.ctx)
-            return;
-
-        vr->ClearHudSurface(false);
         vr->SetHudPaintActive(true);
+        if (!vr->BindPauseHudForExtraPaint())
         {
-            EyeRtPush push(scope.ctx, hud, tw, th);
-            if (Hooks::hkViewport.fOriginal)
-                Hooks::hkViewport.fOriginal(scope.ctx, x, y, w, h);
-            const int paintMode = PAINT_UIPANELS | PAINT_CURSOR;
-            ++g_VguiOverlayReentry;
-            Hooks::hkVgui_Paint.fOriginal(vgui, paintMode);
-            --g_VguiOverlayReentry;
-            static int s_ov;
-            if (s_ov < 8)
-            {
-                Game::logMsg("VGui extra-paint overlay inset=%d,%d %dx%d of %dx%d mode=0x%X pause=%d",
-                    x, y, w, h, tw, th, paintMode, vr->PauseUiActive() ? 1 : 0);
-                ++s_ov;
-            }
+            vr->SetHudPaintActive(false);
+            return;
         }
+        if (scope.ctx && Hooks::hkViewport.fOriginal)
+            Hooks::hkViewport.fOriginal(scope.ctx, 0, 0, static_cast<int>(tw), static_cast<int>(th));
+        // HL2VR RenderHUD: full dest, alpha write, clear 0,0,0,0,
+        // then PAINT_UIPANELS. Software CURSOR fights the ColorFill arrow
+        // and strobes. D3D bind replaces named PushRT.
+        vr->PreparePauseHudForVgui(scope.ctx);
+        const int paintMode = PAINT_UIPANELS;
+        ++g_VguiOverlayReentry;
+        Hooks::hkVgui_Paint.fOriginal(vgui, paintMode);
+        --g_VguiOverlayReentry;
+        vr->FinishPauseHudExtraPaint(scope.ctx);
         vr->SetHudPaintActive(false);
+        vr->UnbindPauseHudAfterExtraPaint();
+        vr->StampPauseOverlayCursor();
         vr->NoteHudPainted();
+        static int s_ov;
+        if (s_ov < 8)
+        {
+            Game::logMsg("VGui extra-paint overlay %ux%u mode=0x%X pause=%d ready=%d",
+                tw, th, paintMode, vr->PauseUiActive() ? 1 : 0,
+                vr->HudOverlayReady() ? 1 : 0);
+            ++s_ov;
+        }
     }
 }
 
@@ -3031,7 +3212,8 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             if (!keepNative)
             {
                 const long long tHands = QpcNow();
-                glovesInBlit = m_VR->DrawVrGlovesIntoBlitSource(1);
+                if (!m_VR->IsMenuUp())
+                    glovesInBlit = m_VR->DrawVrGlovesIntoBlitSource(1);
                 g_Cost.handsTicks += QpcNow() - tHands;
                 const long long t0 = QpcNow();
                 // Always GPU-wait this copy. Both eyes share _rt_FullFrameFB /
@@ -3057,8 +3239,9 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 // RenderView on DXVK async; wait before the right eye starts.
                 m_VR->FlushStereoBlitGpu();
             }
-            if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud
-                || m_VR->WeaponMenuOpen() || m_VR->AimCrosshairVisible())
+            if (!m_VR->IsMenuUp()
+                && (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud
+                || m_VR->WeaponMenuOpen() || m_VR->AimCrosshairVisible()))
             {
                 const long long t0 = QpcNow();
                 m_VR->DrawIndependentHandMarkers(
@@ -3092,7 +3275,8 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             if (!keepNative)
             {
                 const long long tHands = QpcNow();
-                glovesInBlit = m_VR->DrawVrGlovesIntoBlitSource(2);
+                if (!m_VR->IsMenuUp())
+                    glovesInBlit = m_VR->DrawVrGlovesIntoBlitSource(2);
                 g_Cost.handsTicks += QpcNow() - tHands;
                 const long long t0 = QpcNow();
                 const bool rightBb = m_VR->BlitHmdViewFromBackbuffer(
@@ -3104,8 +3288,9 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
                 }
                 g_Cost.blitTicks += QpcNow() - t0;
             }
-            if (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud
-                || m_VR->WeaponMenuOpen() || m_VR->AimCrosshairVisible())
+            if (!m_VR->IsMenuUp()
+                && (bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes || bmvr::g_HandHud
+                || m_VR->WeaponMenuOpen() || m_VR->AimCrosshairVisible()))
             {
                 const long long t0 = QpcNow();
                 m_VR->DrawIndependentHandMarkers(
@@ -3114,9 +3299,12 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
             }
         }
         m_VR->m_StereoEye = 0;
+        // Keep the 3D world on the HWND under GameUI. Skipping this left the
+        // desktop pause menu on black (2026-09-06). ColorFill of unused 16:9
+        // still fights VGUI chrome — skip only that.
         if (bmvr::OffscreenWorldMatchesEyes())
             m_VR->MirrorStereoToDesktopWindow();
-        else if (m_VR->m_IsVREnabled)
+        else if (m_VR->m_IsVREnabled && !m_VR->WantPauseWorldOverlay())
             m_VR->ClearUnusedDesktopBackbuffer();
         // gbmatch already draws flashlight in the eye passes. A third window
         // DRAWHUD pass was a 15fps regression. Keep it only for the fused
@@ -3142,6 +3330,7 @@ void __fastcall Hooks::dRenderView(void* ecx, void* edx, CViewSetup& setup, int 
         // top of that put a second, slightly offset copy of each hand on the
         // window, which is what read as the hands being see-through there.
         if ((bmvr::g_VrHandsGlovesEnabled || bmvr::g_VrHandsDebugBoxes)
+            && !m_VR->IsMenuUp()
             && !bmvr::OffscreenWorldMatchesEyes()
             && !m_VR->VrGlovesDrawnIntoScene())
             m_VR->DrawIndependentHandsOnDesktop();
@@ -3225,6 +3414,13 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
         if (m_VR->TryGetMeleeAim(meleeOrigin, meleeAim))
         {
             apply(meleeAim);
+            return;
+        }
+        // HL2 player_pickup / CGrabController follows player vtable +0x474
+        // along EyeAngles. Stay on the latched grab hand until drop.
+        if (m_VR->UseGrabActive() && m_VR->GrabHandTrackingValid())
+        {
+            apply(m_VR->GetUseAimAngles());
             return;
         }
         // Looking down a scope, the crosshair is fixed in the middle of the
@@ -3319,6 +3515,8 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
             cmd->sidemove += analogS;
         }
         cmd->buttons |= static_cast<int>(m_VR->HeldButtons());
+        if (m_VR->SuppressThrowWhileGrabbing())
+            cmd->buttons &= ~IN_ATTACK;
         const int inv = m_VR->m_PendingInvDelta.exchange(0, std::memory_order_acq_rel);
         if (inv != 0 && m_Game)
         {
@@ -3342,6 +3540,9 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
     if (m_VR && m_VR->m_IsVREnabled && cmd->command_number)
         applyVrUserCmd();
 
+    if (m_VR && m_VR->SuppressThrowWhileGrabbing())
+        cmd->buttons &= ~IN_ATTACK;
+
     bool result = hkCreateMove.fOriginal(ecx, flInputSampleTime, cmd);
 
     if (m_VR && cmd->command_number && m_VR->IsGameplayEligible())
@@ -3359,6 +3560,8 @@ bool __fastcall Hooks::dCreateMove(void* ecx, void* edx, float flInputSampleTime
         cmd->buttons &= ~(IN_ATTACK | IN_ATTACK2);
     else
         cmd->buttons |= static_cast<int>(m_VR->HeldButtons());
+    if (m_VR->SuppressThrowWhileGrabbing())
+        cmd->buttons &= ~IN_ATTACK;
 
     EnsureServerFlashlightHook();
     EnsureWeaponShootOriginHooks();
@@ -3402,37 +3605,30 @@ void __fastcall Hooks::dCalcViewModelView(void* ecx, void* edx, void* owner, con
         // Do not IPD the gun — that drew two weapons (2026-08-17).
         if (m_VR->m_ControllerPoseValid)
         {
-            if (m_Game)
-            {
-                const char* weaponModel = m_Game->GetActiveWeaponModelName();
-                if (weaponModel)
-                    m_VR->NoteViewmodelModel(weaponModel);
-            }
+            // One active-weapon lookup per call (was three). The MP5 test on
+            // the last classified viewmodel is the lock-free class flag rather
+            // than an unlocked read of the std::string.
+            const char* weaponModel = m_Game ? m_Game->GetActiveWeaponModelName() : nullptr;
+            if (weaponModel)
+                m_VR->NoteViewmodelModel(weaponModel);
+            // NoteViewmodelModel just classified weaponModel (mp5/MP5/smg/mp5k
+            // all match on the lowercased path), so the flag is authoritative.
+            const bool mp5 = m_Game && m_VR->ViewmodelIsMp5();
             // L4D2VR: feed the aim-controller pose as CalcViewModelView eye so
             // lag/bob and $origin are in the same frame as the hard-lock.
             const Vector targetOrigin = m_VR->GetRecommendedViewmodelAbsPos(eyePosition);
             const QAngle targetAng = m_VR->GetRecommendedViewmodelAbsAngle();
             // Crowbar idle-force runs in SuppressViewmodelMovementAnims.
             // MP5 fire sequences must keep playing (never idle-force those).
-            if (m_Game)
-            {
-                const char* weaponModel = m_Game->GetActiveWeaponModelName();
-                if (IsMp5Viewmodel(weaponModel)
-                    || (m_VR && IsMp5Viewmodel(m_VR->m_LastViewmodelModel.c_str())))
-                    ZeroPlayerViewRecoil(owner);
-            }
+            if (mp5)
+                ZeroPlayerViewRecoil(owner);
             SuppressViewmodelMovementAnims(ecx);
             CallCalcViewModelViewOriginal(ecx, owner, targetOrigin, targetAng);
             const float origin3[3] = { targetOrigin.x, targetOrigin.y, targetOrigin.z };
             const float angles3[3] = { targetAng.x, targetAng.y, targetAng.z };
             CallSetAbsOriginAngles(ecx, origin3, angles3);
-            if (m_Game)
-            {
-                const char* weaponModel = m_Game->GetActiveWeaponModelName();
-                if (IsMp5Viewmodel(weaponModel)
-                    || (m_VR && IsMp5Viewmodel(m_VR->m_LastViewmodelModel.c_str())))
-                    ZeroPlayerViewRecoil(owner);
-            }
+            if (mp5)
+                ZeroPlayerViewRecoil(owner);
             SuppressViewmodelMovementAnims(ecx);
             return;
         }
@@ -3591,6 +3787,11 @@ void __fastcall Hooks::dDrawModelExecute(void* ecx, void* edx, void* state, cons
     }
 
     if (isViewmodel && m_VR && m_VR->EmptyHands() && m_VR->IsGameplayEligible() && EngineInGame())
+        return;
+
+    // Pause / GameUI: keep controller poses updating, skip the gun mesh so it
+    // does not track in front of the overlay. Next unpaused DME draws it again.
+    if (isViewmodel && m_VR && m_VR->IsMenuUp() && m_VR->IsGameplayEligible() && EngineInGame())
         return;
 
     if (isViewmodel && m_VR && m_VR->IsGameplayEligible() && EngineInGame())
@@ -3782,6 +3983,7 @@ void __fastcall Hooks::dPushRenderTargetAndViewport(void* ecx, void* edx, ITextu
 {
     NoteMatContext(ecx);
     const char* pushName = SafeTextureName(pTexture);
+    const RtNameClass nameClass = ClassifyRtName(pushName);
     // Grow world G-buffer viewports before NotePushRt so the stack records
     // 3168, and so a `_rt_gb*` push while flashlight is still parent is not
     // skipped by AuxSceneRtBound().
@@ -3792,7 +3994,7 @@ void __fastcall Hooks::dPushRenderTargetAndViewport(void* ecx, void* edx, ITextu
     {
         const int eyeW = static_cast<int>(m_VR->m_RenderWidth);
         const int eyeH = static_cast<int>(m_VR->m_RenderHeight);
-        const bool namedWorld = IsOffscreenWorldRtName(pushName);
+        const bool namedWorld = nameClass.world;
         const bool backbuffer = (pTexture == nullptr)
             || (pushName && (std::strcmp(pushName, "null") == 0));
         const bool smallVp = nViewW > 0 && nViewH > 0 && (nViewW < 640 || nViewH < 360);
@@ -3815,7 +4017,7 @@ void __fastcall Hooks::dPushRenderTargetAndViewport(void* ecx, void* edx, ITextu
             nViewH = eyeH;
         }
     }
-    NotePushRt(pushName, nViewW, nViewH);
+    NotePushRt(pushName, nViewW, nViewH, &nameClass);
     if (m_VR && m_VR->IsGameplayEligible())
     {
         static int s_pushNames;
@@ -3825,20 +4027,18 @@ void __fastcall Hooks::dPushRenderTargetAndViewport(void* ecx, void* edx, ITextu
                 pushName, nViewW, nViewH, AuxSceneRtBound() ? 1 : 0);
             ++s_pushNames;
         }
-        if (pushName && (std::strstr(pushName, "flashlight") || std::strstr(pushName, "Flashlight")
-                || std::strstr(pushName, "FlashLight"))
-            && (m_VR->StereoEyeBlitActive() || m_VR->m_StereoEye != 0))
+        static int s_flPush;
+        if (s_flPush < 12 && pushName
+            && (m_VR->StereoEyeBlitActive() || m_VR->m_StereoEye != 0)
+            && (std::strstr(pushName, "flashlight") || std::strstr(pushName, "Flashlight")
+                || std::strstr(pushName, "FlashLight")))
         {
-            static int s_flPush;
-            if (s_flPush < 12)
-            {
-                Game::logMsg("Flashlight PushRT inside eye RV %s %dx%d stereoEye=%d",
-                    pushName, nViewW, nViewH, m_VR->m_StereoEye);
-                ++s_flPush;
-            }
+            Game::logMsg("Flashlight PushRT inside eye RV %s %dx%d stereoEye=%d",
+                pushName, nViewW, nViewH, m_VR->m_StereoEye);
+            ++s_flPush;
         }
     }
-    if (m_VR && TextureNameIsHudRt(pushName))
+    if (m_VR && nameClass.hud)
         m_VR->NoteEngineHudRtPush(pushName, nViewW, nViewH);
     if (g_StereoRedirect)
     {
@@ -3885,22 +4085,22 @@ void __fastcall Hooks::dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial
     const int origH = height;
     const int origSrcW = srcWidth;
     const int origSrcH = srcHeight;
-    int rtW = 0;
-    int rtH = 0;
-    QueryContextColorRtSize(ecx, rtW, rtH, nullptr);
     const int eyeW = m_VR ? static_cast<int>(m_VR->m_RenderWidth) : 0;
     const int eyeH = m_VR ? static_cast<int>(m_VR->m_RenderHeight) : 0;
     const char* matName = SafeMaterialName(material);
     if (m_VR && m_VR->RpgLaserActive())
     {
         static int s_laserDssr;
-        const bool glowish = std::strstr(matName, "glow") || std::strstr(matName, "laser")
-            || std::strstr(matName, "dot") || std::strstr(matName, "flare");
-        const bool smallQuad = width > 0 && height > 0 && width < 256 && height < 256;
-        if (s_laserDssr < 16 && (glowish || smallQuad))
+        if (s_laserDssr < 16)
         {
-            Game::logMsg("DSSR laser-on %s dest=%d,%d %dx%d", matName, destX, destY, width, height);
-            ++s_laserDssr;
+            const bool glowish = std::strstr(matName, "glow") || std::strstr(matName, "laser")
+                || std::strstr(matName, "dot") || std::strstr(matName, "flare");
+            const bool smallQuad = width > 0 && height > 0 && width < 256 && height < 256;
+            if (glowish || smallQuad)
+            {
+                Game::logMsg("DSSR laser-on %s dest=%d,%d %dx%d", matName, destX, destY, width, height);
+                ++s_laserDssr;
+            }
         }
     }
     const bool windowDest = destX <= 16 && destY <= 16 && LooksLikeWindowExtent(width, height);
@@ -3950,7 +4150,8 @@ void __fastcall Hooks::dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial
     static char s_seen[24][80];
     static int s_seenN;
     bool seen = false;
-    for (int i = 0; i < s_seenN; ++i)
+    // Only matters while the seen-table still has room (first 24 materials).
+    for (int i = 0; s_seenN < 24 && i < s_seenN; ++i)
     {
         if (std::strcmp(s_seen[i], matName) == 0)
         {
@@ -3963,6 +4164,11 @@ void __fastcall Hooks::dDrawScreenSpaceRectangle(void* ecx, void* edx, IMaterial
         || (OffscreenEyePassActive() && (windowDest || windowUv || expanded) && s_stereoDssrLog < 16);
     if (logDssr)
     {
+        // Diagnostic only: GetRenderTarget + texture size per DSSR call was
+        // paid for every post-process quad long after the log caps filled.
+        int rtW = 0;
+        int rtH = 0;
+        QueryContextColorRtSize(ecx, rtW, rtH, nullptr);
         Game::logMsg("DSSR %s dest=%d,%d %dx%d src=%dx%d uv=(%.1f,%.1f)-(%.1f,%.1f) expand=%d rt=%dx%d rt0eye=%d",
             matName, origX, origY, origW, origH, origSrcW, origSrcH,
             srcX0, srcY0, srcX1, srcY1, expanded, rtW, rtH,
@@ -4101,7 +4307,7 @@ void __fastcall Hooks::dVGui_Paint(void* ecx, void* edx, int mode)
         if (m_VR)
             m_VR->SetVguiPaintActive(false);
     }
-    if (inGame && eligible && m_VR && m_VR->HudOverlayReady() && m_VR->PauseUiActive()
+    if (inGame && eligible && m_VR && m_VR->WantPauseWorldOverlay()
         && !m_VR->Want2dMenuPanel())
         PaintVguiToOverlay(ecx, mode);
 }
@@ -4347,7 +4553,9 @@ namespace
 
     bool ShouldRewriteShootOrigin(void* player, const Vector* current)
     {
-        if (!Hooks::m_VR || !Hooks::m_VR->m_IsVREnabled || !Hooks::m_VR->m_ControllerPoseValid)
+        if (!Hooks::m_VR || !Hooks::m_VR->m_IsVREnabled)
+            return false;
+        if (!Hooks::m_VR->UseGrabActive() && !Hooks::m_VR->m_ControllerPoseValid)
             return false;
         if (!Hooks::m_VR->IsGameplayEligible() || !EngineInGame())
             return false;
@@ -4432,12 +4640,6 @@ namespace
             return out;
         if (!ShouldRewriteShootOrigin(player, out))
             return out;
-        // Scoped: dCreateMove has switched the aim to the headset, so leave the
-        // engine's own eye-relative origin alone. Projecting the muzzle onto a
-        // controller ray that is no longer the firing direction would put the
-        // bolt off to one side.
-        if (Hooks::m_VR->ScopeZoomActive())
-            return out;
         Vector muzzle{};
         // Melee swings start on the visible crowbar, not at a projection onto
         // the controller's aim ray, because dCreateMove has already pointed
@@ -4448,6 +4650,27 @@ namespace
             *out = muzzle;
             return out;
         }
+        if (Hooks::m_VR->UseGrabActive())
+        {
+            if (Hooks::m_VR->TryGetVrUseOrigin(muzzle))
+            {
+                static int s_grabLog;
+                if (s_grabLog < 8)
+                {
+                    Game::logMsg("Grab hold origin VR (%.1f,%.1f,%.1f) was (%.1f,%.1f,%.1f)",
+                        muzzle.x, muzzle.y, muzzle.z, out->x, out->y, out->z);
+                    ++s_grabLog;
+                }
+                *out = muzzle;
+            }
+            return out;
+        }
+        // Scoped: dCreateMove has switched the aim to the headset, so leave the
+        // engine's own eye-relative origin alone. Projecting the muzzle onto a
+        // controller ray that is no longer the firing direction would put the
+        // bolt off to one side.
+        if (Hooks::m_VR->ScopeZoomActive())
+            return out;
         if (!Hooks::m_VR->TryGetVrShootOrigin(muzzle))
             return out;
         static int s_log;
@@ -4464,6 +4687,12 @@ namespace
 
 void Hooks::EnsureWeaponShootOriginHooks()
 {
+    // Called 2-3 times per CreateMove tick and from RenderView. Once every
+    // target is resolved (installed or marked skipped) the body is only
+    // GetModuleHandleA calls under the loader lock; skip it.
+    static bool s_done = false;
+    if (s_done)
+        return;
     HMODULE client = GetModuleHandleA("client.dll");
     if (client && !hkClientWeaponShootPosition.pTarget)
     {
@@ -4543,6 +4772,45 @@ void Hooks::EnsureWeaponShootOriginHooks()
             hkServerWeaponShootPosition.pTarget = p;
         }
     }
+    if (server && !hkServerGrabHoldOrigin.pTarget)
+    {
+        // CGrabController::UpdateObject calls player vtable +0x474, not +0x23C.
+        auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kCBasePlayer_GrabHoldOrigin_Server;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            && CodeBytesMatch(p, "558BEC83EC24578BF98D4DE86A00516A008B078BCFFF904C020000"))
+        {
+            if (hkServerGrabHoldOrigin.createHook(p, &dServerGrabHoldOrigin) == 0
+                && hkServerGrabHoldOrigin.enableHook() == 0)
+                Game::logMsg("Hook enabled: server grab hold origin rva=0x%X", Offsets::kCBasePlayer_GrabHoldOrigin_Server);
+            else
+                Game::logMsg("server grab hold origin hook failed");
+        }
+        else
+        {
+            Game::logMsg("server grab hold origin skipped (bytes/rva 0x%X)", Offsets::kCBasePlayer_GrabHoldOrigin_Server);
+            hkServerGrabHoldOrigin.pTarget = p;
+        }
+    }
+    if (server && !hkGrabSetTarget.pTarget)
+    {
+        auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kCGrabController_SetTargetPosition;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(p, &mbi, sizeof(mbi)) && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))
+            && CodeBytesMatch(p, "558BEC8B45088BD1D900D95A04"))
+        {
+            if (hkGrabSetTarget.createHook(p, &dGrabSetTarget) == 0
+                && hkGrabSetTarget.enableHook() == 0)
+                Game::logMsg("Hook enabled: server grab SetTargetPosition rva=0x%X", Offsets::kCGrabController_SetTargetPosition);
+            else
+                Game::logMsg("server grab SetTargetPosition hook failed");
+        }
+        else
+        {
+            Game::logMsg("server grab SetTargetPosition skipped (bytes/rva 0x%X)", Offsets::kCGrabController_SetTargetPosition);
+            hkGrabSetTarget.pTarget = p;
+        }
+    }
     if (server && !hkGetShootAngles.pTarget)
     {
         auto* p = reinterpret_cast<unsigned char*>(server) + Offsets::kBlackMesaPlayer_GetShootAngles_Server;
@@ -4584,7 +4852,12 @@ void Hooks::EnsureWeaponShootOriginHooks()
                 + Offsets::kCBasePlayer_Weapon_ShootPosition;
         }
     }
-    EnsureWeaponVfxHooks();
+    const bool vfxDone = EnsureWeaponVfxHooks();
+    s_done = vfxDone
+        && hkClientWeaponShootPosition.pTarget && hkGetAttachmentVec.pTarget
+        && hkGetAttachmentMatrix.pTarget && hkServerWeaponShootPosition.pTarget
+        && hkServerGrabHoldOrigin.pTarget && hkGrabSetTarget.pTarget
+        && hkGetShootAngles.pTarget && hkClientGetShootAngles.pTarget;
 }
 
 void __fastcall Hooks::dGetShootAngles(void* ecx, void* edx, QAngle* out)
@@ -4614,6 +4887,40 @@ Vector* __fastcall Hooks::dServerWeaponShootPosition(void* ecx, void* edx, Vecto
 {
     (void)edx;
     return RewriteShootOrigin(ecx, out, hkServerWeaponShootPosition.fOriginal);
+}
+
+Vector* __fastcall Hooks::dServerGrabHoldOrigin(void* ecx, void* edx, Vector* out)
+{
+    (void)edx;
+    return RewriteShootOrigin(ecx, out, hkServerGrabHoldOrigin.fOriginal);
+}
+
+void __fastcall Hooks::dGrabSetTarget(void* ecx, void* edx, Vector* pos, QAngle* ang)
+{
+    (void)edx;
+    Vector p{};
+    QAngle a{};
+    if (pos)
+        p = *pos;
+    if (ang)
+        a = *ang;
+    if (m_VR && m_VR->UseGrabActive())
+    {
+        Vector hand{};
+        if (m_VR->TryGetVrGrabTarget(hand))
+        {
+            static int s_tgtLog;
+            if (s_tgtLog < 8)
+            {
+                Game::logMsg("Grab SetTarget palm (%.1f,%.1f,%.1f) was (%.1f,%.1f,%.1f)",
+                    hand.x, hand.y, hand.z, p.x, p.y, p.z);
+                ++s_tgtLog;
+            }
+            p = hand;
+        }
+    }
+    if (hkGrabSetTarget.fOriginal)
+        hkGrabSetTarget.fOriginal(ecx, pos ? &p : pos, ang ? &a : ang);
 }
 
 int __fastcall Hooks::dGetAttachmentVec(void* ecx, void* edx, int number, Vector* origin, QAngle* angles)
@@ -4646,11 +4953,14 @@ int __fastcall Hooks::dGetAttachmentMatrix(void* ecx, void* edx, int number, flo
     return result;
 }
 
-void Hooks::EnsureWeaponVfxHooks()
+bool Hooks::EnsureWeaponVfxHooks()
 {
+    static bool s_done = false;
+    if (s_done)
+        return true;
     HMODULE client = GetModuleHandleA("client.dll");
     if (!client)
-        return;
+        return false;
 
     MEMORY_BASIC_INFORMATION mbi{};
     if (!hkTauBeamView.pTarget)
@@ -4971,6 +5281,14 @@ void Hooks::EnsureWeaponVfxHooks()
                 + Offsets::kSpriteQuad;
         }
     }
+    s_done = hkTauBeamView.pTarget && hkTauBeamWorld.pTarget && hkTauBeamFireTrace.pTarget
+        && hkGluonImpactTrace.pTarget && hkGluonBeamUpdate.pTarget && hkGluonBeamFxSet.pTarget
+        && hkGluonBeamFxDraw.pTarget && hkParticleSetControlPoint.pTarget
+        && hkParticleMgrAddEffect.pTarget && hkRpgUpdateLaser.pTarget
+        && hkHudCrosshairPaint.pTarget && hkSpriteRendererDraw.pTarget
+        && hkViewRenderBeamsDraw.pTarget && hkSpriteRenderableDraw.pTarget
+        && hkEnvLaserDotDraw.pTarget && hkSpriteQuad.pTarget;
+    return s_done;
 }
 
 void __fastcall Hooks::dTauBeamView(void* ecx, void* edx, Vector* startEnd, void* a2, float a3, int a4, int a5)
@@ -5256,12 +5574,18 @@ int __fastcall Hooks::dSpriteRendererDraw(void* ecx, void* edx, void* entity, vo
     unsigned a10, unsigned a11, unsigned a12, unsigned a13, float frame, int a15)
 {
     (void)edx;
-    if (hkSpriteRendererDraw.fOriginal && m_VR && m_VR->m_IsVREnabled
-        && m_Game && m_Game->m_ModelInfo)
+    const bool rpgLaser = hkSpriteRendererDraw.fOriginal && m_VR && m_VR->m_IsVREnabled
+        && m_Game && m_Game->m_ModelInfo && m_VR->RpgLaserActive();
+    const bool gluonHeld = hkSpriteRendererDraw.fOriginal && m_VR && m_VR->m_IsVREnabled
+        && m_Game && m_Game->m_ModelInfo && origin && GluonWeaponHeld();
+    if (rpgLaser || gluonHeld)
     {
+        // Model / class names only matter for the laser and gluon paths;
+        // plain sprites skip both engine lookups.
         const char* name = SafeModelName(m_Game->m_ModelInfo, model);
-        const char* cls = m_Game->GetEntityClientClassName(static_cast<C_BaseEntity*>(entity));
-        if (m_VR->RpgLaserActive())
+        const char* cls = rpgLaser
+            ? m_Game->GetEntityClientClassName(static_cast<C_BaseEntity*>(entity)) : nullptr;
+        if (rpgLaser)
         {
             const bool look = SpriteOriginOnLookRay(origin);
             const bool nearEye = SpriteOriginNearEye(origin);
@@ -5287,7 +5611,7 @@ int __fastcall Hooks::dSpriteRendererDraw(void* ecx, void* edx, void* entity, vo
                 }
             }
         }
-        if (origin && GluonWeaponHeld() && GluonGlowMaterialName(name)
+        if (gluonHeld && GluonGlowMaterialName(name)
             && !std::strstr(name ? name : "", "glow06"))
         {
             Vector parked{};
@@ -5408,6 +5732,14 @@ void __cdecl Hooks::dSpriteQuad(float* origin, float width, float height, unsign
     Vector parked{};
     const bool rpg = m_VR && m_VR->m_IsVREnabled && m_VR->RpgLaserActive();
     const bool gluon = GluonFxLive();
+    if (!rpg && !gluon)
+    {
+        // Nothing below applies without RPG laser / gluon FX; skip the two
+        // pose-mutex look-angle computations per sprite quad.
+        if (hkSpriteQuad.fOriginal)
+            hkSpriteQuad.fOriginal(origin, width, height, color);
+        return;
+    }
     const float offHmd = origin ? PointOffLookDegrees(origin) : 180.f;
     const float offView = origin ? PointOffCurrentViewDegrees(origin) : 180.f;
     const bool onLook = origin && (offHmd < 4.f || offView < 4.f);
@@ -5468,18 +5800,7 @@ void __fastcall Hooks::dGetBackBufferDimensions(void* ecx, void* edx, int& width
     if (m_VR && m_VR->HudPaintActive())
     {
         int x = 0, y = 0, w = 0, h = 0;
-        int fbW = 0;
-        int fbH = 0;
-        if (m_VR->m_HUDTexture)
-        {
-            fbW = m_VR->m_HUDTexture->GetActualWidth();
-            fbH = m_VR->m_HUDTexture->GetActualHeight();
-        }
-        if (fbW < 640)
-            fbW = (width > 0) ? width : 1280;
-        if (fbH < 360)
-            fbH = (height > 0) ? height : 720;
-        if (m_VR->ComputeHudInset(fbW, fbH, x, y, w, h))
+        if (m_VR->ForceHudOverlayViewport(x, y, w, h))
         {
             width = w;
             height = h;
@@ -5532,18 +5853,7 @@ void __fastcall Hooks::dGetScreenSize(void* ecx, void* edx, int& width, int& hei
     if (m_VR && m_VR->HudPaintActive())
     {
         int x = 0, y = 0, w = 0, h = 0;
-        int fbW = 0;
-        int fbH = 0;
-        if (m_VR->m_HUDTexture)
-        {
-            fbW = m_VR->m_HUDTexture->GetActualWidth();
-            fbH = m_VR->m_HUDTexture->GetActualHeight();
-        }
-        if (fbW < 640)
-            fbW = (width > 0) ? width : 1280;
-        if (fbH < 360)
-            fbH = (height > 0) ? height : 720;
-        if (m_VR->ComputeHudInset(fbW, fbH, x, y, w, h))
+        if (m_VR->ForceHudOverlayViewport(x, y, w, h))
         {
             width = w;
             height = h;
@@ -5805,6 +6115,31 @@ ITexture* __fastcall Hooks::dCreateNamedRTEx(void* ecx, void* edx, const char* n
         }
     }
     return tex;
+}
+
+void __fastcall Hooks::dEndRTAlloc(void* ecx, void* edx)
+{
+    (void)edx;
+    if (hkEndRTAlloc.fOriginal)
+        hkEndRTAlloc.fOriginal(ecx);
+}
+
+void __fastcall Hooks::dDrawFilledRect(void* ecx, void* edx, int x0, int y0, int x1, int y1)
+{
+    (void)edx;
+    if (SkipPauseOverlayFullscreenRect(x0, y0, x1, y1))
+        return;
+    if (hkDrawFilledRect.fOriginal)
+        hkDrawFilledRect.fOriginal(ecx, x0, y0, x1, y1);
+}
+
+void __fastcall Hooks::dDrawTexturedRect(void* ecx, void* edx, int x0, int y0, int x1, int y1)
+{
+    (void)edx;
+    if (SkipPauseOverlayFullscreenRect(x0, y0, x1, y1))
+        return;
+    if (hkDrawTexturedRect.fOriginal)
+        hkDrawTexturedRect.fOriginal(ecx, x0, y0, x1, y1);
 }
 
 void bmvr::InstallEarlyFramebufferHook()

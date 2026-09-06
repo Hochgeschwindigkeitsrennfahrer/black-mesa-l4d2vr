@@ -42,7 +42,8 @@ public:
         const Vector& rightWorld,
         const QAngle& rightAngles,
         float zNear,
-        float zFar);
+        float zFar,
+        bool overlayNoDepth = false);
 
     bool AssetsReady() const;
     bool HasBareHands() const;

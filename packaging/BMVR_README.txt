@@ -24,9 +24,10 @@ If you already tuned VR\config.txt, keep your copy (do not overwrite it).
 
 This zip also includes:
 
-  Black Mesa\VR\hands\          HEV glove meshes
+  Black Mesa\VR\hands\            HEV glove meshes
+  Black Mesa\VR\weapon_wheel\     HL2VR radial-menu textures
   Black Mesa\VR\openxr_helper64\  L4D2VR x64 OpenXR helper (if built)
-  Black Mesa\bms\cfg\bmvr.cfg   crosshair off / VR QoL cvars
+  Black Mesa\bms\cfg\bmvr.cfg     crosshair off / VR QoL cvars
 
 If bms\cfg\autoexec.cfg exists, add this line (once):
 
@@ -84,39 +85,32 @@ Then fully quit and restart the game. Eye size is chosen at CreateDevice; changi
 the file while the game is running does nothing.
 
 RenderScale multiplies SteamVR's recommended per-eye size (not the window),
-then aligns to 16 pixels (cap 4096). With WorldRenderAtEyeSize=false the
-headset copies are that size but the game still draws at the window
-(G-buffers stay 2560x1440 on a 1440p window) and is scaled into the eyes.
+then aligns to 16 pixels (cap 4096). WorldRenderAtEyeSize=true grows FullFrame
++ G-buffer to one eye so that size is real world pixels (log worldMatch=1 /
+grow LITERAL). false squash-blits the 16:9 window into the eyes.
 
-WorldRenderAtEyeSize=true grows FullFrame + G-buffer to the eye size so
-SteamVR SS is real world pixels. Set it back to false and restart to
-revert. Add `hmd_offscreen` to bmvr_skip.txt to force window-fit eyes.
+On OpenXR (G2 / Oasis / SteamVR OpenXR) the overlay SS is sampled when the
+helper starts, not live. Change SS, quit the game, relaunch. The in-game
+video slider also does not drive the HMD blit (that copies the window).
 
   RenderScale=1.0     SteamVR recommended (typical Index/G2 is taller than 1080p)
   RenderScale=0.75    cheaper if GPU bound
   RenderScale=1.25    extra SS on top of SteamVR
 
 A 1080p window with a headset recommended height above 1080 is supported.
-This zip renders at the window and scales into SteamVR-sized eyes. An older
-zip that logged "HMD native G-buffer 1456x1808" and "Eye/G-buffer size
-1456x1808 (CreateDevice HMD-aspect" on a 1920x1080 window treated that as
-the engine framebuffer and could not run. Confirm this zip with:
-  offscreen=1 hmd_world=0
-  Eye RT ... window 1920x1080
-  Skip hmd_native size ... over window ...
-
 After launch, bmvr_log.txt reports the size actually used, for example:
-  Eye RT 2016x2240 (offscreen rec=2016x2240 RenderScale=1.00 window 1920x1080)
+  Eye RT 3152x3088 (offscreen rec=3152x3088 RenderScale=1.00 window 1920x1080)
 
 
 5) Controllers (HP Reverb G2 / WMR / Touch)
 -------------------------------------------
-Left stick walk, right stick turn, right trigger attack, left trigger alt-fire,
-right B use, right A jump, right grip crouch, left grip reload,
-left-stick click recenter, right-stick click flashlight.
-Left Y next weapon. Left X sprint. Right-stick dpad north/south prev/next weapon.
-Left menu / system button opens the in-game ESC menu (same as keyboard Escape).
-While that menu is up, point the right controller at it and pull the trigger to click.
+Left stick walk, right stick turn, right trigger attack (use when hands are empty),
+left trigger use, right B alt-fire, right A reload, left Y / left menu pause.
+Left-stick click sprint; double-tap the stick forward also sprints while you
+keep holding forward. Right-stick click weapon wheel (tap to recenter).
+Right grip flashlight. Left X previous weapon. Reload is A only.
+While the menu is up, point the right controller at it and pull the trigger
+to click. A confirms, B goes back.
 
 If sticks or the new pause/sprint bindings do nothing, open SteamVR Bindings for
 this app and reset the layout to the default in VR\SteamVRActionManifest.

@@ -94,16 +94,38 @@ namespace
             || PathContainsI(asset.sourcePath, "bare_hand");
     }
 
-    bool BuildSummaryCurlPalette(
-        const VrHandMeshAsset& asset,
-        const vr::VRSkeletalSummaryData_t& summary,
-        std::vector<VrHandMatrixRows3x4>& outPalette,
-        float gripCurlMin)
+    // Everything about a hand asset that does not depend on the live finger
+    // curls: joint lookups, bind-local matrices, a parents-first evaluation
+    // order and the curl sign. Built once per asset. The old per-call version
+    // rebuilt 15 joint-name strings, ran ~450 std::string compares, allocated
+    // four vectors and resolved the hierarchy in O(joints^2) passes — per
+    // hand, per eye, per frame.
+    struct HandRig
     {
+        bool built = false;
+        bool valid = false;
+        bool valveBiped = false;
+        int fingerJoint[vr::VRFinger_Count][3]{};
+        std::vector<VrHandMatrix4> bindLocal;
+        std::vector<int> order;
+        std::vector<VrHandMatrix4> scratchLocal;
+        std::vector<VrHandMatrix4> scratchModel;
+        // Inputs of the last palette so an identical request (the second eye
+        // of the same frame, or idle hands) is a no-op.
+        bool paletteValid = false;
+        float lastCurl[vr::VRFinger_Count]{};
+        float lastGripCurlMin = -1.f;
+    };
+
+    void BuildHandRig(const VrHandMeshAsset& asset, HandRig& rig)
+    {
+        rig.built = true;
+        rig.valid = false;
+        rig.paletteValid = false;
         const bool rightHand = FindNameIndex(asset.jointNames, "wrist_r") >= 0;
         const bool leftHand = FindNameIndex(asset.jointNames, "wrist_l") >= 0;
         if (!rightHand && !leftHand)
-            return false;
+            return;
 
         const char suffix = rightHand ? 'r' : 'l';
         static const char* kFingerNames[vr::VRFinger_Count] =
@@ -114,23 +136,74 @@ namespace
             "ring",
             "pinky"
         };
-        static const float kMaxCurlRadians[vr::VRFinger_Count][3] =
+        for (int finger = 0; finger < vr::VRFinger_Count; ++finger)
         {
-            { 0.75f, 0.90f, 0.65f },
-            { 1.15f, 1.25f, 0.90f },
-            { 1.15f, 1.25f, 0.90f },
-            { 1.15f, 1.25f, 0.90f },
-            { 1.15f, 1.25f, 0.90f },
-        };
+            for (int segment = 0; segment < 3; ++segment)
+            {
+                const std::string jointName = std::string("finger_") +
+                    kFingerNames[finger] + "_" + static_cast<char>('0' + segment) + "_" + suffix;
+                const int joint = FindNameIndex(asset.jointNames, jointName);
+                if (joint < 0)
+                    return;
+                rig.fingerJoint[finger][segment] = joint;
+            }
+        }
 
-        std::vector<VrHandMatrix4> localMatrices(asset.jointNames.size(), VrHandMath::Identity());
-        for (size_t joint = 0; joint < asset.jointNames.size(); ++joint)
-            localMatrices[joint] = BuildBindLocalMatrix(asset, static_cast<int>(joint));
+        const size_t n = asset.jointNames.size();
+        if (asset.jointParents.size() < n || asset.inverseBindMatrices.size() < n
+            || asset.bindMatrices.size() < n)
+            return;
+        rig.bindLocal.resize(n);
+        for (size_t joint = 0; joint < n; ++joint)
+            rig.bindLocal[joint] = BuildBindLocalMatrix(asset, static_cast<int>(joint));
 
+        // Parents-first order, same fixpoint the old loop computed each call.
+        rig.order.clear();
+        rig.order.reserve(n);
+        std::vector<bool> resolved(n, false);
+        size_t unresolved = n;
+        for (size_t pass = 0; pass < n && unresolved > 0; ++pass)
+        {
+            bool progressed = false;
+            for (size_t joint = 0; joint < n; ++joint)
+            {
+                if (resolved[joint])
+                    continue;
+                const int parent = asset.jointParents[joint];
+                if (parent >= 0 && (parent >= static_cast<int>(n) || !resolved[static_cast<size_t>(parent)]))
+                    continue;
+                rig.order.push_back(static_cast<int>(joint));
+                resolved[joint] = true;
+                --unresolved;
+                progressed = true;
+            }
+            if (!progressed)
+                return;
+        }
         // HEV/bare ValveBiped index–pinky hinges are opposite SteamVR glove +Z.
         // Thumb already curls inward on the ripped mesh. Do not negate
         // SteamVR vr_glove fallback assets.
-        const bool valveBiped = AssetUsesValveBipedCurl(asset);
+        rig.valveBiped = AssetUsesValveBipedCurl(asset);
+        rig.scratchLocal.resize(n);
+        rig.scratchModel.resize(n);
+        rig.valid = true;
+    }
+
+    // L4D2VR VrHandSkeletonRuntime::BuildSummaryCurlPalette — GLB bind locals
+    // plus OpenVR summary curls. No ozz.
+    bool BuildSummaryCurlPalette(
+        const VrHandMeshAsset& asset,
+        HandRig& rig,
+        const vr::VRSkeletalSummaryData_t& summary,
+        std::vector<VrHandMatrixRows3x4>& outPalette,
+        float gripCurlMin)
+    {
+        if (!rig.built)
+            BuildHandRig(asset, rig);
+        if (!rig.valid)
+            return false;
+
+        float curls[vr::VRFinger_Count];
         for (int finger = 0; finger < vr::VRFinger_Count; ++finger)
         {
             float curl = std::clamp(summary.flFingerCurl[finger], 0.0f, 1.0f);
@@ -142,54 +215,56 @@ namespace
                 if (curl < minCurl)
                     curl = minCurl;
             }
-            const float sign = (valveBiped && finger > 0) ? -1.f : 1.f;
+            curls[finger] = curl;
+        }
+        const size_t n = asset.jointNames.size();
+        if (rig.paletteValid && outPalette.size() == n && rig.lastGripCurlMin == gripCurlMin
+            && std::memcmp(curls, rig.lastCurl, sizeof(curls)) == 0)
+            return true;
+
+        static const float kMaxCurlRadians[vr::VRFinger_Count][3] =
+        {
+            { 0.75f, 0.90f, 0.65f },
+            { 1.15f, 1.25f, 0.90f },
+            { 1.15f, 1.25f, 0.90f },
+            { 1.15f, 1.25f, 0.90f },
+            { 1.15f, 1.25f, 0.90f },
+        };
+
+        std::vector<VrHandMatrix4>& localMatrices = rig.scratchLocal;
+        std::vector<VrHandMatrix4>& modelMatrices = rig.scratchModel;
+        localMatrices.assign(rig.bindLocal.begin(), rig.bindLocal.end());
+        for (int finger = 0; finger < vr::VRFinger_Count; ++finger)
+        {
+            const float sign = (rig.valveBiped && finger > 0) ? -1.f : 1.f;
             for (int segment = 0; segment < 3; ++segment)
             {
-                const std::string jointName = std::string("finger_") +
-                    kFingerNames[finger] + "_" + static_cast<char>('0' + segment) + "_" + suffix;
-                const int joint = FindNameIndex(asset.jointNames, jointName);
-                if (joint < 0)
-                    return false;
-
-                localMatrices[static_cast<size_t>(joint)] = VrHandMath::Multiply(
-                    localMatrices[static_cast<size_t>(joint)],
-                    MakeLocalZRotation(sign * curl * kMaxCurlRadians[finger][segment]));
+                const size_t joint = static_cast<size_t>(rig.fingerJoint[finger][segment]);
+                localMatrices[joint] = VrHandMath::Multiply(
+                    localMatrices[joint],
+                    MakeLocalZRotation(sign * curls[finger] * kMaxCurlRadians[finger][segment]));
             }
         }
 
-        std::vector<VrHandMatrix4> modelMatrices(asset.jointNames.size(), VrHandMath::Identity());
-        std::vector<bool> resolved(asset.jointNames.size(), false);
-        size_t unresolved = asset.jointNames.size();
-        for (size_t pass = 0; pass < asset.jointNames.size() && unresolved > 0; ++pass)
+        for (const int j : rig.order)
         {
-            bool progressed = false;
-            for (size_t joint = 0; joint < asset.jointNames.size(); ++joint)
-            {
-                if (resolved[joint])
-                    continue;
-
-                const int parent = asset.jointParents[joint];
-                if (parent >= 0 && (parent >= static_cast<int>(resolved.size()) || !resolved[static_cast<size_t>(parent)]))
-                    continue;
-
-                modelMatrices[joint] = (parent >= 0)
-                    ? VrHandMath::Multiply(modelMatrices[static_cast<size_t>(parent)], localMatrices[joint])
-                    : localMatrices[joint];
-                resolved[joint] = true;
-                --unresolved;
-                progressed = true;
-            }
-            if (!progressed)
-                return false;
+            const size_t joint = static_cast<size_t>(j);
+            const int parent = asset.jointParents[joint];
+            modelMatrices[joint] = (parent >= 0)
+                ? VrHandMath::Multiply(modelMatrices[static_cast<size_t>(parent)], localMatrices[joint])
+                : localMatrices[joint];
         }
 
-        outPalette.resize(asset.jointNames.size());
-        for (size_t joint = 0; joint < asset.jointNames.size(); ++joint)
+        outPalette.resize(n);
+        for (size_t joint = 0; joint < n; ++joint)
         {
             outPalette[joint] = VrHandMath::ToRows3x4(VrHandMath::Multiply(
                 modelMatrices[joint],
                 asset.inverseBindMatrices[joint]));
         }
+        std::memcpy(rig.lastCurl, curls, sizeof(curls));
+        rig.lastGripCurlMin = gripCurlMin;
+        rig.paletteValid = true;
         return true;
     }
 
@@ -298,6 +373,14 @@ struct BmVrGloves::Impl
         const char* fileName = nullptr;
         VrHandMeshAsset asset;
         std::vector<VrHandMatrixRows3x4> palette;
+        HandRig rig;
+        // Palm scene light is sampled per hand per eye; both eyes of a frame
+        // ask for the same palm position.
+        bool lightValid = false;
+        uint32_t lightTick = 0;
+        Vector lightPalm{};
+        Vector lightRgb{};
+        float lightExposure = 0.45f;
     };
 
     Hand hev[2];
@@ -563,9 +646,9 @@ bool BmVrGloves::DrawForEye(
     const Vector& rightWorld,
     const QAngle& rightAngles,
     float zNear,
-    float zFar)
+    float zFar,
+    bool overlayNoDepth)
 {
-    (void)stereoEye;
     if (!device || !m_Impl || !m_Impl->EnsureAssets())
         return false;
 
@@ -626,7 +709,7 @@ bool BmVrGloves::DrawForEye(
             && g_Game->m_VR->WantsRightGloveWeaponGripCurl();
         if (TryGetSummary(input, actions[i], summary))
         {
-            if (!BuildSummaryCurlPalette(hand.asset, summary, hand.palette, gripCurl ? 0.40f : 0.f))
+            if (!BuildSummaryCurlPalette(hand.asset, hand.rig, summary, hand.palette, gripCurl ? 0.40f : 0.f))
                 BuildBindPosePalette(hand.asset, hand.palette);
         }
         else if (hand.palette.empty())
@@ -634,7 +717,7 @@ bool BmVrGloves::DrawForEye(
             BuildBindPosePalette(hand.asset, hand.palette);
         }
 
-        const Vector rotOffset(
+        Vector rotOffset(
             bmvr::g_VrHandsPoseRotX + (rightHand && gripCurl ? bmvr::g_VrHandsRightGripRotX : 0.f),
             bmvr::g_VrHandsPoseRotY + (rightHand && gripCurl ? bmvr::g_VrHandsRightGripRotY : 0.f),
             bmvr::g_VrHandsPoseRotZ + (rightHand && gripCurl ? bmvr::g_VrHandsRightGripRotZ : 0.f));
@@ -655,14 +738,6 @@ bool BmVrGloves::DrawForEye(
             posOffset.x += bmvr::g_VrHandsRightPoseOffX;
             posOffset.y += bmvr::g_VrHandsRightPoseOffY;
             posOffset.z += bmvr::g_VrHandsRightPoseOffZ;
-            if (g_Game && g_Game->m_VR)
-            {
-                Vector palm{};
-                g_Game->m_VR->GetRightGlovePalmOffsetMeters(palm);
-                posOffset.x += palm.x;
-                posOffset.y += palm.y;
-                posOffset.z += palm.z;
-            }
         }
         const VrHandMatrix4 world = VrHandMath::BuildControllerWorld(
             *origins[i],
@@ -673,8 +748,21 @@ bool BmVrGloves::DrawForEye(
             rotOffset);
         const VrHandMatrix4 wvp = VrHandMath::Multiply(projection, VrHandMath::Multiply(camera, world));
 
-        float envExposure = 0.45f;
-        const Vector sceneRgb = SamplePalmSceneLight(*origins[i], envExposure);
+        // GetLightForPoint + flashlight cone once per hand per frame; the
+        // second eye reuses it (same palm position, same Present tick).
+        const uint32_t tick = (g_Game && g_Game->m_VR) ? g_Game->m_VR->m_PresentTick : 0u;
+        const Vector& palm = *origins[i];
+        if (!hand.lightValid || hand.lightTick != tick
+            || hand.lightPalm.x != palm.x || hand.lightPalm.y != palm.y || hand.lightPalm.z != palm.z)
+        {
+            hand.lightExposure = 0.45f;
+            hand.lightRgb = SamplePalmSceneLight(palm, hand.lightExposure);
+            hand.lightPalm = palm;
+            hand.lightTick = tick;
+            hand.lightValid = true;
+        }
+        const float envExposure = hand.lightExposure;
+        const Vector sceneRgb = hand.lightRgb;
         IDirect3DBaseTexture9* envCube = (g_Game && g_Game->m_VR)
             ? g_Game->m_VR->SceneCubemap() : nullptr;
 
@@ -686,7 +774,8 @@ bool BmVrGloves::DrawForEye(
                 hand.palette,
                 world,
                 wvp,
-                stereoEye == 0 ? VrHandDrawPass::OverlayNoDepth : VrHandDrawPass::WorldDepth,
+                (overlayNoDepth || stereoEye == 0)
+                    ? VrHandDrawPass::OverlayNoDepth : VrHandDrawPass::WorldDepth,
                 sceneRgb,
                 eyeOrigin,
                 envExposure,

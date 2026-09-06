@@ -212,6 +212,26 @@ C_BaseEntity* Game::GetLocalPlayerEntity()
     return static_cast<C_BaseEntity*>(m_ClientEntityList->GetClientEntity(local));
 }
 
+C_BaseEntity* Game::LocalPlayerUseEntity()
+{
+    C_BaseEntity* player = GetLocalPlayerEntity();
+    if (!player)
+        return nullptr;
+
+    uint32_t handle = 0;
+    __try
+    {
+        handle = *reinterpret_cast<uint32_t*>(
+            reinterpret_cast<uint8_t*>(player) + Offsets::kCBasePlayer_hUseEntity);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return nullptr;
+    }
+
+    return ResolveEntityFromHandle(handle);
+}
+
 C_BaseEntity* Game::ResolveEntityFromHandle(uint32_t handle)
 {
     if (!m_ClientEntityList || handle == 0 || handle == 0xFFFFFFFFu)
@@ -268,6 +288,111 @@ const char* Game::GetEntityModelName(C_BaseEntity* entity)
     if (!model)
         return nullptr;
     return m_ModelInfo->GetModelName(model);
+}
+
+void* Game::FindOrLoadModel(const char* name)
+{
+    if (!m_ModelInfo || !name || !name[0])
+        return nullptr;
+    auto modelLooksRight = [&](void* model) -> bool {
+        if (!model)
+            return false;
+        const char* got = nullptr;
+        __try
+        {
+            got = m_ModelInfo->GetModelName(model);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+        if (!got || !got[0])
+            return false;
+        if (std::strstr(got, name))
+            return true;
+        const char* leaf = name;
+        for (const char* p = name; *p; ++p)
+        {
+            if (*p == '/' || *p == '\\')
+                leaf = p + 1;
+        }
+        return leaf && leaf[0] && std::strstr(got, leaf) != nullptr;
+    };
+    int idx = -1;
+    __try
+    {
+        idx = m_ModelInfo->GetModelIndex(name);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        idx = -1;
+    }
+    if (idx != -1)
+    {
+        void* model = nullptr;
+        __try
+        {
+            model = m_ModelInfo->GetModel(idx);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            model = nullptr;
+        }
+        if (modelLooksRight(model))
+            return model;
+    }
+
+    void** vt = nullptr;
+    __try
+    {
+        vt = *reinterpret_cast<void***>(m_ModelInfo);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        vt = nullptr;
+    }
+    if (!vt)
+        return nullptr;
+
+    // IVModelInfoClient006: RegisterDynamicModel ~slot 52, FindOrLoadModel ~slot 59
+    // (Source 2013 layout). Probe those two only; a wide slot sweep can call
+    // OnLevelChange / CleanupDynamicModels.
+    void* found = nullptr;
+    __try
+    {
+        using FindFn = void*(__thiscall*)(void*, const char*);
+        auto find = reinterpret_cast<FindFn>(vt[59]);
+        if (find)
+        {
+            void* model = find(m_ModelInfo, name);
+            if (modelLooksRight(model))
+                found = model;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    if (found)
+        return found;
+    __try
+    {
+        using RegFn = int(__thiscall*)(void*, const char*, bool);
+        auto reg = reinterpret_cast<RegFn>(vt[52]);
+        if (reg)
+        {
+            const int dyn = reg(m_ModelInfo, name, true);
+            if (dyn != -1)
+            {
+                void* model = m_ModelInfo->GetModel(dyn);
+                if (model)
+                    found = model;
+            }
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    return found;
 }
 
 const char* Game::GetActiveWeaponModelName()

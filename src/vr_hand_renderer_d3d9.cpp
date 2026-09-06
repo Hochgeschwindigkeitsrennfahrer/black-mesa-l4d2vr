@@ -26,6 +26,111 @@ namespace
     constexpr float kViewmodelDepthRangeMax = 1.0f;
     constexpr DWORD kVrHandOcclusionStencilBit = 0x80u;
 
+    // Save/restore around the hand draws. The old code created a D3DSBT_ALL
+    // block per call; on DXVK that Capture()/Apply() walks every render
+    // state, all sampler and texture-stage states, 260 transforms and ~480
+    // shader constants (one SetXxx each), plus a ~40KB allocation — twice per
+    // hand per eye. This block is recorded once with exactly the states
+    // Draw() / ClearViewmodelOcclusionStencil() touch. Values recorded are
+    // irrelevant; only the set of touched states matters.
+    IDirect3DDevice9* g_HandStateBlockDevice = nullptr;
+    IDirect3DStateBlock9* g_HandStateBlock = nullptr;
+
+    void ReleaseHandStateBlock()
+    {
+        if (g_HandStateBlock)
+        {
+            g_HandStateBlock->Release();
+            g_HandStateBlock = nullptr;
+        }
+        g_HandStateBlockDevice = nullptr;
+    }
+
+    IDirect3DStateBlock9* AcquireHandStateBlock(IDirect3DDevice9* device, IDirect3DVertexDeclaration9* decl)
+    {
+        if (!device)
+            return nullptr;
+        if (g_HandStateBlock && g_HandStateBlockDevice == device)
+            return g_HandStateBlock;
+        ReleaseHandStateBlock();
+        if (FAILED(device->BeginStateBlock()))
+            return nullptr;
+        static const D3DRENDERSTATETYPE kRenderStates[] = {
+            D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC, D3DRS_CULLMODE, D3DRS_FILLMODE,
+            D3DRS_ALPHABLENDENABLE, D3DRS_SEPARATEALPHABLENDENABLE, D3DRS_SRCBLEND, D3DRS_DESTBLEND,
+            D3DRS_BLENDOP, D3DRS_ALPHATESTENABLE, D3DRS_SRGBWRITEENABLE, D3DRS_FOGENABLE,
+            D3DRS_COLORWRITEENABLE, D3DRS_TEXTUREFACTOR, D3DRS_COLORVERTEX, D3DRS_LIGHTING,
+            D3DRS_DIFFUSEMATERIALSOURCE, D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILREF,
+            D3DRS_STENCILMASK, D3DRS_STENCILWRITEMASK, D3DRS_STENCILFAIL, D3DRS_STENCILZFAIL,
+            D3DRS_STENCILPASS,
+        };
+        for (D3DRENDERSTATETYPE rs : kRenderStates)
+            device->SetRenderState(rs, 0);
+        static const D3DTEXTURESTAGESTATETYPE kStage0[] = {
+            D3DTSS_COLOROP, D3DTSS_COLORARG1, D3DTSS_COLORARG2, D3DTSS_ALPHAOP, D3DTSS_ALPHAARG1,
+        };
+        for (D3DTEXTURESTAGESTATETYPE ts : kStage0)
+            device->SetTextureStageState(0, ts, 0);
+        device->SetTextureStageState(1, D3DTSS_COLOROP, 0);
+        device->SetTextureStageState(1, D3DTSS_ALPHAOP, 0);
+        static const D3DSAMPLERSTATETYPE kSampler[] = {
+            D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER,
+            D3DSAMP_ADDRESSU, D3DSAMP_ADDRESSV, D3DSAMP_ADDRESSW,
+        };
+        for (D3DSAMPLERSTATETYPE ss : kSampler)
+        {
+            device->SetSamplerState(0, ss, 0);
+            device->SetSamplerState(1, ss, 0);
+        }
+        // SetFVF is the same device state as the vertex declaration.
+        device->SetVertexDeclaration(decl);
+        device->SetVertexShader(nullptr);
+        device->SetPixelShader(nullptr);
+        device->SetTexture(0, nullptr);
+        device->SetTexture(1, nullptr);
+        // DrawPrimitiveUP also resets stream 0.
+        device->SetStreamSource(0, nullptr, 0, 0);
+        device->SetIndices(nullptr);
+        static const float kZero[4 * (kBoneConstantStart + kMaxShaderBones * 3)]{};
+        device->SetVertexShaderConstantF(0, kZero, kBoneConstantStart + kMaxShaderBones * 3);
+        device->SetPixelShaderConstantF(0, kZero, 4);
+        D3DVIEWPORT9 vp{};
+        vp.Width = 1;
+        vp.Height = 1;
+        vp.MaxZ = 1.f;
+        device->SetViewport(&vp);
+        IDirect3DStateBlock9* block = nullptr;
+        if (FAILED(device->EndStateBlock(&block)) || !block)
+            return nullptr;
+        g_HandStateBlock = block;
+        g_HandStateBlockDevice = device;
+        return block;
+    }
+
+    // Recorded block when available, else the old per-call D3DSBT_ALL.
+    IDirect3DStateBlock9* BeginHandStateScope(IDirect3DDevice9* device, IDirect3DVertexDeclaration9* decl, bool& owned)
+    {
+        owned = false;
+        IDirect3DStateBlock9* block = AcquireHandStateBlock(device, decl);
+        if (!block)
+        {
+            if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &block)) || !block)
+                return nullptr;
+            owned = true;
+        }
+        block->Capture();
+        return block;
+    }
+
+    void EndHandStateScope(IDirect3DStateBlock9* block, bool owned)
+    {
+        if (!block)
+            return;
+        block->Apply();
+        if (owned)
+            block->Release();
+    }
+
     const char* kVertexShaderSource = R"HLSL(
 float4 gWorldViewProjectionRows[4] : register(c0);
 float4 gWorldRows[3] : register(c5);
@@ -589,13 +694,13 @@ bool VrHandRendererD3D9::ClearViewmodelOcclusionStencil(IDirect3DDevice9* device
         return false;
     }
 
-    IDirect3DStateBlock9* stateBlock = nullptr;
-    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)) || !stateBlock)
+    bool ownedBlock = false;
+    IDirect3DStateBlock9* stateBlock = BeginHandStateScope(device, m_VertexDeclaration, ownedBlock);
+    if (!stateBlock)
     {
         outError = "CreateStateBlock failed before VR hand stencil-bit clear";
         return false;
     }
-    stateBlock->Capture();
 
     D3DVIEWPORT9 viewport{};
     const bool haveViewport = SUCCEEDED(device->GetViewport(&viewport));
@@ -642,8 +747,7 @@ bool VrHandRendererD3D9::ClearViewmodelOcclusionStencil(IDirect3DDevice9* device
         drawResult = device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, vertices, sizeof(ClearStencilVertex));
     }
 
-    stateBlock->Apply();
-    SafeRelease(stateBlock);
+    EndHandStateScope(stateBlock, ownedBlock);
     if (!haveViewport || FAILED(drawResult))
     {
         outError = "D3D9 reserved stencil-bit clear failed before VR hand world-depth mask";
@@ -676,13 +780,13 @@ bool VrHandRendererD3D9::Draw(
     if (!EnsureSharedResources(device, outError) || !EnsureMeshResources(device, handIndex, asset, outError))
         return false;
 
-    IDirect3DStateBlock9* stateBlock = nullptr;
-    if (FAILED(device->CreateStateBlock(D3DSBT_ALL, &stateBlock)) || !stateBlock)
+    bool ownedBlock = false;
+    IDirect3DStateBlock9* stateBlock = BeginHandStateScope(device, m_VertexDeclaration, ownedBlock);
+    if (!stateBlock)
     {
         outError = "CreateStateBlock failed before VR hand draw";
         return false;
     }
-    stateBlock->Capture();
 
     const MeshResources& mesh = m_Meshes[static_cast<size_t>(handIndex)];
     const std::array<float, 16> wvpRows = VrHandMath::ToRows4x4(worldViewProjection);
@@ -894,8 +998,7 @@ bool VrHandRendererD3D9::Draw(
     if (haveOldViewport)
         device->SetViewport(&oldViewport);
 
-    stateBlock->Apply();
-    SafeRelease(stateBlock);
+    EndHandStateScope(stateBlock, ownedBlock);
     if (FAILED(drawResult))
     {
         outError = "DrawIndexedPrimitive failed for VR hands";
@@ -916,6 +1019,7 @@ void VrHandRendererD3D9::ReleaseMesh(MeshResources& mesh)
 
 void VrHandRendererD3D9::ReleaseShared()
 {
+    ReleaseHandStateBlock();
     SafeRelease(m_VertexDeclaration);
     SafeRelease(m_VertexShader);
     SafeRelease(m_PixelShader);

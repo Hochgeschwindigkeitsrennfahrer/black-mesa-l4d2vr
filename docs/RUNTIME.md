@@ -378,4 +378,6 @@ Keep skipping that bloom chain on stereo eyes. Do not disable the rest of post. 
 
 Refraction-only (user): surface better. Full water retry: `r_WaterDrawReflection` / `r_waterforcereflectentities` / `r_waterforceexpensive` / `nr_gbuffer_for_reflection_enabled` on. Keep `nr_gbuffer_for_refraction_enabled 0` (wall color-buffer stamps, not the water surface). Cafeteria ghosts were bloom, already skipped on stereo eyes. Do not grow `_rt_Water*` / Refract RTs to the eye.
 
-**Verified 2026-09-04 (user):** that full-water set was the GitHub 47 FPS vs local 32 FPS regression in the same spot. Hands and menu were not the cause. Current path keeps all five at 0 (`waterrefl0`). Do not retry stereo full water. A cheaper water surface still needs a different approach — not these cvars per eye.
+**Verified 2026-09-04 (user):** that full-water set was the GitHub 47 FPS vs local 32 FPS regression in the same spot. Hands and menu were not the cause. Do not retry stereo **full** water (reflection + expensive + gbuffer reflection).
+
+**Verified 2026-09-06 (user):** `r_WaterDrawRefraction 1` alone costs no noticeable performance and looks better than the fog fill. Default is refraction-only again (`waterrefract1`). `nr_gbuffer_for_refraction_enabled` stays 0. Do not grow Water/Refract RTs to the eye.

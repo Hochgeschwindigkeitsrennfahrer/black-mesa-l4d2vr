@@ -71,15 +71,6 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/Reload"
-                  }
-               },
-               "mode": "button",
-               "path": "/user/hand/left/input/grip"
-            },
-            {
-               "inputs": {
-                  "click": {
                      "output": "/actions/main/in/PrimaryAttack"
                   }
                },
@@ -112,7 +103,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/Use"
+                     "output": "/actions/main/in/SecondaryAttack"
                   }
                },
                "mode": "button",
@@ -121,7 +112,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/ActivateVR"
+                     "output": "/actions/main/in/Reload"
                   }
                },
                "mode": "button",
@@ -189,7 +180,7 @@
             {
                "inputs": {
                   "click": {
-                     "output": "/actions/main/in/SecondaryAttack"
+                     "output": "/actions/main/in/Use"
                   }
                },
                "mode": "button",
@@ -201,7 +192,7 @@
    "category": "steamvr_input",
    "controller_type": "vive_controller",
    "description": "Vive wand trackpads mapped like L4D2VR/Portal2 sticks (left walk, right turn).",
-   "name": "Black Mesa VR Vive v2 stick jump/crouch",
+   "name": "Black Mesa VR Vive v3 use/sprint/reload",
    "options": {},
    "simulated_actions": []
 }
