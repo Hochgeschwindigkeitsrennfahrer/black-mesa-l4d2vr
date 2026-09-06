@@ -1,6 +1,6 @@
 # Black Mesa VR
 
-<a href="https://www.youtube.com/watch?v=5oqQ8akfu3s">
+<a href="https://www.youtube.com/watch?v=S9kmK95yqgM">
   <img src="assets/release-2026-09-06.jpg" alt="Black Mesa VR — HL2VR weapon wheel and ammo counter">
 </a>
 
