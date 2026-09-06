@@ -36,8 +36,7 @@ https://github.com/keyou91/l4d2vr
 The VR experience is fully playable, but several features are still a work in progress:
 
 * **Quest 3:** Meta Link uses the Link / Oculus OpenXR runtime. Virtual Desktop must use Streamer Options → **OpenXR Runtime = VDXR**. SteamVR in that dropdown inverts the world
-* 
-* Performance is be poor in open and complex scenes, especiall in Blue Shift and Xen
+* Performance is be poor in open and complex scenes, especially in Blue Shift and Xen
 * Two-handed weapons are planned for a later update.
 * Manual reloading is not currently implemented and is planned for a future update.
 
