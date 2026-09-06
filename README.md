@@ -61,6 +61,6 @@ HEV amber.
 
 TheRealBubble
 
-SilentVortiguant
+SilentVortiguant - [Check out his youtube](https://www.youtube.com/@SilentVortigauntVR).
 
 yakupagagaming
